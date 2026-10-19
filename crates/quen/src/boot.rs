@@ -117,6 +117,7 @@ impl Spec {
             "photo",
             "extra_env",
             "stage",
+            "stage_mods",
             "user_ok",
             "allow_unknown_build",
         ];
@@ -152,7 +153,15 @@ impl Spec {
             Some(other) => return Err(format!("mode {other:?}: test (the default) or play")),
         };
         // A play session launches the user's game as it is.
-        let refused = ["park", "keep", "profiler", "preset", "extra_env", "stage"];
+        let refused = [
+            "park",
+            "keep",
+            "profiler",
+            "preset",
+            "extra_env",
+            "stage",
+            "stage_mods",
+        ];
         if let Some(key) = refused.iter().find(|k| play && args.contains_key(**k)) {
             return Err(format!(
                 "{key} isn't taken in a play session (mode play): it launches the game with the user's mods and \
@@ -191,17 +200,50 @@ impl Spec {
                 return Err(format!("stage {}: {why}", path.display()));
             }
         }
+        // Mod folders on this PC copied into Mods for the session (quen-core's boot::stage_mods; finding 38).
+        let mut stage_mods = Vec::new();
+        if let Some(list) = args.get("stage_mods") {
+            for path in list
+                .as_array()
+                .ok_or("stage_mods must be an array of paths")?
+            {
+                let path = Path::new(
+                    path.as_str()
+                        .ok_or("stage_mods: each entry must be a path")?,
+                );
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let why = if !path.is_absolute() {
+                    "not an absolute path".to_string()
+                } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
+                    "its name must be ASCII letters, digits, _ . and -".to_string()
+                } else if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                    "no such folder (missing, a file or a link)".to_string()
+                } else if let Some(why) = link_in(path) {
+                    why
+                } else {
+                    stage_mods.push(path.to_owned());
+                    continue;
+                };
+                return Err(format!("stage_mods {}: {why}", path.display()));
+            }
+        }
         let canonical = |path: &Path| fs::canonicalize(path).ok();
-        let inside = || {
-            canonical(&bin)
+        let inside = |dir: &Path| {
+            canonical(dir)
                 .zip(canonical(&game_dir))
-                .is_some_and(|(b, g)| b.starts_with(g))
+                .is_some_and(|(d, g)| d.starts_with(g))
         };
-        if !stage.is_empty() && !inside() {
-            return Err(format!(
-                "stage: {} leads out of the game folder (a link or junction)",
-                bin.display()
-            ));
+        let mods_dir = game_dir.join("Mods");
+        for (key, list, dir) in [
+            ("stage", &stage, &bin),
+            ("stage_mods", &stage_mods, &mods_dir),
+        ] {
+            if !list.is_empty() && !inside(dir) {
+                return Err(format!(
+                    "{key}: {} is missing or leads out of the game folder (a link or junction)",
+                    dir.display()
+                ));
+            }
         }
         let mut extra = Map::new();
         if let Some(env) = args.get("extra_env") {
@@ -361,10 +403,11 @@ impl Spec {
                 }
                 if stage
                     .iter()
+                    .chain(&stage_mods)
                     .any(|p| p.file_name().is_some_and(|f| f.eq_ignore_ascii_case(name)))
                 {
                     return Err(format!(
-                        "profiler {profiler} parks {name}: leave it out of stage"
+                        "profiler {profiler} parks {name}: leave it out of stage and stage_mods"
                     ));
                 }
                 if !named(&park, name) {
@@ -389,9 +432,9 @@ impl Spec {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(",");
-        let mods = match park.trim().is_empty() {
+        let mods = match park.trim().is_empty() && stage_mods.is_empty() {
             true => Vec::new(),
-            false => listing(&game_dir.join("Mods"))?,
+            false => listing(&mods_dir)?,
         };
         let bin_entries = listing(&bin)?;
         // The build under test is the one installed (the harness's add-on check). A play session tests no build.
@@ -486,6 +529,16 @@ impl Spec {
             &changes,
         )?;
         changes.extend(staged);
+        let staged = boot::stage_mods(
+            &JournalFs,
+            &game_dir,
+            &stage_mods,
+            &never,
+            &mods,
+            backups,
+            &changes,
+        )?;
+        changes.extend(staged);
         let mark = config.renodx_addon.as_ref().filter(|_| !play).map(|_| {
             if on("W3_FOREIGN_ADDON") {
                 "Registered add-on \"RenoDX\""
@@ -538,6 +591,11 @@ impl Spec {
     }
 }
 
+/// Why quen loads no save without a file on disk (finding 34: game_listsaves lists cloud-only saves; the user loaded
+/// one from the menu during a hand-over).
+pub(crate) const NO_FILE: &str = "quen loads only a save with a file in gamesaves; a save the game lists without one \
+    (a cloud-only save, game_listsaves' no_file) the user can load from the game's menu while they have the controls";
+
 /// The save a boot loads: the one `.sav` whose name is `name` in any case, with or without `.sav` (the game's own list
 /// gives bare lowercase names, as the first experiment boot showed; modQuen matches the same way), or else the newest
 /// `QuickSave*.sav`, as ini_session.py's `save_path` picks it.
@@ -567,7 +625,7 @@ fn find_save(dir: &Path, name: Option<&str>) -> Result<PathBuf, String> {
     match found[..] {
         [file] => Ok(dir.join(file)),
         [] => Err(format!(
-            "no save {} in {}",
+            "no save {} in {}: {NO_FILE}",
             name.unwrap_or("QuickSave*.sav"),
             dir.display()
         )),
@@ -589,6 +647,34 @@ pub(crate) fn newest_save(dir: &Path) -> Option<PathBuf> {
         .filter(|(file, _)| file.to_lowercase().ends_with(".sav"))
         .max_by_key(|(_, (_, modified))| *modified)
         .map(|(file, _)| dir.join(file))
+}
+
+/// The first link in the folder tree `dir`, or why part of it can't be read: a staged mod is copied file by file.
+fn link_in(dir: &Path) -> Option<String> {
+    let unread = |e: std::io::Error| Some(format!("{}: {e}", dir.display()));
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return unread(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return unread(e),
+        };
+        match entry.file_type() {
+            Ok(t) if t.is_symlink() => {
+                return Some(format!("{} is a link", entry.path().display()));
+            }
+            Ok(t) if t.is_dir() => {
+                if let Some(why) = link_in(&entry.path()) {
+                    return Some(why);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return unread(e),
+        }
+    }
+    None
 }
 
 /// A folder's entries for the park planner.
@@ -972,7 +1058,7 @@ fn after_gameplay(sent: &[(&str, u64)], pushes: &[(u64, i64)]) -> Option<Vec<Val
 }
 
 /// Why a game tool didn't do its work.
-fn reason(done: &Done) -> String {
+pub(crate) fn reason(done: &Done) -> String {
     match done {
         Done::Ok(_) => String::new(),
         Done::Refused(why)

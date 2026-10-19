@@ -231,7 +231,7 @@ approval_mode = "prompt"
 ```
 
 - `tool_timeout_sec`: quen answers within about 20 s (then `job_status`), so 120 leaves room. Codex's default is 60 or 300 s depending on the version.
-- **Approvals.** Without `default_tools_approval_mode`, Codex asks before every quen tool (quen marks none of its tools read-only), so during a launch you would switch from the game to Codex for each call. With the entry above, only `session_launch` asks: Codex shows an approval card each time. Use a Codex permission mode that asks, not Full access: there Codex refuses every tool that needs approval, including the launch.
+- **Approvals.** Without `default_tools_approval_mode`, Codex asks before every quen tool that changes something (quen 0.1.8 marks only its read-only tools, which run without asking), so during a launch you would switch from the game to Codex for each call. With the entry above, only `session_launch` asks: Codex shows an approval card each time. Use a Codex permission mode that asks, not Full access: there Codex refuses every tool that needs approval, including the launch.
 - Codex passes only a short list of environment variables to servers. If you set `QUEN_CONFIG`, add `env_vars = ["QUEN_CONFIG"]`, or `env = { QUEN_CONFIG = '<path>' }`, and set the same `QUEN_CONFIG` in the terminal that runs `quen serve --stay`: with another config, Codex's `quen mcp` looks for another `quen serve`.
 
 **VS Code (Copilot agent mode).** In your user `mcp.json` (Command Palette: *MCP: Open User Configuration*) or a workspace's `.vscode\mcp.json`:

@@ -56,7 +56,7 @@ pub fn tool() -> Value {
             sky_clear, world_weather). weather (name), env (path), time (minute), grade (grading): set it, photo is \
             the read-back, failed when it doesn't show the change. reset (part): the world's weather, no env, or \
             the grading at open. tick (tick_s, cloth_s): one world tick and the cloth simulation; no read-back. list \
-            (what, filter): names. All but enter need photo mode. time and env are journaled and taint later saves. \
+            (what, filter): names. All but enter need photo mode. env is journaled and taints later saves. \
             Refused, nothing sent: wrong token, a value out of range, no loaded game, not in photo mode (enter: in \
             it); with needs: quen-w3 0.1.8 or older. Failed: no reply within 5 s.",
         "inputSchema": schema(json!({
@@ -76,7 +76,7 @@ pub fn tool() -> Value {
 }
 
 /// game_photo's work: the action's verb, checked as the protocol checks it; quen's package at 0.1.9 or later, a loaded
-/// game and (but to enter) photo mode in quen's state; the journal for time and env; then the verb, and what its reply
+/// game and (but to enter) photo mode in quen's state; the journal for env; then the verb, and what its reply
 /// must show.
 pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &ARGS)?;
@@ -103,9 +103,10 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
     let channel = cx.channel()?;
     call.lap("check");
     let mut fields = Map::new();
-    // Whether photo mode's time and env outlast it is untested; the game restores its weather (DisablePhotomode).
+    // Photo mode's time and weather didn't outlast it (finding 33: world_get read the old hour and weather after the
+    // exit; the game restores its weather in DisablePhotomode). Whether env does is untested: it stays journaled.
     let journal = match verb {
-        Verb::PhotoTime { .. } | Verb::PhotoEnv { .. } => {
+        Verb::PhotoEnv { .. } => {
             let what = format!(
                 "channel {}",
                 serde_json::to_string(&verb).unwrap_or_default()
@@ -313,7 +314,7 @@ mod tests {
         fx
     }
 
-    /// Every set action sends its verb and answers the read-back as photo; time and env are journaled, the rest not.
+    /// Every set action sends its verb and answers the read-back as photo; env is journaled, the rest not (finding 33).
     #[test]
     fn the_sets_send_their_verbs_and_read_the_change_back() {
         let fx = in_photo_mode("photo-sets");
@@ -369,9 +370,9 @@ mod tests {
         );
         let config = fx.shared.config().as_ref().clone().unwrap();
         let journal = fs::read_to_string(crate::session::journal_path(&config)).unwrap();
-        assert_eq!(journal.matches("game_memory").count(), 2, "{journal}");
+        assert_eq!(journal.matches("game_memory").count(), 1, "{journal}");
         assert!(
-            journal.contains("photo.time") && journal.contains("photo.env"),
+            !journal.contains("photo.time") && journal.contains("photo.env"),
             "{journal}"
         );
     }

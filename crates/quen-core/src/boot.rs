@@ -76,12 +76,14 @@ pub struct RenoDx<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Back `path` up to `backup`, then write `bytes` over it. `sha` is of the bytes the plan read: a file that has
-    /// changed since is refused.
+    /// changed since is refused. `ignore`: the journal step's keys whose lines don't count at the replay
+    /// ([`Action::Patch`]).
     Rewrite {
         path: PathBuf,
         sha: String,
         bytes: Vec<u8>,
         backup: PathBuf,
+        ignore: Vec<String>,
     },
     /// Rename `from` to `to`: a mod parked. `to`'s folder must exist.
     Move { from: PathBuf, to: PathBuf },
@@ -95,6 +97,9 @@ pub enum Change {
     },
     /// A staged mod's log, where no file is: the replay recycles whatever the game wrote there.
     NewLog { path: PathBuf },
+    /// Copy the mod folder `from` (on this PC) to `dest` in Mods, where nothing is ([`stage_mods`]): the replay
+    /// recycles the copy.
+    CopyDir { from: PathBuf, dest: PathBuf },
     /// Back `path` up to `backup` and record its write time: the game rewrites it during the session (its compiled
     /// scripts, once a mod is parked; input.settings and dx12user.settings.bak, at every launch), and the replay puts
     /// both back. `keep`: a live file whose lines changed beyond their order is kept beside first (input.settings: the
@@ -125,6 +130,9 @@ impl Change {
                 "recycle {} at the end if the game writes it (game_logs keeps a copy)",
                 path.display()
             ),
+            Change::CopyDir { from, dest } => {
+                format!("stage {} -> {}", from.display(), dest.display())
+            }
             Change::Rebuilt { path, backup, .. } => {
                 format!(
                     "keep {} as it is now (backup {}): the game rewrites it",
@@ -213,7 +221,7 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
         }
     }
 
-    let mut rewrite = |path: PathBuf, old: Vec<u8>, new: Vec<u8>| {
+    let mut rewrite = |path: PathBuf, old: Vec<u8>, new: Vec<u8>, ignore: Vec<String>| {
         if new != old {
             let name = path.file_name().unwrap_or_default();
             let backup = inputs.backups.join(name);
@@ -223,24 +231,42 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
                 sha,
                 bytes: new,
                 backup,
+                ignore,
             });
         }
     };
 
-    rewrite(path, data, new);
+    // Finding 35: at the end the game's copy differed from the user's only in the keys quen forced and the game's
+    // version stamp; such a copy isn't kept beside.
+    let mut forced = vec!["LastGameVersion"];
+    if !inputs.fg {
+        forced.push("DLSSGMode");
+    }
+    if !inputs.play {
+        forced.extend(["CameraAutoRotX", "CameraAutoRotY"]);
+    }
+    if !inputs.vsync {
+        forced.push("VSync");
+    }
+    rewrite(
+        path,
+        data,
+        new,
+        forced.into_iter().map(String::from).collect(),
+    );
 
     if inputs.renodx.is_some() || inputs.load_from_dll_main.is_some() {
         let path = bin.join("ReShade.ini");
         let data = read(&path)?;
         let new = reshade_ini(&data, inputs.renodx.as_ref(), inputs.load_from_dll_main)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        rewrite(path, data, new);
+        rewrite(path, data, new, Vec::new());
     }
     if inputs.renodx.is_some() {
         let path = bin.join("ReShadePreset.ini");
         let data = read(&path)?;
         let new = techniques_off(&data).map_err(|e| format!("{}: {e}", path.display()))?;
-        rewrite(path, data, new);
+        rewrite(path, data, new, Vec::new());
     }
 
     let path = inputs
@@ -251,7 +277,7 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
         .join("general.ini");
     let data = read(&path)?;
     let new = console_on(&data).map_err(|e| format!("{}: {e}", path.display()))?;
-    rewrite(path, data, new);
+    rewrite(path, data, new, Vec::new());
 
     let dest = bin.join("steam_appid.txt");
     if !fs.exists(&dest) {
@@ -297,20 +323,17 @@ pub fn stage(
         if dests.iter().any(|d| same(d, &dest)) {
             return refused("a second file of that name");
         }
-        let touches = |c: &Change| match c {
-            Change::Rewrite { path, .. }
-            | Change::Rebuilt { path, .. }
-            | Change::NewLog { path }
-            | Change::Place { dest: path, .. } => same(path, &dest),
-            Change::Move { .. } => false, // a park of it: then only the copy is placed
-        };
-        if let Some(c) = earlier.iter().find(|c| touches(c)) {
+        // A park of it is no conflict: then only the copy is placed.
+        let parked = |c: &Change| matches!(c, Change::Move { from, .. } if same(from, &dest));
+        if let Some(c) = earlier
+            .iter()
+            .find(|c| !parked(c) && stage_touches(c, &dest))
+        {
             return refused(&format!("the launch changes it already ({})", c.summary()));
         }
         let bytes = fs
             .read(file)
             .map_err(|e| format!("stage {}: {e}", file.display()))?;
-        let parked = |c: &Change| matches!(c, Change::Move { from, .. } if same(from, &dest));
         if let Some(e) = found.filter(|_| !earlier.iter().any(parked)) {
             changes.push(Change::Move {
                 from: dest.clone(),
@@ -339,6 +362,87 @@ pub fn stage(
         }
     }
     Ok(changes)
+}
+
+/// The changes that copy the mod folders `dirs` (on this PC) into Mods under their own names for one session, after
+/// `earlier` (finding 38): a mod of that name (`mods` lists Mods) is parked first, unless `earlier` parks it, then the
+/// folder copied. The game's compiled scripts are kept as a parked script mod keeps them, unless `earlier` keeps them:
+/// a staged mod may hold scripts, and the end puts back the cache the launch found. Refuses, with nothing changed: a
+/// name staged twice or on `never`, a file or link of that name in Mods, one `earlier` changes otherwise.
+pub fn stage_mods(
+    fs: &dyn Fs,
+    game_dir: &Path,
+    dirs: &[PathBuf],
+    never: &[&str],
+    mods: &[Entry],
+    backups: &Path,
+    earlier: &[Change],
+) -> Result<Vec<Change>, String> {
+    let mods_dir = game_dir.join("Mods");
+    let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
+    let mut changes = Vec::new();
+    let mut dests = Vec::<PathBuf>::new();
+    for dir in dirs {
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let refused = |why: &str| Err(format!("stage_mods {}: {why}", dir.display()));
+        if never.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            return refused("quen never parks that name, so nothing is staged over it");
+        }
+        let found = mods.iter().find(|e| e.name.eq_ignore_ascii_case(&name));
+        if found.is_some_and(|e| !e.is_dir || e.is_link) {
+            return refused("a file or link of that name is in Mods");
+        }
+        // The name as Mods spells it, so the original comes back as it was.
+        let dest = mods_dir.join(found.map_or(&*name, |e| e.name.as_str()));
+        if dests.iter().any(|d| same(d, &dest)) {
+            return refused("a second folder of that name");
+        }
+        let parked = |c: &Change| matches!(c, Change::Move { from, .. } if same(from, &dest));
+        if let Some(c) = earlier
+            .iter()
+            .find(|c| !parked(c) && stage_touches(c, &dest))
+        {
+            return refused(&format!("the launch changes it already ({})", c.summary()));
+        }
+        if let Some(e) = found.filter(|_| !earlier.iter().any(parked)) {
+            changes.push(Change::Move {
+                from: dest.clone(),
+                to: game_dir.join(PARKED).join("Mods").join(&e.name),
+            });
+        }
+        changes.push(Change::CopyDir {
+            from: dir.clone(),
+            dest: dest.clone(),
+        });
+        dests.push(dest);
+    }
+    let compiled = compiled_scripts(game_dir);
+    let kept = |c: &Change| matches!(c, Change::Rebuilt { path, .. } if same(path, &compiled));
+    if !dirs.is_empty() && fs.exists(&compiled) && !earlier.iter().any(kept) {
+        let data = fs
+            .read(&compiled)
+            .map_err(|e| format!("{}: {e}", compiled.display()))?;
+        changes.push(Change::Rebuilt {
+            sha: sha256_hex(&data),
+            backup: backups.join(compiled.file_name().unwrap_or_default()),
+            path: compiled,
+            keep: false,
+        });
+    }
+    Ok(changes)
+}
+
+/// Whether change `c` writes, moves or keeps `path`.
+fn stage_touches(c: &Change, path: &Path) -> bool {
+    let same = |a: &Path| a.as_os_str().eq_ignore_ascii_case(path.as_os_str());
+    match c {
+        Change::Rewrite { path, .. }
+        | Change::Rebuilt { path, .. }
+        | Change::NewLog { path }
+        | Change::Place { dest: path, .. }
+        | Change::CopyDir { dest: path, .. } => same(path),
+        Change::Move { from, .. } => same(from),
+    }
 }
 
 /// Makes `changes` in order, each step journaled before it acts: a [`Change::Rewrite`] is a Backup step (the copy read
@@ -381,6 +485,7 @@ pub fn apply(
                 sha,
                 bytes,
                 backup,
+                ignore,
             } => {
                 back_up(journal, path, sha, backup)?;
                 let id = journal.step(Action::Patch {
@@ -388,6 +493,7 @@ pub fn apply(
                     sha_before: sha.clone(),
                     sha_after: sha256_hex(bytes),
                     mtime: Some(fs.mtime(path)?),
+                    ignore: ignore.clone(),
                 })?;
                 fs.write_atomic(path, bytes)?;
                 if fs.read(path)? != *bytes {
@@ -447,6 +553,15 @@ pub fn apply(
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
                 }
                 let id = journal.step(Action::NewLog { path: path.clone() })?;
+                journal.done(id)?;
+            }
+            Change::CopyDir { from, dest } => {
+                if fs.exists(dest) {
+                    let why = format!("{} exists: nothing is staged over a mod", dest.display());
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
+                }
+                let id = journal.step(Action::NewDir { path: dest.clone() })?;
+                fs.copy_tree(from, dest)?;
                 journal.done(id)?;
             }
         }
@@ -1111,7 +1226,7 @@ mod tests {
                 | Change::Rebuilt { path, .. }
                 | Change::NewLog { path } => path.as_path(),
                 Change::Move { from, .. } => from.as_path(),
-                Change::Place { dest, .. } => dest.as_path(),
+                Change::Place { dest, .. } | Change::CopyDir { dest, .. } => dest.as_path(),
             })
             .collect();
         let want = [
@@ -1274,6 +1389,77 @@ mod tests {
             );
         }
         assert_eq!(fs.files(), before);
+    }
+
+    /// Finding 38: a test mod copied into Mods by hand and recycled after the boot. Staged, each folder is a copy; the
+    /// user's mod of that name (in another case) is parked first and comes back; the compiled scripts are kept and put
+    /// back. Refused before any change: a name quen never parks, a file in Mods, a second folder of one name.
+    #[test]
+    fn staged_mods_land_park_what_is_there_and_replay_away() {
+        let fs = game();
+        let compiled = compiled_scripts(Path::new("GAME"));
+        fs.put(&compiled, "compiled");
+        for (dir, tree) in [("PC/modalpha", "test alpha"), ("PC/modNew", "test new")] {
+            fs.put(dir, tree);
+        }
+        let before = fs.files();
+        let mods = [dir("modAlpha"), dir("modQuen"), file("modFile", false)];
+        let mut changes = plan(&fs, &inputs(&mods, &[])).unwrap();
+        let backups = Path::new("QUEN/backup");
+        let (game_dir, mods_dir) = (Path::new("GAME"), Path::new("GAME").join("Mods"));
+        let staged = |dirs: &[&str]| {
+            let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+            stage_mods(
+                &fs,
+                game_dir,
+                &dirs,
+                park::W3_NEVER_PARK,
+                &mods,
+                backups,
+                &changes,
+            )
+        };
+        for (dirs, why) in [
+            (&["PC/modQuen"][..], "never parks"),
+            (&["PC/modFile"], "a file or link"),
+            (&["PC/modNew", "PC/b/modnew"], "a second folder"),
+        ] {
+            let err = staged(dirs).unwrap_err();
+            assert!(
+                err.contains(why) && err.contains(dirs[dirs.len() - 1]),
+                "{err}"
+            );
+        }
+        let staged = staged(&["PC/modalpha", "PC/modNew"]).unwrap();
+        let alpha = mods_dir.join("modAlpha");
+        let parked = game_dir.join(PARKED).join("Mods").join("modAlpha");
+        let lines: Vec<String> = staged.iter().map(Change::summary).collect();
+        assert_eq!(
+            lines[..3],
+            [
+                format!("park {} -> {}", alpha.display(), parked.display()),
+                format!("stage PC/modalpha -> {}", alpha.display()),
+                format!("stage PC/modNew -> {}", mods_dir.join("modNew").display()),
+            ]
+        );
+        assert!(
+            matches!(&staged[3..], [Change::Rebuilt { path, .. }] if *path == compiled),
+            "{lines:?}"
+        );
+        changes.extend(staged);
+        let path = Path::new("QUEN/journal.jsonl");
+        let mut journal = Journal::create(&fs, path).unwrap();
+        apply(&fs, &mut journal, &changes, &|| false).unwrap();
+        assert_eq!(fs.read(&alpha).unwrap(), b"test alpha");
+        assert_eq!(fs.read(&parked).unwrap(), b"alpha");
+        // The game recompiles its scripts with the staged mods; the replay puts everything back.
+        fs.put(&compiled, "recompiled");
+        let report = replay(&fs.read(path).unwrap(), &fs);
+        assert!(report.clean() && report.kept.is_empty(), "{report:#?}");
+        let mut after = fs.files();
+        after.retain(|p, _| !p.starts_with("QUEN"));
+        assert_eq!(after, before);
+        assert!(report.recycled.contains(&alpha), "{report:#?}");
     }
 
     #[test]

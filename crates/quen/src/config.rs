@@ -114,7 +114,14 @@ impl Config {
 }
 
 /// quen's own folder, `%USERPROFILE%\.quen`: the default data root, and the config's folder.
+/// Unit tests get a folder of their own, so none reads or writes the user's: a live session's journal there once
+/// failed setup's `confirmed_values_are_written_keeping_other_keys_and_comments`, whose config names no data_root
+/// (2026-10-19).
 pub fn home() -> Option<PathBuf> {
+    if cfg!(test) {
+        let own = format!("quen-test-home-{}", std::process::id());
+        return Some(env::temp_dir().join(own));
+    }
     env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".quen"))
 }
 

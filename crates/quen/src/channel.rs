@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use quen_core::bridge_log::{PHOTO, VALID};
-use quen_core::protocol::{self, MAX_REPLY_BYTES, Reply, Request, Verb};
+use quen_core::protocol::{self, MAX_ITEM_COUNT, MAX_REPLY_BYTES, Reply, Request, Verb};
 use serde_json::{Map, Value, json};
 
 use crate::doctor;
@@ -28,6 +28,12 @@ const NO_REPLY: &str = "modQuen gave no reply";
 /// game_settime's and game_weather's read-back (world.get): the first read at once, then one every `CONFIRM_EVERY`, at
 /// most `CONFIRM_READS`, so about 3 s. modQuen blends the weather over 1 s (RequestWeatherChangeTo), and a read is
 /// answered on the game's next tick. ponytail: 2 s over the blend for slow ticks, until a live boot times it.
+/// game_weather's `settle_s` at most: past the 45 s seen for a path-tracing constant (finding 41).
+const SETTLE_MAX_S: f64 = 120.0;
+/// What game_weather's read-back can't show in gameplay (finding 41; the scripts read no blend weight, finding 30).
+const BLEND: &str = "the name changes at once, and the scripts read no blend weight. Seen in gameplay (2026-10-19, \
+    one PC): the sky and lighting switched within about 2-3 s, rain wetness ramped for about 20 s, a path-tracing \
+    constant took about 45 s";
 const CONFIRM_EVERY: Duration = Duration::from_millis(250);
 const CONFIRM_READS: usize = 13;
 
@@ -211,7 +217,9 @@ pub fn tools() -> Vec<Value> {
             "name": "game_listsaves",
             "description": format!("List the saves the game itself sees (its own list: bare lowercase names, \
                 cloud-only entries too), wherever the game ticks: gameplay, photo mode, the pause and main menus, \
-                not a loading screen. {needs}. Failed: no reply within 5 s."),
+                not a loading screen. no_file: the listed names with no file in gamesaves (a cloud-only save keeps \
+                its case and .sav): game_load and the launch refuse them, and the user can load one from the game's \
+                menu while they have the controls. {needs}. Failed: no reply within 5 s."),
             "inputSchema": schema(json!({}), &[]),
         }),
         json!({
@@ -234,10 +242,13 @@ pub fn tools() -> Vec<Value> {
             "name": "game_weather",
             "description": format!("Change the weather, blending over 1 s, as the vanilla console's \
                 changeweather does: only a name the current area's list holds, e.g. WT_Clear. An unknown name is \
-                refused with the area's list. In photo mode the weather didn't change: world_get still read the old \
-                one 40 s later (observed 2026-10-19); game_photo sets photo mode's own. {confirms} {taints}. {needs}, \
-                or {game}."),
-            "inputSchema": schema(json!({"name": {"type": "string", "description": "a weather name, e.g. WT_Clear"}}), &["name"]),
+                refused with the area's list. In photo mode it didn't change (game_photo sets photo mode's own). \
+                {confirms} In gameplay, blend: what blends on after that (observed); settle_s waits after it. \
+                {taints}. {needs}, or {game}."),
+            "inputSchema": schema(json!({
+                "name": {"type": "string", "description": "a weather name, e.g. WT_Clear"},
+                "settle_s": {"type": "number", "minimum": 0, "maximum": 120, "description": "seconds to wait once the change shows, in gameplay (observed: the sky about 2-3 s, rain wetness about 20 s, a path-tracing constant about 45 s); default none"},
+            }), &["name"]),
         }),
         json!({
             "name": "world_get",
@@ -250,6 +261,19 @@ pub fn tools() -> Vec<Value> {
                 the controls in a play session too. {needs}; with needs: quen-w3 0.1.4 or older, or {game}, or no \
                 player. Failed: no reply within 5 s."),
             "inputSchema": schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "game_items",
+            "description": format!("Add an item to the player's inventory by its own name (spaces allowed, no \
+                quotes), count of it, as the console's additem does, and with equip equip the first; quen-w3 0.1.10 \
+                or later. inventory: the item's count before and after, and equipped, read back by the game. Refused, \
+                nothing changed: no item of that name was added (the game's words in game_text). Failed: equip asked \
+                and the item added but not equipped. {taints}. {needs}, or {game}, or no player."),
+            "inputSchema": schema(json!({
+                "name": {"type": "string", "description": "the item's own name, as additem takes it, e.g. Wolf Armor 4"},
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_ITEM_COUNT, "description": "how many, default 1"},
+                "equip": {"type": "boolean", "description": "equip the first one added; default false"},
+            }), &["name"]),
         }),
         json!({
             "name": "game_teleport",
@@ -274,11 +298,21 @@ pub(crate) fn call(
     let known: &[&str] = match name {
         "game_pause" => &["on"],
         "game_settime" => &["day", "hour"],
-        "game_weather" => &["name"],
+        "game_weather" => &["name", "settle_s"],
         "game_teleport" => &["pos", "rot"],
+        "game_items" => &["name", "count", "equip"],
         _ => &[],
     };
     let cx = ctx(session, args, known)?;
+    let settle = match args.get("settle_s").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|s| (0.0..=SETTLE_MAX_S).contains(s))
+                .map(Duration::from_secs_f64)
+                .ok_or(format!("settle_s must be seconds, 0 to {SETTLE_MAX_S}"))?,
+        ),
+    };
     let verb = match name {
         "game_listsaves" => Verb::ListSaves {},
         "world_get" => Verb::WorldGet {},
@@ -298,6 +332,14 @@ pub(crate) fn call(
             pos: vec3(args, "pos")?.ok_or("pos must be [x, y, z]".to_string())?,
             rot: vec3(args, "rot")?.unwrap_or_default(),
         },
+        "game_items" => Verb::ItemsAdd {
+            name: text(args, "name")?.into(),
+            count: match args.get("count") {
+                None => 1,
+                Some(_) => whole(args, "count", MAX_ITEM_COUNT)?,
+            },
+            equip: game::flag(args, "equip")?,
+        },
         _ => return Err(Done::Refused(format!("unknown tool {name:?}"))),
     };
     let request = Request {
@@ -309,6 +351,9 @@ pub(crate) fn call(
     doctor::installed(&[&doctor::PACKAGE], cx.config, name)?;
     if name == "world_get" {
         doctor::package_at_least(cx.config, doctor::BEFORE_WORLD, "world_get", "0.1.5")?;
+    }
+    if name == "game_items" {
+        doctor::package_at_least(cx.config, doctor::BEFORE_ITEMS, "game_items", "0.1.10")?;
     }
     let last = cx.last_flags();
     if name != "game_listsaves" && last.is_none_or(|f| f & VALID == 0) {
@@ -323,7 +368,7 @@ pub(crate) fn call(
     let mut fields = Map::new();
     let taints = matches!(
         verb,
-        Verb::SetTime { .. } | Verb::Weather { .. } | Verb::Teleport { .. }
+        Verb::SetTime { .. } | Verb::Weather { .. } | Verb::Teleport { .. } | Verb::ItemsAdd { .. }
     );
     let journal = match taints {
         true => {
@@ -350,12 +395,38 @@ pub(crate) fn call(
             }
             fields.insert("reply".into(), json!(reply.text));
             if matches!(request.verb, Verb::SetTime { .. } | Verb::Weather { .. }) {
-                let confirmed = confirm(&cx, &request.verb, &mut fields);
+                let mut confirmed = confirm(&cx, &request.verb, &mut fields);
                 call.lap("confirm");
+                // Finding 41: in gameplay the name is all the read-back shows; what blends on is observed only.
+                let gameplay = last.is_some_and(|f| f & PHOTO == 0);
+                if confirmed.is_ok() && gameplay && matches!(request.verb, Verb::Weather { .. }) {
+                    fields.insert("blend".into(), json!(BLEND));
+                    if let Some(d) = settle {
+                        if crate::measure::settle(call, d, "game_weather") {
+                            fields.insert("settled_s".into(), json!(d.as_secs_f64()));
+                            call.lap("settle");
+                        } else {
+                            let why =
+                                format!("{} during settle_s, after the change", call.stop_cause());
+                            confirmed = Err(why);
+                        }
+                    }
+                }
                 return match confirmed {
                     Ok(()) => Ok(fields),
                     Err(why) => Err(Done::Failed(why, fields)),
                 };
+            }
+            // Finding 42: the item's count read back; an equip it doesn't show fails, the item added.
+            if let Verb::ItemsAdd { equip, .. } = request.verb {
+                let inventory = reply.data.unwrap_or_default();
+                let equipped = inventory["equipped"] == true;
+                fields.insert("inventory".into(), inventory);
+                if equip && !equipped {
+                    let why = "the item was added, but the game reads it back as not equipped";
+                    return Err(Done::Failed(why.into(), fields));
+                }
+                return Ok(fields);
             }
             // Only listsaves and world.get read back.
             let key = if name == "world_get" {
@@ -363,11 +434,36 @@ pub(crate) fn call(
             } else {
                 "saves"
             };
+            if name == "game_listsaves" {
+                let no_file = no_file(cx.config, reply.data.as_ref());
+                fields.extend(no_file.map(|n| ("no_file".to_string(), n)));
+            }
             fields.extend(reply.data.map(|data| (key.to_string(), data)));
             Ok(fields)
         }
         Err(e) => Err(e.done(fields)),
     }
+}
+
+/// The names of `saves` (listsaves' list) with no file in gamesaves, matched as game_load matches: a cloud-only save
+/// keeps its case and ".sav" (finding 34). None when gamesaves can't be read.
+fn no_file(config: &crate::config::Config, saves: Option<&Value>) -> Option<Value> {
+    let files: Vec<String> = std::fs::read_dir(config.saves_dir()?)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_lowercase())
+        .collect();
+    let on_disk = |n: &str| {
+        let n = n.to_lowercase();
+        files.contains(&n) || files.contains(&format!("{n}.sav"))
+    };
+    let names: Vec<&str> = saves?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|n| !on_disk(n))
+        .collect();
+    Some(json!(names))
 }
 
 /// Reads the world back (world.get) until it shows `verb`'s settime or weather, at most [`CONFIRM_READS`] times; the
@@ -744,10 +840,13 @@ pub(crate) mod tests {
                 _ => vec![reply(r.id, true, "done", None)],
             }),
         );
+        // Finding 34: a listed name without a file in gamesaves (a cloud-only save) is in no_file.
+        fs::write(fx.dir.join("docs/gamesaves/A.sav"), "synthetic").unwrap();
         let mut session = fx.session();
         let saves = run(&mut session, "game_listsaves", json!({"token": "tok"}));
         assert_eq!(saves["ok"], true, "{saves}");
         assert_eq!(saves["saves"], json!(["a", "b"]));
+        assert_eq!(saves["no_file"], json!(["b"]), "{saves}");
         let pause = run(
             &mut session,
             "game_pause",
@@ -849,6 +948,65 @@ pub(crate) mod tests {
         vec![reply(r.id, true, "the world", Some(world))]
     }
 
+    /// Finding 42: game_items sends the item's name as it is, spaces and all, journals it as tainting, and answers the
+    /// game's read-back as inventory; nothing added is the game's refusal, an equip not shown fails.
+    #[test]
+    fn game_items_adds_by_name_and_reads_the_inventory_back() {
+        let fx = served("channel-items");
+        let server = fake_game(
+            &token(&fx),
+            3,
+            Box::new(|r| match &r.verb {
+                Verb::ItemsAdd { name, .. } if name == "Nope" => {
+                    let data = json!({"before": 0, "after": 0, "equipped": false});
+                    vec![reply(
+                        r.id,
+                        false,
+                        "nothing added: no item is named Nope",
+                        Some(data),
+                    )]
+                }
+                Verb::ItemsAdd { count, equip, .. } => {
+                    let data =
+                        json!({"before": 1, "after": 1 + count, "equipped": *equip && *count == 1});
+                    vec![reply(r.id, true, "added", Some(data))]
+                }
+                _ => unreachable!(),
+            }),
+        );
+        let mut session = fx.session();
+        let wolf = json!({"token": "tok", "name": "Red Wolf Armor 2", "equip": true});
+        let out = run(&mut session, "game_items", wolf);
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["inventory"]["after"], 2, "{out}");
+        let nope = run(
+            &mut session,
+            "game_items",
+            json!({"token": "tok", "name": "Nope"}),
+        );
+        assert_eq!(nope["refused"], true, "{nope}");
+        let two = json!({"token": "tok", "name": "Wolf Armor 4", "count": 2, "equip": true});
+        let two = run(&mut session, "game_items", two);
+        assert_eq!(
+            (&two["ok"], &two["refused"]),
+            (&json!(false), &json!(false)),
+            "{two}"
+        );
+        assert_eq!(two["inventory"]["after"], 3, "{two}");
+        let bad = json!({"token": "tok", "name": "Wolf Armor 4", "count": 0});
+        assert_eq!(run(&mut session, "game_items", bad)["refused"], true);
+        let verbs: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert_eq!(
+            verbs[0],
+            Verb::ItemsAdd {
+                name: "Red Wolf Armor 2".into(),
+                count: 1,
+                equip: true
+            }
+        );
+        assert!(journal(&fx).contains("items.add"), "journaled as tainting");
+    }
+
     /// game_settime and game_weather read the world back until it shows the change: the clock at once, the weather on
     /// the third read here (a blend). Ok, with the last read-back as `world`.
     #[test]
@@ -875,10 +1033,21 @@ pub(crate) mod tests {
             json!({"day": 3, "hour": 22}),
             "{time}"
         );
-        let weather = json!({"token": "tok", "name": "WT_Mid_Clouds"});
+        // Finding 41: settle_s is checked before anything is sent; in gameplay the result says what blends on, and
+        // the call waits settle_s once the change shows.
+        let late = json!({"token": "tok", "name": "WT_Mid_Clouds", "settle_s": 121});
+        assert_eq!(run(&mut session, "game_weather", late)["refused"], true);
+        let weather = json!({"token": "tok", "name": "WT_Mid_Clouds", "settle_s": 0.3});
+        let started = Instant::now();
         let weather = run(&mut session, "game_weather", weather);
+        assert!(started.elapsed() >= Duration::from_millis(300));
         assert_eq!(weather["ok"], true, "{weather}");
         assert_eq!(weather["world"]["weather"], "WT_Mid_Clouds", "{weather}");
+        assert_eq!(weather["settled_s"], 0.3, "{weather}");
+        assert!(
+            weather["blend"].as_str().unwrap().contains("45 s"),
+            "{weather}"
+        );
         let verbs: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
         assert_eq!(verbs.iter().filter(|v| **v == Verb::WorldGet {}).count(), 4);
     }

@@ -205,16 +205,29 @@ pub fn leftovers(
 }
 
 /// The ids of `rows` (captures the ledger says are on disk) that no file of `files` matches: removed by hand, or kept
-/// under another capture root (feature tests 2b). Sorted.
-pub fn missing(rows: &[CaptureRow], files: &[File]) -> Vec<i64> {
+/// under another capture root (feature tests 2b). Those of quen's boots first, then of imported boots, then of no
+/// boot, each sorted, with how many of each (finding 36: the harness import records its files by their path in its
+/// own folder, and without a boot but for its boot logs).
+pub fn missing(rows: &[CaptureRow], files: &[File]) -> (Vec<i64>, [usize; 3]) {
     let found: std::collections::HashSet<i64> = files.iter().filter_map(|f| f.capture).collect();
-    let mut ids: Vec<i64> = rows
+    let mut gone: Vec<(usize, i64)> = rows
         .iter()
-        .map(|r| r.id)
-        .filter(|id| !found.contains(id))
+        .filter(|r| !found.contains(&r.id))
+        .map(|r| {
+            (
+                if r.boot_id.is_none() {
+                    2
+                } else {
+                    usize::from(r.imported)
+                },
+                r.id,
+            )
+        })
         .collect();
-    ids.sort_unstable();
-    ids
+    gone.sort_unstable();
+    let mut counts = [0; 3];
+    gone.iter().for_each(|&(origin, _)| counts[origin] += 1);
+    (gone.into_iter().map(|(_, id)| id).collect(), counts)
 }
 
 /// The usage: totals by boot (largest first), by kind and by age, and every file over [`LARGE`].
@@ -491,6 +504,7 @@ mod tests {
             id,
             path: path.into(),
             boot_id: boot,
+            imported: false,
             cited,
         }
     }
@@ -537,7 +551,12 @@ mod tests {
             row(9, "old/x.png", Some(9), false),
             row(5, "y.png", None, true),
         ];
-        assert_eq!(missing(&gone, &files), [5, 9]);
+        assert_eq!(missing(&gone, &files), (vec![9, 5], [1, 0, 1]));
+        let imported = CaptureRow {
+            imported: true,
+            ..row(7, "z.png", Some(3), false)
+        };
+        assert_eq!(missing(&[imported], &files), (vec![7], [0, 1, 0]));
         assert_eq!(total(&t.0), 555);
         let mut dirs = super::folders(&t.0);
         dirs.sort();

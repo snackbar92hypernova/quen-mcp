@@ -741,10 +741,23 @@ fn measurements_need_a_lowercase_method_family() {
         extraction_id: None,
         world: None,
     };
-    for bad in ["PresentMon", "present mon", ""] {
-        assert!(l.add_measurement(&m(bad)).is_err(), "{bad:?}");
+    // Finding 32: a tool's name or a new family is refused too, naming the list.
+    for bad in [
+        "PresentMon",
+        "present mon",
+        "",
+        "rea",
+        "dxil",
+        "game_data",
+        "perf_func",
+    ] {
+        match l.add_measurement(&m(bad)) {
+            Err(Error::Refused(why)) => assert!(why.contains("static_re, mem, files"), "{why}"),
+            other => panic!("{bad:?}: {other:?}"),
+        }
     }
-    let id = l.add_measurement(&m("perf_func")).unwrap();
+    let id = l.add_measurement(&m("static_re")).unwrap();
+    assert!(l.unknown_families().unwrap().is_empty());
     let claim = l
         .add_claim(&Claim {
             text: "pool size is 4096".into(),
@@ -765,11 +778,35 @@ fn measurements_need_a_lowercase_method_family() {
     );
 }
 
+/// Finding 32: rows an older quen took with another family are listed by family, read only, and stay as written.
+#[test]
+fn unknown_families_lists_older_rows_without_touching_them() {
+    let db = TempDb::new();
+    drop(Ledger::open(&db.0).unwrap());
+    Connection::open(&db.0)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO measurements (metric, method_family, tag) VALUES ('a', 'rea', 'static_re'), \
+             ('b', 'tracy', 'M'), ('c', 'dxil', 'static_re'), ('d', 'rea', 'O')",
+        )
+        .unwrap();
+    let l = Ledger::open_readonly(&db.0).unwrap();
+    assert_eq!(
+        l.unknown_families().unwrap(),
+        [
+            ("dxil".to_string(), vec![3]),
+            ("rea".to_string(), vec![1, 4])
+        ]
+    );
+    let families = "SELECT group_concat(method_family) FROM measurements";
+    assert_eq!(rows(&l, families, &[]), [[json!("rea,tracy,dxil,rea")]]);
+}
+
 #[test]
 fn rows_deserialize_from_json_and_refuse_unknown_fields() {
     let m: Measurement = serde_json::from_value(json!({
         "boot_id": null, "capture_id": null, "metric": "rva_writes", "value": 1.0, "unit": null, "state_label": null,
-        "method_family": "rea", "tag": "static_re", "run_id": null, "note": "synthetic"
+        "method_family": "static_re", "tag": "static_re", "run_id": null, "note": "synthetic"
     }))
     .unwrap();
     assert_eq!(m.tag, Tag::StaticRe);

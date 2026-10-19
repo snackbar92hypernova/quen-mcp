@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.10 adds the items.add verb (game_items, channel.rs) to both files.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.10",
+        sha256: "e0d17b5657b10846db4694d9390bec6c06d964be0572f2a908c4dbcc14c3d3e3",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.10",
+        sha256: "45326db9258223da00ac84910414b59ffb18f83b2fee0123732a52c54e53db47",
+        exact: true,
+    },
     // 0.1.9 adds the photo.* verbs (game_photo, photo.rs) and world.get's rain, snow and sky flag to both files.
     Pin {
         file: PACKAGE_ASI,
@@ -98,7 +111,8 @@ const PINS: &[Pin] = &[
         sha256: "9fc78e8715f52447194ec25652e4ab8898c83b80c512743f44b05ddbdee30730",
         exact: true,
     },
-    // 0.1.6 adds the state's menu bit (game.rs close_menu) to quen.ws, and the release to W3Quen.log's first line.
+    // 0.1.6 adds the state's menu bit (game.rs close_menu) to quen.ws, and the release to W3Quen.log's natives line (in
+    // a tracy launch the hook lines come before it).
     // Never published: 0.1.7 supersedes it, with the same behaviour.
     Pin {
         file: PACKAGE_ASI,
@@ -233,6 +247,19 @@ pub(crate) const BEFORE_PHOTO: &[&str] = &[
     "quen-w3 0.1.8",
 ];
 
+/// The package releases from before the items.add verb (quen-w3 0.1.10): game_items refuses them with needs.
+pub(crate) const BEFORE_ITEMS: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+    "quen-w3 0.1.9",
+];
+
 /// Refused with needs, nothing sent, while quen's package in the game is one of `before`: releases without what
 /// `tool` needs, which came in quen-w3 `since`. An unpinned package (a dev build) goes on: its ASI refuses a verb it
 /// doesn't know.
@@ -334,7 +361,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         that isn't the newest, game_listsaves, game_pause, game_settime, game_weather, game_teleport, game_camera \
         and (from quen-w3 0.1.2) sweep_play; from quen-w3 0.1.3, session_launch profiler tracy:NAME; from quen-w3 \
         0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
-        quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo",
+        quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo; from quen-w3 0.1.10, \
+        game_items",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
@@ -752,6 +780,22 @@ fn quen_saves(config: &Config) -> Value {
             .into_iter()
             .filter(|r| r[0].as_str().is_some_and(|file| dir.join(file).is_file()))
             .map(|r| json!({"file": r[0], "boot": r[1], "tainted": r[2] == 1}))
+            .collect(),
+        Err(e) => json!(format!("the ledger can't be read: {e}")),
+    }
+}
+
+/// The measurement rows whose method family is outside the playbook's list, by family: written before quen refused
+/// them (finding 32), reported and never rewritten. Empty when there are none.
+fn unknown_families(config: &Config) -> Value {
+    let db = config.state_dir().join("quen.db");
+    if !db.exists() {
+        return json!([]);
+    }
+    match Ledger::open_readonly(&db).and_then(|l| l.unknown_families()) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(family, ids)| json!({"family": family, "rows": ids.len(), "ids": ids}))
             .collect(),
         Err(e) => json!(format!("the ledger can't be read: {e}")),
     }
@@ -1414,6 +1458,7 @@ pub fn call(shared: &Shared, args: &Value) -> Value {
             let mut fields = report(&cx);
             fields.insert("captures".into(), crate::disk::summary(&disk.config));
             fields.insert("quen_saves".into(), quen_saves(&disk.config));
+            fields.insert("unknown_families".into(), unknown_families(&disk.config));
             // AppData redirected into an app package, or an older quen's folders in AppData (relocate.rs); always
             // there, empty when there are none.
             let places = crate::relocate::Places::here();

@@ -1365,7 +1365,7 @@ fn a_launch_needs_the_native_bridge_and_quen_s_package_whole() {
     off_in(&fx, r"Mods\modQuenRpc");
     fs::write(fx.path("game").join(PARTS[4]), "another release").unwrap();
     broken(
-        "quen.ws is not the version quen expects (quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
+        "quen.ws is not the version quen expects (quen-w3 0.1.10, quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
     );
     off_in(&fx, PARTS[4]); // quen.ws
     broken(r"W3Quen.asi without Mods\modQuen, half the package");
@@ -2232,6 +2232,11 @@ fn a_screenshot_needs_the_session_token() {
     let tools = quen.request("tools/list", json!({}));
     let listed = tools["result"]["tools"].as_array().unwrap();
     assert!(listed.iter().any(|t| t["name"] == "game_screenshot"));
+    // Finding 38: session_status fingerprints the list a client got.
+    let status = quen.tool("session_status", json!({}));
+    let sha = quen_core::journal::sha256_hex(tools["result"].to_string().as_bytes());
+    let fingerprint = json!({"count": listed.len(), "sha256": sha});
+    assert_eq!(status["tools"], fingerprint, "{status}");
     let refused =
         |e: &Value, why: &str| e["refused"] == true && e["reason"].as_str().unwrap().contains(why);
     let early = quen.tool("game_screenshot", json!({"token": "x", "tag": "A1"}));

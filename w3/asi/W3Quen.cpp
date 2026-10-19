@@ -29,9 +29,9 @@
 #include "WitcherNativeBridgeApi.h"
 #pragma comment(lib, "advapi32")
 
-// quen-w3's release, named on W3Quen.log's first line and by pack.py's zip. Each release's ASI then differs from the last,
-// which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.9";
+// quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
+// zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
+constexpr char kVersion[] = "0.1.10";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -42,6 +42,9 @@ constexpr size_t kMaxNotice = 160;
 // protocol.rs's MAX_FILTER_BYTES and MAX_TICK_S: photo.list's filter and photo.tick's seconds, from quen-w3 0.1.9.
 constexpr size_t kMaxFilter = 200;
 constexpr float kMaxTick = 10;
+// protocol.rs's MAX_ITEM_BYTES and MAX_ITEM_COUNT: items.add's name and count, from quen-w3 0.1.10.
+constexpr size_t kMaxItem = 200;
+constexpr uint64_t kMaxItemCount = 1000;
 // photo.grade's sliders, in modQuen's QUEN_Grade order, as protocol.rs names them.
 constexpr const char* kGrade[] = {"exposure", "contrast", "highlights", "saturation", "temperature", "vignette", "grain",
                                   "chromatic_aberration"};
@@ -766,6 +769,12 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
       cmd.args += given ? " 1 " + Fixed(f) : std::string(" 0 0");
     }
     ok = ok && any;
+  } else if (v == "items.add") {
+    // "<count> <equip 0|1> <name>": the name last, as it may hold spaces.
+    Value equip;
+    ok = whole("count", kMaxItemCount, n) && n > 0 && take("equip", Value::kBool, equip) && name("name") &&
+         cmd.args.size() <= kMaxItem + 1;
+    cmd.args = ' ' + std::to_string(n) + (equip.flag ? " 1" : " 0") + cmd.args;
   } else if (v == "photo.reset") {
     const char* parts[] = {"weather", "env", "grading"};
     int part = -1;
@@ -809,7 +818,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   if (!ok) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
             "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
-            "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes)";
+            "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes, an "
+            "items.add name over 200 bytes or count outside 1 to 1000)";
     return false;
   }
   if (!fields.empty()) {
@@ -890,6 +900,8 @@ static void Next(void*, void* frame, void* result) {
 // '|') -> ["a","b","c"]; cam.get, cam.set, cam.path and cam.frame "<camera> x y z pitch yaw roll fov" ->
 // {"camera":..,"pos":[..],"rot":[..],"fov":..}; world.get "x y z heading day hour rain snow skyclear weather" ->
 // {"player":{"pos":[..],"heading":..},"time":{"day":..,"hour":..},"rain":..,"snow":..,"sky_clear":..,"weather":..};
+// items.add "before after equipped" (the item's count before and after, equipped 0 or 1) ->
+// {"before":..,"after":..,"equipped":..};
 // the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
 // {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
 // "world_weather":..}.
@@ -909,6 +921,13 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
       if (!ParseFloat(t[k + 1], v[k])) return false;
     json = "{\"camera\":" + Quote(t[0]) + ",\"pos\":[" + Number(v[0]) + ',' + Number(v[1]) + ',' + Number(v[2]) +
            "],\"rot\":[" + Number(v[3]) + ',' + Number(v[4]) + ',' + Number(v[5]) + "],\"fov\":" + Number(v[6]) + '}';
+    return true;
+  }
+  uint64_t before = 0, after = 0;
+  if (verb == "items.add" && t.size() == 3) {
+    if (!Whole(t[0], INT32_MAX, before) || !Whole(t[1], INT32_MAX, after) || (t[2] != "0" && t[2] != "1")) return false;
+    json = "{\"before\":" + std::to_string(before) + ",\"after\":" + std::to_string(after) +
+           ",\"equipped\":" + (t[2] == "1" ? "true" : "false") + '}';
     return true;
   }
   // rain, snow and the sky flag, "r s 0|1" as QUENRPC_Env writes them, as JSON members.

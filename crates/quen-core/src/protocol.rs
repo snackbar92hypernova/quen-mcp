@@ -140,6 +140,15 @@ pub enum Verb {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filter: Option<String>,
     },
+    /// Add `count` of the item `name` (its own name, spaces allowed) to the player's inventory, as the console's
+    /// `additem` does, and with `equip` equip the first; the reply's data reads the item's count back (it taints later
+    /// saves). 1 to [`MAX_ITEM_BYTES`] bytes, no control character; `count` 1 to [`MAX_ITEM_COUNT`].
+    #[serde(rename = "items.add")]
+    ItemsAdd {
+        name: String,
+        count: u32,
+        equip: bool,
+    },
 }
 
 /// What `photo.reset` puts back.
@@ -165,6 +174,10 @@ pub const MAX_NOTICE_BYTES: usize = 160;
 pub const MAX_FILTER_BYTES: usize = 200;
 /// The longest `photo.tick` time, in seconds (photo mode's menu itself passes 0.00001 s and 1 s).
 pub const MAX_TICK_S: f32 = 10.0;
+/// The longest `items.add` item name, in bytes.
+pub const MAX_ITEM_BYTES: usize = 200;
+/// The most of one item `items.add` adds.
+pub const MAX_ITEM_COUNT: u32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -254,6 +267,16 @@ impl Verb {
             } if !name(filter) || filter.len() > MAX_FILTER_BYTES => Err(Error::Invalid(format!(
                 "a filter is 1 to {MAX_FILTER_BYTES} bytes, no control character"
             ))),
+            Verb::ItemsAdd { name: s, count, .. }
+                if !name(s)
+                    || s.len() > MAX_ITEM_BYTES
+                    || !(1..=MAX_ITEM_COUNT).contains(count) =>
+            {
+                Err(Error::Invalid(format!(
+                    "items.add: a name of 1 to {MAX_ITEM_BYTES} bytes, no control character, and a count of 1 \
+                     to {MAX_ITEM_COUNT}"
+                )))
+            }
             Verb::PhotoTime { minute } if !(0.0..1440.0).contains(minute) => Err(Error::Invalid(
                 format!("photo.time minute {minute}: 0 to below 1440"),
             )),
@@ -452,6 +475,11 @@ mod tests {
                 what: PhotoListed::Weathers,
                 filter: None,
             },
+            Verb::ItemsAdd {
+                name: "Red Wolf Armor 2".into(),
+                count: 1,
+                equip: true,
+            },
         ]
     }
 
@@ -532,6 +560,20 @@ mod tests {
             invalid(Verb::PhotoList {
                 what: PhotoListed::Envs,
                 filter: Some(filter),
+            });
+        }
+        // Finding 42: items.add's name and count.
+        for (name, count) in [
+            (String::new(), 1),
+            ("a\tb".into(), 1),
+            ("x".repeat(MAX_ITEM_BYTES + 1), 1),
+            ("Wolf Armor 4".into(), 0),
+            ("Wolf Armor 4".into(), MAX_ITEM_COUNT + 1),
+        ] {
+            invalid(Verb::ItemsAdd {
+                name,
+                count,
+                equip: false,
             });
         }
         for line in [
