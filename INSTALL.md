@@ -47,7 +47,7 @@ Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 - **quen checks the build itself.** Before a launch changes anything, it hashes `witcher3.exe`: a build it doesn't know (a game update, another store's copy) is refused, and the reason gives the exe's sha256 and its PE stamp. quen knows Steam's 5.01. To test another build anyway, the agent passes `allow_unknown_build` for that launch (the boot's record says so); once you have checked a build works, you can add it to the config's `known_builds` (§3).
 - Only the Steam copy has been used so far. GOG is untested: its exe counts as unknown until someone verifies it there.
 
-**An MCP client** to talk to quen: Claude Code (the CLI or the desktop app) is the one quen is built and tested with. VS Code, Cursor and Gemini CLI should work: quen passes protocol checks with the official MCP tools, but nobody has tried them with a model yet. Codex CLI can't start quen on Windows yet (section 4). What each client does with quen's long calls: [docs/clients.md](docs/clients.md).
+**An MCP client** to talk to quen: Claude Code (the CLI or the desktop app) is the one quen is built and tested with. VS Code, Cursor and Gemini CLI should work: quen passes protocol checks with the official MCP tools, but nobody has tried them with a model yet. Codex CLI needs `quen serve --stay` started in a terminal first (section 4). What each client does with quen's long calls: [docs/clients.md](docs/clients.md).
 
 **Rust and Git, to build quen.**
 - Rust: install rustup from <https://rustup.rs>. On Windows it also needs the Microsoft C++ build tools ("Desktop development with C++"); the rustup installer offers them. The repo pins its Rust version (`rust-toolchain.toml`), and rustup downloads it on the first build.
@@ -210,7 +210,13 @@ claude mcp add --scope user quen -- quen mcp
 
 Nothing to set for time: its tool timeout is about 28 hours.
 
-**Codex CLI: doesn't work on Windows yet.** Codex runs each MCP server inside a Windows job that closes everything when Codex closes, and won't let quen's background `quen serve` leave it. quen refuses to start there: closing Codex would kill the game mid-save. While a `quen serve` for the same config is already running (started by another client), Codex can use it. The setup, for when that changes, in `%USERPROFILE%\.codex\config.toml`:
+**Codex CLI: start `quen serve --stay` first.** Codex runs each MCP server inside a Windows job that closes everything when Codex closes, and won't let quen's background `quen serve` leave it, so quen won't start it there: closing Codex would kill the game mid-save. Start it yourself instead, before opening Codex:
+
+1. Open a terminal (PowerShell or Windows Terminal) and run `quen serve --stay`. It prints one line with its pid and says Ctrl+C ends it. Leave that terminal open while you use Codex.
+2. Open Codex. Its `quen mcp` connects to that `quen serve`.
+3. When you're done, press Ctrl+C in that terminal: a live session ends the normal way, then `quen serve` exits. Don't close the terminal window during a session: Windows gives a closing console only 5 s.
+
+The terminal must run the same `quen.exe` as Codex's `command` (both ends check). Tested against a simulated Codex job, not yet with real Codex. Details: [docs/clients.md](docs/clients.md#clients-that-hold-servers-in-a-job-object). Codex's entry, in `%USERPROFILE%\.codex\config.toml`:
 
 ```toml
 [mcp_servers.quen]
@@ -221,7 +227,7 @@ tool_timeout_sec = 120
 ```
 
 - `tool_timeout_sec`: quen answers within about 20 s (then `job_status`), so 120 leaves room. Codex's default is 60 or 300 s depending on the version.
-- Codex passes only a short list of environment variables to servers. If you set `QUEN_CONFIG`, add `env_vars = ["QUEN_CONFIG"]`, or `env = { QUEN_CONFIG = '<path>' }`.
+- Codex passes only a short list of environment variables to servers. If you set `QUEN_CONFIG`, add `env_vars = ["QUEN_CONFIG"]`, or `env = { QUEN_CONFIG = '<path>' }`, and set the same `QUEN_CONFIG` in the terminal that runs `quen serve --stay`: with another config, Codex's `quen mcp` looks for another `quen serve`.
 
 **VS Code (Copilot agent mode).** In your user `mcp.json` (Command Palette: *MCP: Open User Configuration*) or a workspace's `.vscode\mcp.json`:
 
@@ -279,7 +285,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 | `state\quen.db` | the ledger (SQLite): games, boots, saves, mod sets, captures, measurements |
 | `gamesaves\` | a copy of your `gamesaves` folder, refreshed before every launch |
 | `logs\<time>-<session>\` | one folder per session: the backups of the files it patched (`backup\`), the game's log, a numbered log per tool step (PresentMon's too), the finished journal, and `game-logs\`: copies of the game folder's `*.log` files the boot wrote (quen's, the Native Bridge's, ReShade's, the mods'), which the next launch would overwrite. They can hold personal data (a Steam id, the PC's name): keep them on this PC |
-| `logs\serve.log` | the background `quen serve` log |
+| `logs\serve.log` | the background `quen serve` log (a `quen serve --stay` writes to its terminal instead) |
 | `logs\queries\` | `ledger_query` results too big to answer inline |
 | `state\backups\` | a copy of the ledger from before each upgrade of its schema |
 | `captures\<session>\` | screenshots, PresentMon CSVs and memory-tool results too big to answer inline (or under `capture_root`) |
