@@ -127,6 +127,11 @@ fn action(fs: &MemFs, op: &Op) -> Action {
             sha_before: fs.sha256(path).unwrap(),
             sha_after: sha256_hex(bytes),
             mtime: Some(fs.mtime(path).unwrap()),
+            // As a launch journals dx12user.settings: its forced keys and the game's version stamp (finding 35).
+            ignore: match path == Path::new(SETTINGS) {
+                true => vec!["AutoRotate".into(), "LastGameVersion".into()],
+                false => Vec::new(),
+            },
         },
         Op::Move(from, to) => Action::Move {
             from: from.clone(),
@@ -298,7 +303,10 @@ fn assert_reported(original: &BTreeMap<PathBuf, Vec<u8>>, fs: &MemFs, report: &R
             Action::Patch { path, .. } => vec![path.as_path()],
             Action::Move { from, to, .. } => vec![from.as_path(), to.as_path()],
             Action::Place { dest, .. } => vec![dest.as_path()],
-            Action::Rebuilt { path, .. } | Action::Stage { path, .. } | Action::NewLog { path } => {
+            Action::Rebuilt { path, .. }
+            | Action::Stage { path, .. }
+            | Action::NewLog { path }
+            | Action::NewDir { path } => {
                 vec![path.as_path()]
             }
             Action::GameMemory { .. } => vec![],
@@ -360,6 +368,26 @@ fn a_config_the_game_rewrote_is_kept_beside_then_restored() {
         user_state().read(Path::new(SETTINGS)).unwrap()
     );
     assert_reported(&user_files(&user_state()), &fs, &report);
+}
+
+/// Finding 35: a copy that differs from the user's only in the step's ignored keys isn't kept beside; a note says so.
+#[test]
+fn a_rewrite_only_in_ignored_keys_is_not_kept() {
+    let (fs, journal) = ended();
+    fs.put(
+        SETTINGS,
+        "[Rendering]\r\nMotionBlur=true\r\n[Gameplay]\r\nAutoRotate=false\r\nLastGameVersion=5.01\r\n",
+    );
+    let report = replay(&journal, &fs);
+    assert!(report.kept.is_empty() && report.clean(), "{report:#?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("only in AutoRotate, LastGameVersion: not kept")),
+        "{report:#?}"
+    );
+    assert_eq!(user_files(&fs), user_files(&user_state()));
 }
 
 /// An atomic write a crash cut off leaves `<file>.quen-tmp` beside a file the journal names; the replay sends it to

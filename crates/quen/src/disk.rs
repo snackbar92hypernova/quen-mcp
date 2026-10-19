@@ -88,8 +88,9 @@ struct Found {
     files: Vec<File>,
     /// quen's other leftovers under the data root ([`disk::leftovers`]).
     leftovers: Vec<File>,
-    /// Capture rows marked on disk whose file isn't under the capture root.
-    missing: Vec<i64>,
+    /// Capture rows marked on disk whose file isn't under the capture root, and how many are of quen's boots, of
+    /// imported boots and of no boot ([`disk::missing`]).
+    missing: (Vec<i64>, [usize; 3]),
     /// The folder names that belong to a boot (`Ledger::boot_folders`).
     folders: Vec<(String, i64)>,
     /// The ledger's error, when it can't be read.
@@ -264,7 +265,7 @@ pub fn usage(shared: &Shared, args: &Value) -> Value {
             .map_err(|e| format!("quen's config: {e}"))?;
         let select = selection(args, &[])?;
         let found = files(config);
-        let (files, missing) = (&found.files, &found.missing);
+        let (files, (missing, by)) = (&found.files, &found.missing);
         let mut out = budget(config, files.iter().map(|f| f.bytes).sum());
         let usage = disk::usage(files);
         out.extend(usage.as_object().cloned().unwrap_or_default());
@@ -290,11 +291,15 @@ pub fn usage(shared: &Shared, args: &Value) -> Value {
         }
         if !missing.is_empty() {
             let note = "capture rows the ledger says are on disk, with no file under the capture root (removed by \
-                        hand, or under another capture root); ids lists the first 50";
+                        hand, or under another capture root), by origin: quen_boots, imported_boots (harness_info) \
+                        and no_boot (recorded without a boot: the harness import records each file of its cap \
+                        folder so, its boot logs aside, by its path in that folder); ids lists the first 50, \
+                        quen's boots' first";
             let ids = &missing[..missing.len().min(50)];
             out.insert(
                 "missing".into(),
-                json!({"rows": missing.len(), "ids": ids, "note": note}),
+                json!({"rows": missing.len(), "quen_boots": by[0], "imported_boots": by[1],
+                       "no_boot": by[2], "ids": ids, "note": note}),
             );
         }
         if let Some(note) = &found.note {
@@ -487,7 +492,7 @@ fn take(
     let leftover_folders = removed(&config.data_root, leftovers_emptied);
     // Rows whose file was gone already, marked in one transaction (feature tests 2c: batches 1-2's 3,887).
     let missing = match select.missing {
-        true => found.missing.as_slice(),
+        true => found.missing.0.as_slice(),
         false => &[],
     };
     let mut fields = Map::new();
@@ -633,6 +638,9 @@ mod tests {
         let used = usage(&fx.shared, &json!({}));
         assert_eq!(used["missing"]["rows"], 1, "{used}");
         assert_eq!(used["missing"]["ids"], json!([gone]), "{used}");
+        // Finding 36: counted by origin; this row is a quen boot's.
+        let by = ["quen_boots", "imported_boots", "no_boot"].map(|k| used["missing"][k].clone());
+        assert_eq!(by, [json!(1), json!(0), json!(0)], "{used}");
         let kinds = used["leftovers"]["by_kind"].as_array().unwrap();
         assert!(
             kinds.contains(&json!({"kind": "session_logs", "files": 2, "gb": 0.0})),

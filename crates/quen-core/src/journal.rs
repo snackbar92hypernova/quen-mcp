@@ -30,6 +30,11 @@ pub trait Fs {
     fn fsync(&self, path: &Path) -> io::Result<()>;
     /// Sends `path` to the Recycle Bin: nothing is ever deleted for good.
     fn recycle(&self, path: &Path) -> io::Result<()>;
+    /// Copies the folder `from` (on this PC) to `to`, where nothing is, with its whole tree. A flat file system (no
+    /// folders, as [`MemFs`]) copies the one entry.
+    fn copy_tree(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.write_atomic(to, &self.read(from)?)
+    }
     /// A file's last write time, in nanoseconds since 1970.
     fn mtime(&self, path: &Path) -> io::Result<u64>;
     fn set_mtime(&self, path: &Path, nanos: u64) -> io::Result<()>;
@@ -87,6 +92,11 @@ pub enum Action {
         sha_after: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<u64>,
+        /// Keys whose `Key=Value` lines don't count when the live file is compared with the one put back: a live
+        /// file that differs only in them isn't kept beside, and a note says so (dx12user.settings: the keys the
+        /// launch forced and LastGameVersion, finding 35). Journals before quen 0.1.8 have none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignore: Vec<String>,
     },
     /// Renames `from` (a mod being parked) to `to`. Undo: rename it back.
     Move {
@@ -108,6 +118,9 @@ pub enum Action {
     /// The log a staged mod may write at `path`, where no file was at the launch. Undo: recycle it if it is there (the
     /// end copies the boot's logs into the session's game-logs first).
     NewLog { path: PathBuf },
+    /// A mod folder about to be copied to `path` (`Mods\<name>`) from this PC, where nothing was at the launch
+    /// (finding 38). Undo: recycle it if it is there, a copy cut off by a crash included: its source stays on the PC.
+    NewDir { path: PathBuf },
     /// A file the game rewrites by itself during the session, backed up earlier in the journal, with its sha and write
     /// time then: Witcher 3 recompiles its scripts into `content\content0\x64.final.redscripts` when a script mod is
     /// parked (first experiment boot), and reorders the lines of input.settings at every launch (live boot 1). Undo:
@@ -358,6 +371,7 @@ fn undo(
             sha_before,
             sha_after,
             mtime,
+            ignore,
         } => {
             let (backup, original) = backup_of(earlier, path)?;
             let live = if fs.exists(path) {
@@ -374,7 +388,24 @@ fn undo(
                 && live != *sha_after
                 && live != *sha_before
             {
-                keep_beside(fs, path, &fs.read(path)?, &live, report)?;
+                let current = fs.read(path)?;
+                let counted = |data: &[u8]| {
+                    let mut lines = sorted_lines(data);
+                    lines.retain(|l| {
+                        !l.split_once('=')
+                            .is_some_and(|(k, _)| ignore.iter().any(|i| i == k.trim()))
+                    });
+                    lines
+                };
+                if !ignore.is_empty() && counted(&current) == counted(&bytes) {
+                    report.notes.push(format!(
+                        "{}: the game's copy differed from the one put back only in {}: not kept",
+                        path.display(),
+                        ignore.join(", ")
+                    ));
+                } else {
+                    keep_beside(fs, path, &current, &live, report)?;
+                }
             }
             fs.write_atomic(path, &bytes)?;
             if let Some(mtime) = mtime {
@@ -477,6 +508,16 @@ fn undo(
                 report.recycled.push(path.clone());
                 report.undone.push(format!(
                     "removed {}, a staged mod's log (Recycle Bin)",
+                    path.display()
+                ));
+            }
+        }
+        Action::NewDir { path } => {
+            if fs.exists(path) {
+                fs.recycle(path)?;
+                report.recycled.push(path.clone());
+                report.undone.push(format!(
+                    "removed the staged mod {} (Recycle Bin)",
                     path.display()
                 ));
             }

@@ -69,8 +69,9 @@ pub fn tools() -> Vec<Value> {
                         "description": "each row one JSON object as text, e.g. {\"table\": \"measurements\", \"boot_id\": \
                             214, \"capture_id\": null, \"metric\": \"frame_ms\", \"value\": 23.1, \"unit\": \"ms\", \
                             \"state_label\": \"A\", \"method_family\": \"tracy\", \"tag\": \"M\", \"run_id\": null, \"note\": \
-                            null}. Tables: measurements (method_family lowercase: presentmon, tracy, perf_func, nsight...; \
-                            tag M, O, I, U or static_re), captures (path relative to the harness's cap folder; t in UTC \
+                            null}. Tables: measurements (method_family one of presentmon, tracy, nsight, \
+                            renodx_devkit, screenshot, renderdoc, static_re, mem, files, any other refused; tag \
+                            M, O, I, U or static_re), captures (path relative to the harness's cap folder; t in UTC \
                             like 2026-10-17T13:15:00Z), saves, poses (camera [x, y, z], rotation [pitch, yaw, roll], fov, \
                             player {position, optional yaw}), mod_versions, boot_mod_status, re_refs (target \
                             {\"measurement\": id} or {\"claim\": id}, kb_path)",
@@ -593,8 +594,9 @@ quen ledger add < rows.json
     line on stdin. The Python analysis scripts use it to record a second method family, e.g. one line:
       {\"table\": \"measurements\", \"boot_id\": 214, \"capture_id\": null, \"metric\": \"frame_ms\", \"value\": 23.1,
        \"unit\": \"ms\", \"state_label\": \"A\", \"method_family\": \"tracy\", \"tag\": \"M\", \"run_id\": null, \"note\": null}
-    method_family is lowercase (presentmon, tracy, perf_func, nsight, ...); tag is M, O, I, U or static_re. Other
-    tables: captures, saves, poses, mod_versions, boot_mod_status, re_refs. Prints {\"ok\": true, \"ids\": [...]}.
+    method_family is one of presentmon, tracy, nsight, renodx_devkit, screenshot, renderdoc, static_re, mem, files
+    (any other is refused); tag is M, O, I, U or static_re. Other tables: captures, saves, poses, mod_versions,
+    boot_mod_status, re_refs. Prints {\"ok\": true, \"ids\": [...]}.
     Refused, nothing written (exit 1): a bad row, or captures / measurements / boot_mod_status while a quen holds the
     game lock (a live session): record those after its session_end, or through its ledger_ingest.
 

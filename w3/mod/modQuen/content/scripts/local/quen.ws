@@ -22,7 +22,8 @@
 //   0.1.4) writes a new manual save as the menu's "Empty save slot" does; the game names the file. world.get (from
 //   quen-w3 0.1.5) reads back "x y z heading day hour rain snow skyclear weather" (rain, snow and skyclear from quen-w3
 //   0.1.9) and changes nothing. notice (from quen-w3 0.1.8) shows quen's text on screen for 8 s, as QUEN_Say does, and
-//   changes nothing.
+//   changes nothing. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
+//   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1.
 // - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
 //   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
 //   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
@@ -459,6 +460,11 @@ function QUENRPC_PhotoPose() : string
 	var t : GameTime;
 	var gui : CR4GuiManager;
 	var fx : CR4PhotomodeEffects;
+	var item : name;
+	var ids : array<SItemUniqueId>;
+	var before, after : int;
+	var equipped : bool;
+	var witcher : W3PlayerWitcher;
 
 	line = QUEN_Next();
 	if (line == "")
@@ -828,6 +834,40 @@ function QUENRPC_PhotoPose() : string
 			}
 			gui.ShowNotification(args, 8000);
 			QUEN_Reply(handle, true, "notice shown", "");
+			return;
+
+		case "items.add":
+			// As vanilla exec function additem (game\temp.ws), the name made by the Native Bridge's WNB_StringToName (the
+			// console needs quotes for a name with spaces). AddAnItem gives back an invalid id for a name no item has, so
+			// the count before and after tells whether anything was added. The equip as additem's, read back as
+			// W3PlayerWitcher.IsItemEquipped.
+			if (!thePlayer)
+			{
+				QUEN_Reply(handle, false, "no player (not in a game session)", "");
+				return;
+			}
+			QUENRPC_Split(args, head, rest);
+			count = StringToInt(head);
+			QUENRPC_Split(rest, head, text);
+			item = WNB_StringToName(text);
+			before = thePlayer.inv.GetItemQuantityByName(item);
+			ids = thePlayer.inv.AddAnItem(item, count);
+			after = thePlayer.inv.GetItemQuantityByName(item);
+			equipped = false;
+			if (head == "1" && ids.Size() > 0 && thePlayer.inv.IsIdValid(ids[0]))
+			{
+				thePlayer.EquipItem(ids[0]);
+				witcher = GetWitcherPlayer();
+				if (witcher)
+					equipped = witcher.IsItemEquipped(ids[0]);
+			}
+			rest = IntToString(before) + " " + IntToString(after) + " 0";
+			if (equipped)
+				rest = IntToString(before) + " " + IntToString(after) + " 1";
+			if (after > before)
+				QUEN_Reply(handle, true, "added " + IntToString(after - before) + " of " + text, rest);
+			else
+				QUEN_Reply(handle, false, "nothing added: no item is named " + text + " (the item's own name, as additem takes it)", rest);
 			return;
 
 		case "pause":

@@ -520,6 +520,12 @@ pub fn status(shared: &Shared) -> Value {
     fields.insert("serve_pid".into(), json!(std::process::id()));
     // Finding 22: a client keeps the tool list it got when it connected, maybe from an older quen.
     fields.insert("quen".into(), json!(env!("CARGO_PKG_VERSION")));
+    // Finding 38: a client kept an older quen's schemas after a reconnect; tools/list's result, fingerprinted.
+    let tools = crate::mcp::tools();
+    let list = serde_json::to_string(&json!({"tools": tools})).unwrap_or_default();
+    let count = tools.as_array().map_or(0, Vec::len);
+    let fingerprint = json!({"count": count, "sha256": sha256_hex(list.as_bytes())});
+    fields.insert("tools".into(), fingerprint);
     envelope(
         shared,
         "session_status",
@@ -2010,6 +2016,25 @@ impl Fs for JournalFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         win::rename_no_replace(from, to)
+    }
+
+    /// File by file into a new folder (never into one that exists); a link in the tree fails the copy, which the
+    /// launch refuses before.
+    fn copy_tree(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::create_dir(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let (kind, dest) = (entry.file_type()?, to.join(entry.file_name()));
+            if kind.is_symlink() {
+                let why = format!("{} is a link", entry.path().display());
+                return Err(io::Error::other(why));
+            }
+            match kind.is_dir() {
+                true => self.copy_tree(&entry.path(), &dest)?,
+                false => drop(fs::copy(entry.path(), &dest)?),
+            }
+        }
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> bool {

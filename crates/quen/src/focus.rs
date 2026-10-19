@@ -80,7 +80,7 @@ fn to(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
 
 /// Brings process `pid`'s window ([`window_of`]) to the front, a minimized one restored first; whether it was there
 /// already. Refused, nothing moved, when it shows none now.
-fn to_client(pid: u32, name: &str) -> Result<bool, Done> {
+pub(crate) fn to_client(pid: u32, name: &str) -> Result<bool, Done> {
     let window = window_of(pid)?.ok_or(format!(
         "{name}, this connection's client, shows no window now (closed, hidden, or on another virtual desktop): \
          nothing moved"
@@ -100,7 +100,7 @@ fn to_client(pid: u32, name: &str) -> Result<bool, Done> {
 }
 
 /// Process `pid`'s first [`switchable`] top-level window in z-order: the one it had in front last.
-fn window_of(pid: u32) -> Result<Option<HWND>, String> {
+pub(crate) fn window_of(pid: u32) -> Result<Option<HWND>, String> {
     let all = capture::top_windows()?;
     Ok(all.into_iter().find(|&w| switchable(w) == Some(pid)))
 }

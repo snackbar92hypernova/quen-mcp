@@ -53,6 +53,28 @@ const LONG: [&str; 12] = [
     "sweep_play",
 ];
 
+/// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
+/// every unannotated call). Their own files there count as nothing changed: ledger_query's spill files, and the mem
+/// tools' results over 16 KB with their captures rows. world_get and game_listsaves read through the game's channel.
+const READ_ONLY: [&str; 16] = [
+    "session_status",
+    "session_plan",
+    "quen_guide",
+    "quen_doctor",
+    "ledger_query",
+    "ledger_about",
+    "capture_usage",
+    "job_status",
+    "world_get",
+    "game_listsaves",
+    "mem_read",
+    "mem_scan",
+    "mem_follow",
+    "mem_walk",
+    "mem_find",
+    "mem_regions",
+];
+
 /// A tool call for the session thread, a connection that closed, the config file changed (quen_setup wrote it, or a
 /// connection came, which may follow an edit), or the order to end the session and stop.
 pub enum Msg {
@@ -733,7 +755,7 @@ fn listed(name: &str) -> bool {
         .is_some_and(|t| t.iter().any(|t| t["name"] == name))
 }
 
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     let none = json!({"type": "object", "properties": {}, "additionalProperties": false});
     let mut tools = json!([
         {
@@ -742,7 +764,7 @@ fn tools() -> Value {
                 run in the session's job (and game_outside_job: a copy of the game running outside it), quen's game state (the last push of its state log: flags and their names), the \
                 mods quen has parked, each file the live journal backed up (and whether it is still the original), \
                 and, with the Python harness configured, what an unfinished harness session left; quen: the running \
-                quen's version. Never changes anything.",
+                quen's version; tools: its tool count and the sha256 of its tools/list result. Never changes anything.",
             "inputSchema": none,
         },
         {
@@ -763,7 +785,7 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked (settings, devkit, fg false, vsync false); no park, keep, preset, profiler, extra_env or stage; without save no key is sent (the user picks a save); photo defaults false; then the user has the controls (hands_take), and the session ends when the game exits"},
+                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked (settings, devkit, fg false, vsync false); no park, keep, preset, profiler, extra_env, stage or stage_mods; without save no key is sent (the user picks a save); photo defaults false; then the user has the controls (hands_take), and the session ends when the game exits"},
                     "save": {"type": "string", "description": "a save in gamesaves: its name in any case, with or without .sav (as the game's own list names it); omitted: the newest QuickSave (mode play: none)"},
                     "settings": {
                         "type": "object",
@@ -777,11 +799,12 @@ fn tools() -> Value {
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
                     "park": {"type": "string", "description": "mods to park: comma names, or ALL (the Native Bridge and quen's package never are; the W3 Game State Bridge only with both halves named: W3GameStateBridge.asi,modW3GameStateBridge)"},
                     "keep": {"type": "string", "description": "with ALL: comma names to keep"},
-                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 under their names for the session; one there of that name is parked first. The end recycles the copies and each one's new <stem>.log, after game_logs copied it"},
+                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session; one there of that name is parked first. The end recycles the copies and each one's new <stem>.log"},
+                    "stage_mods": {"type": "array", "items": {"type": "string"}, "description": "mod folders (absolute paths) copied into Mods, as stage into bin"},
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
                     "fg": {"type": "boolean", "description": "keep frame generation as the user set it (default false: off)"},
                     "vsync": {"type": "boolean", "description": "default true; false turns VSync off"},
-                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row (the measure tools warn under any): renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: checks the game's Streamline interposer is NVIDIA's signed one, swaps in the patched dev build, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on; captures with game_screenshot method renderdoc; the end puts the signed interposer back and checks it); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base, so its times are relative; ngfx exits after its export and takes the game with it: one trace per boot, then session_end); tracy:NAME (needs tracy_capture, Tracy 0.14.1's tracy-capture.exe, in the config, quen-w3 0.1.3+ in the game and kb in the config: turns on the Tracy zones in quen's own W3Quen.asi, dormant otherwise; parks the mods the KB's hooks.tsv says hook the same functions; the capture runs from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
+                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row (the measure tools warn under any): renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: checks the game's Streamline interposer is NVIDIA's signed one, swaps in the patched dev build, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on; the end puts the signed interposer back and checks it); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base, so its times are relative; ngfx exits after its export and takes the game with it: one trace per boot, then session_end); tracy:NAME (needs tracy_capture, Tracy 0.14.1's tracy-capture.exe, in the config, quen-w3 0.1.3+ in the game and kb in the config: turns on the Tracy zones in quen's own W3Quen.asi, dormant otherwise; parks the mods the KB's hooks.tsv says hook the same functions; the capture runs from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
                     "photo": {"type": "boolean", "description": "enter photo mode after the load (default true; it can take minutes)"},
                     "extra_env": {
                         "type": "object",
@@ -794,7 +817,7 @@ fn tools() -> Value {
                         },
                         "additionalProperties": false,
                     },
-                    "allow_unknown_build": {"type": "boolean", "description": "launch an exe of a build quen doesn't know (a game update, a GOG exe). Default false: refused, the reason naming its sha256, PE stamp and the known_builds entry to add once verified. Only if the user wants that build tested; the boot row records it"},
+                    "allow_unknown_build": {"type": "boolean", "description": "launch an exe of a build quen doesn't know. Default false: refused, the reason naming the known_builds entry to add once verified. Only if the user wants that build tested"},
                     "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation that the game is about to launch on their PC, and they agreed. Required."},
                 },
                 "additionalProperties": false,
@@ -911,12 +934,37 @@ fn tools() -> Value {
     {
         tool["inputSchema"]["properties"]["wait"] = wait.clone();
     }
+    for tool in list
+        .iter_mut()
+        .filter(|t| READ_ONLY.iter().any(|n| t["name"] == *n))
+    {
+        tool["annotations"] = json!({"readOnlyHint": true});
+    }
     tools
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 44: each READ_ONLY name is a tool, annotated readOnlyHint; no other tool has annotations.
+    #[test]
+    fn only_the_read_only_tools_are_annotated() {
+        let tools = tools();
+        let annotated: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t.get("annotations").is_some())
+            .inspect(|t| assert_eq!(t["annotations"], json!({"readOnlyHint": true}), "{t}"))
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(annotated.len(), READ_ONLY.len(), "{annotated:?}");
+        assert!(
+            READ_ONLY.iter().all(|n| annotated.contains(n)),
+            "{annotated:?}"
+        );
+    }
 
     /// An over-long line is refused and skipped, a line that isn't UTF-8 is refused, and neither ends the
     /// connection: the next line is read.

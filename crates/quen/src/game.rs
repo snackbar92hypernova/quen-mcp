@@ -883,6 +883,13 @@ fn load(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             .flatten()
             .filter(|e| wanted.contains(&e.file_name().to_string_lossy().to_lowercase()))
             .count();
+        if matches == 0 {
+            let why = format!(
+                "no file in gamesaves matches {name:?}: {}",
+                crate::boot::NO_FILE
+            );
+            return Err(why.into());
+        }
         if matches != 1 {
             return Err(format!(
                 "{matches} files in gamesaves match {name:?}: modQuen loads exactly one"

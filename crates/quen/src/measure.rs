@@ -624,7 +624,7 @@ fn why(done: Done) -> String {
 }
 
 /// Sleeps `d`, reporting progress; false if the call was stopped meanwhile.
-fn settle(call: &Call, d: Duration, what: &str) -> bool {
+pub(crate) fn settle(call: &Call, d: Duration, what: &str) -> bool {
     let start = Instant::now();
     let mut said = 0;
     while start.elapsed() < d {

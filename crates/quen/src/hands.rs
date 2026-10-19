@@ -19,9 +19,9 @@ use quen_core::saves::{self, Snapshot};
 use serde_json::{Map, Value, json};
 
 use crate::channel::{self, REPLY_MAX};
-use crate::doctor;
 use crate::game::{self, Ctx, Fields, flag, hex_bytes, schema};
 use crate::session::{Call, Done, Live, Session};
+use crate::{doctor, focus, input};
 
 /// What the game shows on screen when the user gets the controls (quen-w3 0.1.8's notice verb).
 const NOTICE: &str =
@@ -78,7 +78,8 @@ pub(crate) fn tools() -> Vec<Value> {
                 after hands_give. The client asks the user on every call (user_ok is only your word): never route \
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
                 moves the focus (game_keys, game_console, game_load, game_pause, game_settime, game_weather, \
-                game_teleport, game_save, game_camera with a pose, game_cvar set or restore, mem_patch, mem_unpatch, \
+                game_teleport, game_items, game_save, game_camera with a pose, game_cvar set or restore, mem_patch, \
+                mem_unpatch, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
                 are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
                 Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
@@ -92,18 +93,19 @@ pub(crate) fn tools() -> Vec<Value> {
         json!({
             "name": "hands_give",
             "description": "Give the controls of the game to the user: back in a play session, or in a test session \
-                for the user to do something in the game. No prompt; the focus stays where it is. applied: memory \
-                patches and cvar writes still applied (in a play session, this hand-over's). A play session refuses \
-                while there is one, unless keep_writes with the user's OK; a \
-                test session gives the controls with them applied. Then quen's pause goes off and a camera path stops \
-                (pause, path: the game's replies), the game shows for 8 s that the user has the controls and hands \
-                them back in the chat (notice: its reply, or why not; quen-w3 0.1.8+), and the controls go to the \
-                user. kept: this hand-over's teleports, settime and weather; unexpected_saves: saves written while \
-                the agent had the controls. A save the user makes while holding them is theirs (hands_take's \
-                user_saves, the end's saves.user). Refused: the user has them already, a wrong token. Failed: the \
-                pause or the path wasn't undone (left); the controls went to the user.",
+                for the user to do something in the game. No prompt. applied: memory patches and cvar writes still \
+                applied (in a play session, this hand-over's). A play session refuses while there is one, unless \
+                keep_writes with the user's OK; a test session gives the controls with them applied. Then quen's pause \
+                goes off and a camera path stops (pause, path: the game's replies), the game shows for 8 s that the \
+                user has the controls and hands them back in the chat (notice: its reply, or why not; quen-w3 \
+                0.1.8+), and the controls go to the user. kept: this hand-over's teleports, settime, weather and \
+                items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
+                front at the end (game, client or other). Refused: the user has them already, a wrong token, \
+                to_client with no client window found at connect. Failed: the pause or the path wasn't undone \
+                (left); the controls went to the user.",
             "inputSchema": schema(json!({
                 "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches and cvar writes still applied, the user having agreed. Default false: refused while any is"},
+                "to_client": {"type": "boolean", "description": "true: bring this client's window to the front last, as focus to client does, so the user sees the chat (to_client in the result: why it didn't). Default false: the focus stays where it is"},
             }), &[]),
         }),
     ]
@@ -187,12 +189,16 @@ pub(crate) fn give(session: &Session, call: &mut Call, args: &Value) -> Done {
 }
 
 fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["keep_writes"])?;
+    let cx = game::ctx(session, args, &["keep_writes", "to_client"])?;
     let h = &cx.live.handovers;
     if cx.hands == Some(Hands::User) {
         return Err("the user has the controls already".to_string().into());
     }
     let keep = flag(args, "keep_writes")?;
+    let client = match flag(args, "to_client")? {
+        true => Some(call.conn.client.clone()?),
+        false => None,
+    };
     let (applied, kept) = {
         let patches = cx.live.patches.borrow();
         let mine = patches.get(h.since.get()..).unwrap_or_default();
@@ -251,12 +257,35 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     call.lap("notice");
     fields.insert("unexpected_saves".into(), json!(sort(cx.live, false)));
     session.shared.set_hands(Some(Hands::User));
+    // Finding 43: the user missed a question twice behind the game. to_client fronts the chat; in_front says which.
+    if let Some((pid, name)) = &client
+        && let Err(done) = focus::to_client(*pid, name)
+    {
+        fields.insert("to_client".into(), json!(crate::boot::reason(&done)));
+    }
+    fields.insert("in_front".into(), json!(in_front(&cx, call)));
     if !left.is_empty() {
         fields.insert("left".into(), json!(left));
         let why = "the controls went to the user, but quen's pause or the camera path wasn't undone (left)";
         return Err(Done::Failed(why.into(), fields));
     }
     Ok(fields)
+}
+
+/// Which window is in front: the game's, this connection's client's, or another.
+fn in_front(cx: &Ctx, call: &Call) -> &'static str {
+    let game = cx.window().is_ok_and(|(_, w)| input::in_front(w));
+    let client = call
+        .conn
+        .client
+        .as_ref()
+        .ok()
+        .and_then(|(pid, _)| focus::window_of(*pid).ok().flatten());
+    match (game, client.is_some_and(input::in_front)) {
+        (true, _) => "game",
+        (false, true) => "client",
+        _ => "other",
+    }
 }
 
 /// The connection that launched a play session closed. While the agent has the controls, this hand-over's memory
@@ -373,6 +402,7 @@ mod tests {
             "game_settime",
             "game_weather",
             "game_teleport",
+            "game_items",
             "game_save",
             "sweep_play",
             "measure_ab",
@@ -530,9 +560,19 @@ mod tests {
             json!({"address": 32, "old": "aa", "new": "bb"}),
         );
         session.live.as_ref().unwrap().handovers.since.set(1);
+        // Finding 43: to_client needs a client window found at connect, checked before anything changes.
+        let front = run(
+            &session,
+            "hands_give",
+            json!({"token": "tok", "to_client": true}),
+        );
+        assert_eq!(front["refused"], true, "{front}");
+        assert_eq!(fx.shared.hands(), Some(Hands::Agent), "nothing changed");
         let out = run(&session, "hands_give", json!({"token": "tok"}));
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["applied"], json!(["mem_patch cull at 0x20"]), "{out}");
+        // No window here is the dummy game's or a client's.
+        assert_eq!(out["in_front"], "other", "{out}");
         assert_eq!(fx.shared.hands(), Some(Hands::User));
     }
 

@@ -72,8 +72,8 @@ fn inferred_and_unverified_support_does_not_count() {
 #[test]
 fn static_re_facts_count_without_a_boot() {
     let (mut l, _, claim) = setup();
-    for family in ["rea", "disasm"] {
-        let m = measurement(&mut l, None, family, Tag::StaticRe);
+    for (family, tag) in [("static_re", Tag::StaticRe), ("files", Tag::O)] {
+        let m = measurement(&mut l, None, family, tag);
         l.support(claim, m, true).unwrap();
     }
     assert_eq!(status(&l, claim), (true, 2, 0));
@@ -170,7 +170,7 @@ fn contradictions_that_cant_be_shown_older_stand() {
         }
         let m = match case {
             "same boot" => measurement(&mut l, Some(b), "presentmon", Tag::M),
-            "no boot" => measurement(&mut l, None, "rea", Tag::StaticRe),
+            "no boot" => measurement(&mut l, None, "static_re", Tag::StaticRe),
             _ => {
                 let later = boot(&mut l, g, "2026-10-11T10:00:00Z");
                 measurement(&mut l, Some(later), "presentmon", Tag::I)

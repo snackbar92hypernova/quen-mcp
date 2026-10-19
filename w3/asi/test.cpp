@@ -458,6 +458,13 @@ static void Channel() {
   RoundTrip(h, R"x({"id":53,"ttl_ms":5000,"verb":"notice","text":"quen: you have the controls (Alt+Tab)"})x",
             L"notice quen: you have the controls (Alt+Tab)", true, "notice shown", "",
             R"({"id":53,"ok":true,"text":"notice shown"})");
+  // items.add (0.1.10): the name last, spaces kept; the read-back on success and on nothing added.
+  RoundTrip(h, R"({"id":54,"ttl_ms":5000,"verb":"items.add","name":"Red Wolf Armor 2","count":1,"equip":true})",
+            L"items.add 1 1 Red Wolf Armor 2", true, "added 1 of Red Wolf Armor 2", "0 1 1",
+            R"({"id":54,"ok":true,"text":"added 1 of Red Wolf Armor 2","data":{"before":0,"after":1,"equipped":true}})");
+  RoundTrip(h, R"({"id":55,"ttl_ms":5000,"verb":"items.add","name":"Nope","count":1000,"equip":false})",
+            L"items.add 1000 0 Nope", false, "nothing added", "2 2 0",
+            R"({"id":55,"ok":false,"text":"nothing added","data":{"before":2,"after":2,"equipped":false}})");
   RoundTrip(h, R"({"id":9,"ttl_ms":2000,"verb":"listsaves"})", L"listsaves", true, "2 saves", "save \"one\"|C:\\two",
             R"({"id":9,"ok":true,"text":"2 saves","data":["save \"one\"","C:\\two"]})");
   RoundTrip(h, R"({"id":10,"ttl_ms":2000,"verb":"listsaves"})", L"listsaves", true, "0 saves", "",
@@ -508,6 +515,15 @@ static void Channel() {
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"a\nb"})", refused1, "invalid notice");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":")" + std::string(161, 'x') + "\"}", refused1, "invalid notice");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"x","ms":1})", refused1, "unknown field");
+  const std::vector<std::string> bad_items = {
+      R"("name":"x","count":0,"equip":false)",  R"("name":"x","count":1001,"equip":false)",
+      R"("name":"","count":1,"equip":false)",   R"("name":"a\tb","count":1,"equip":false)",
+      R"("name":"x","count":1)",                R"("name":"x","count":1,"equip":1)",
+      R"("name":")" + std::string(201, 'x') + R"(","count":1,"equip":false)"};
+  for (const std::string& items : bad_items)
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"items.add",)" + items + "}", refused1, "invalid items.add");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"items.add","name":"x","count":1,"equip":false,"slot":1})", refused1,
+          "unknown field");
   Refused(h, R"({"id":1,"verb":"loadlast"})", refused1, "ttl_ms");
   Refused(h, R"({"id":-1,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");
   Refused(h, R"({"id":1.0,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");
@@ -569,6 +585,12 @@ static void Channel() {
   Send(h, R"({"id":24,"ttl_ms":5000,"verb":"cam.get"})" "\n");
   CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", "photomode 1 2 3 4 5 6 nan") == 0);
   CHECK(ReadLine(h).starts_with(R"({"id":24,"ok":false,"text":"modQuen's read-back did not parse)"));
+  // items.add: two numbers, an equipped flag that isn't 0 or 1.
+  for (const char* bad : {"1 2", "1 2 3"}) {
+    Send(h, R"({"id":28,"ttl_ms":5000,"verb":"items.add","name":"x","count":1,"equip":false})" "\n");
+    CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", bad) == 0);
+    CHECK(ReadLine(h) == R"({"id":28,"ok":false,"text":"modQuen's read-back did not parse: )" + std::string(bad) + "\"}");
+  }
   // world.get: 0.1.8's 7 fields, an hour past 23, a sky flag that isn't 0 or 1.
   for (const char* bad : {"1 2 3 4 5 6 WT_Clear", "1 2 3 4 5 24 0 0 1 WT_Clear", "1 2 3 4 5 6 0 0 2 WT_Clear"}) {
     Send(h, R"({"id":27,"ttl_ms":5000,"verb":"world.get"})" "\n");

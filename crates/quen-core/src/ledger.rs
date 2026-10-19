@@ -16,8 +16,9 @@ mod migrate;
 mod refs;
 
 pub use ingest::{
-    BootEnd, BootModStatus, BootStart, Capture, Claim, Game, LoadStatus, Measurement, ModVersion,
-    Outcome, PlayerPose, Pose, Provenance, ReTarget, Row, Save, Sweep, SweepFrame, SweepRun, Tag,
+    BootEnd, BootModStatus, BootStart, Capture, Claim, Game, LoadStatus, METHOD_FAMILIES,
+    Measurement, ModVersion, Outcome, PlayerPose, Pose, Provenance, ReTarget, Row, Save, Sweep,
+    SweepFrame, SweepRun, Tag,
 };
 pub use kb::{KbClaims, KbScan, Section, git_head, sections};
 pub use knowledge::{About, BundleImport, canonical, extraction_key};

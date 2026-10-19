@@ -43,7 +43,8 @@ newer quen migrates an existing ledger, it copies it to `backups/quen-v<old vers
 
 One measurement row per number, with the boot it was measured in (or none, for a static fact). `method_family` is one
 lowercase identifier per independent method, not per tool, so two tools doing the same thing can't pass as two methods;
-quen's agent playbook (the `quen_guide` tool's `playbook` topic, §2) keeps the list. Don't invent a family to make a claim proven.
+quen's agent playbook (the `quen_guide` tool's `playbook` topic, §2) keeps the list. Don't invent a family to make a claim proven:
+`ledger_ingest` and `quen ledger add` refuse any other (rows an older quen took stay as written).
 
 | Source | method_family | tag |
 |---|---|---|

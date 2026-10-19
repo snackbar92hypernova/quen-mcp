@@ -94,7 +94,7 @@ fn the_cli_records_rows_and_imports_the_harness_once() {
         &format!(
             "{}\n{}\n",
             measurement("tracy", 23.1),
-            measurement("perf_func", 23.4)
+            measurement("mem", 23.4)
         ),
     );
     assert_eq!((code, &out["ids"]), (0, &json!([1, 2])), "{out}");

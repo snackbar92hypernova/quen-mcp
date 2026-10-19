@@ -274,6 +274,8 @@ pub struct CaptureRow {
     /// Relative to the capture root, as the row has it (`/` or `\`).
     pub path: String,
     pub boot_id: Option<i64>,
+    /// Its boot was imported from an earlier tool (`harness_info` set).
+    pub imported: bool,
     /// Kept by a cleanup unless named: pinned, a claim's evidence, a pose's reference image, or in a document.
     pub cited: bool,
 }
@@ -381,20 +383,21 @@ impl Ledger {
     /// reference image, or referenced by a document.
     pub fn capture_rows(&self) -> Result<Vec<CaptureRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.path, c.boot_id,
+            "SELECT c.id, c.path, c.boot_id, b.harness_info IS NOT NULL,
                c.pinned = 1
                OR EXISTS (SELECT 1 FROM measurements m JOIN claim_support s ON s.measurement_id = m.id
                           WHERE m.capture_id = c.id)
                OR EXISTS (SELECT 1 FROM poses p WHERE p.ref_capture_id = c.id)
                OR EXISTS (SELECT 1 FROM doc_refs r WHERE r.capture_id = c.id)
-             FROM captures c WHERE c.removed_at IS NULL ORDER BY c.id",
+             FROM captures c LEFT JOIN boots b ON b.id = c.boot_id WHERE c.removed_at IS NULL ORDER BY c.id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(CaptureRow {
                 id: r.get(0)?,
                 path: r.get(1)?,
                 boot_id: r.get(2)?,
-                cited: r.get(3)?,
+                imported: r.get(3)?,
+                cited: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

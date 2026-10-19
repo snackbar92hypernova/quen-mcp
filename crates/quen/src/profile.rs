@@ -440,6 +440,7 @@ fn swap(
             path,
             sha,
             bytes,
+            ignore: Vec::new(),
         },
         Change::Place {
             stage: bin.join(format!("{INTERPOSER_JSON}.quen-stage")),
@@ -1070,6 +1071,7 @@ mod tests {
                 sha,
                 bytes,
                 backup,
+                ..
             },
             Change::Place {
                 dest, bytes: json, ..

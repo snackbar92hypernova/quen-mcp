@@ -233,6 +233,19 @@ fn flag_or_false<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D
     Ok(flag(d)?.unwrap_or(false))
 }
 
+/// The method families a measurement may name: the playbook's list (docs/agents.md §2), one per independent method.
+pub const METHOD_FAMILIES: &[&str] = &[
+    "presentmon",
+    "tracy",
+    "nsight",
+    "renodx_devkit",
+    "screenshot",
+    "renderdoc",
+    "static_re",
+    "mem",
+    "files",
+];
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Measurement {
@@ -690,7 +703,16 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Refuses a `method_family` outside [`METHOD_FAMILIES`] (finding 32: a tool name passed as a family).
     pub fn add_measurement(&mut self, m: &Measurement) -> Result<i64> {
+        if !METHOD_FAMILIES.contains(&m.method_family.as_str()) {
+            return Err(Error::Refused(format!(
+                "method_family {:?} is not one of {}: a shader decompile is static_re, game files are files \
+                 (quen_guide playbook §2)",
+                m.method_family,
+                METHOD_FAMILIES.join(", ")
+            )));
+        }
         self.conn.execute(
             "INSERT INTO measurements (boot_id, capture_id, metric, value, unit, state_label, method_family, tag,
                run_id, note, extraction_id, world)
@@ -711,6 +733,27 @@ impl Ledger {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The measurement ids whose `method_family` is outside [`METHOD_FAMILIES`], by family: rows written before quen
+    /// refused them (finding 32). Read only: quen never rewrites evidence.
+    pub fn unknown_families(&self) -> Result<Vec<(String, Vec<i64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT method_family, id FROM measurements
+             WHERE method_family NOT IN (SELECT value FROM json_each(?1)) ORDER BY method_family, id",
+        )?;
+        let rows = stmt.query_map([json(&METHOD_FAMILIES)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out: Vec<(String, Vec<i64>)> = Vec::new();
+        for row in rows {
+            let (family, id) = row?;
+            match out.last_mut() {
+                Some((f, ids)) if *f == family => ids.push(id),
+                _ => out.push((family, vec![id])),
+            }
+        }
+        Ok(out)
     }
 
     /// Adds an open claim. Whether it is proven is read from the `claims_status` view.
