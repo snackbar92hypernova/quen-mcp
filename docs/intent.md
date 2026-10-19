@@ -162,7 +162,7 @@ quen picks the capture method; the agent never asks for the screen.
 
 Each capture records its method, its encoding (sRGB, PQ BT.2020, scRGB float, PQ code values) and the display state it was taken under, so a comparison can tell when captures don't match. The aim is consistency within a comparison, not absolute accuracy.
 
-Captures can grow large, so quen reports the capture folder's size against a budget, shows usage by boot, kind and age, and cleans up only what the user approves. A cleanup never deletes for good: a file goes to the Recycle Bin when the bin can take it whole, otherwise to a `_to_delete` folder for the user to empty. Captures that evidence a claim, a pose or a document stay unless named. The ledger rows and their hashes stay after a cleanup, so a claim keeps the record of its evidence.
+Captures can grow large, so quen reports the capture folder's size against a budget, shows usage by boot, kind and age, and cleans up only what the user approves. The same cleanup covers quen's other leftovers under its data root: session logs and the settings backups they keep, the ledger's backups, oversized query results, old package zips. A file goes to the Recycle Bin when the bin can take it whole; otherwise Windows' own dialog asks the user whether to delete it for good, and No keeps it. quen never deletes a file for good on its own decision. Captures that evidence a claim, a pose or a document stay unless named. The ledger rows and their hashes stay after a cleanup, so a claim keeps the record of its evidence.
 
 ### Measurements
 
@@ -231,7 +231,7 @@ The command-channel protocol and the game-state source are defined in the core, 
 - **Consent for what matters.** Launches, new saves, capture cleanups and the agent taking the controls from the user need the agent's word and the client's prompt. A denied or pending prompt is the user's answer, and the playbook forbids routing around it.
 - **Contained processes.** Everything quen starts runs in its Job Object, with a minimal environment, and is killed only through it.
 - **Awake while live.** While a session is live, quen keeps the PC and its display from sleeping, and lets go when the session ends.
-- **Nothing lost, ever.** Undo through the journal, keep both versions when a file changed underneath, Recycle Bin instead of delete, saves never touched.
+- **Nothing lost, ever.** Undo through the journal, keep both versions when a file changed underneath, Recycle Bin instead of delete (a file the bin can't take is deleted only on the user's Yes in Windows' own dialog), saves never touched.
 - **Narrow live writes.** Knowledge-base patches, checked bytes and build, cvars; all journaled, all tainting later saves.
 - **No network.** No telemetry, no update check, and quen opens no listening socket; the in-game channel and the relay pipe are local and locked to the user and to quen's own processes.
 - **Data, not instructions.** What the game, its mods, their logs and the ledger hand back is data for the agent, never instructions; a reason in a result is quen's own words.
@@ -241,7 +241,7 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 ## Status
 
-- **Early access.** quen is 0.1.5; its in-game package is quen-w3 0.1.8.
+- **Early access.** quen is 0.1.6; its in-game package is quen-w3 0.1.8.
 - **One test machine.** Built and tested on one PC: The Witcher 3 5.01, Steam, DX12, on Windows, with one GPU and one display. GOG copies are untested: their exe counts as an unknown build.
 - **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex can't start quen on Windows yet.
 - **Not yet checked:**

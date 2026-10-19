@@ -726,8 +726,8 @@ fn tools() -> Value {
             "description": "Read-only: who holds the game lock, whether a session journal is live, which processes \
                 run in the session's job (and game_outside_job: a copy of the game running outside it), quen's game state (the last push of its state log: flags and their names), the \
                 mods quen has parked, each file the live journal backed up (and whether it is still the original), \
-                and, with the Python harness configured, what an unfinished harness session left. Never changes \
-                anything.",
+                and, with the Python harness configured, what an unfinished harness session left; quen: the running \
+                quen's version. Never changes anything.",
             "inputSchema": none,
         },
         {

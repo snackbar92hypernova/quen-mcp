@@ -1,6 +1,7 @@
-//! The capture root on disk: every file there, which boot it belongs to, what its ledger row says, the usage
-//! by boot, kind and age, and what a cleanup takes and where to. It only reads and plans: quen's capture_clean
-//! (crates/quen disk.rs) moves the files, to the Recycle Bin or `_to_delete`, never deleting one.
+//! The capture root on disk, and quen's other leftovers under the data root ([`leftovers`]): every file there, which
+//! boot it belongs to, what its ledger row says, the usage by boot, kind and age, and what a cleanup takes and where
+//! to. It only reads and plans: quen's capture_clean (crates/quen disk.rs) removes the files, to the Recycle Bin, or
+//! through Windows' own question before a permanent delete.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,22 +16,34 @@ use crate::ledger::CaptureRow;
 pub const LARGE: u64 = 1_000_000_000;
 const GB: f64 = 1e9;
 
-/// A file under the capture root.
+/// A file under the capture root, or one of quen's leftovers under the data root.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct File {
-    /// Relative to the capture root, `/` separators.
+    /// Relative to the capture root (a leftover's: to the data root), `/` separators.
     pub rel: String,
     pub bytes: u64,
     pub age_days: f64,
     /// From its folder: a boot's id, or its session (see `Ledger::boot_folders`), else its ledger row's.
     pub boot: Option<i64>,
-    /// The lowercase extension, as `captures.kind` has it (`file` without one).
+    /// The lowercase extension, as `captures.kind` has it (`file` without one); a leftover's kind ([`LEFTOVERS`]).
     pub kind: String,
     /// Its ledger row, if it has one.
     pub capture: Option<i64>,
     /// Kept by a cleanup unless named by its capture id (`CaptureRow::cited`).
     pub cited: bool,
+    /// One of quen's leftovers under the data root ([`leftovers`]), not a capture-root file.
+    pub leftover: bool,
 }
+
+/// The kinds of quen's leftovers under the data root ([`leftovers`]).
+pub const LEFTOVERS: [&str; 6] = [
+    "session_logs",
+    "settings_backups",
+    "query_spills",
+    "ledger_backups",
+    "packages",
+    "to_delete",
+];
 
 /// GB with two decimals.
 pub fn gb(bytes: u64) -> f64 {
@@ -102,10 +115,6 @@ pub fn scan(
         .into_iter()
         .filter_map(|(path, meta)| {
             let rel = relative(root, &path)?;
-            let age = meta
-                .modified()
-                .ok()
-                .and_then(|t| now.duration_since(t).ok());
             let row = rows.iter().find(|r| norm(&r.path) == rel.to_lowercase());
             let first = rel.split('/').next().unwrap_or_default().to_lowercase();
             let folder = folders.iter().find(|(f, _)| *f == first).map(|(_, b)| *b);
@@ -117,9 +126,77 @@ pub fn scan(
                 kind,
                 capture: row.map(|r| r.id),
                 cited: row.is_some_and(|r| r.cited),
-                age_days: age.map_or(0.0, |a| a.as_secs_f64() / 86_400.0),
-                bytes: meta.len(),
-                rel,
+                ..file(rel, &meta, now)
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    files
+}
+
+/// `rel`, with its size and its age at `now`: no boot, kind or row yet.
+fn file(rel: String, meta: &fs::Metadata, now: SystemTime) -> File {
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|t| now.duration_since(t).ok());
+    File {
+        rel,
+        bytes: meta.len(),
+        age_days: age.map_or(0.0, |a| a.as_secs_f64() / 86_400.0),
+        boot: None,
+        kind: String::new(),
+        capture: None,
+        cited: false,
+        leftover: false,
+    }
+}
+
+/// quen's leftovers under the data root `data` at `now`, beside the capture root, by kind ([`LEFTOVERS`]): each
+/// session's log folder (`logs\<secs>-<session>`: `session_logs`, and the settings backups in its `backup` folder:
+/// `settings_backups`), ledger_query's spill files (`logs\queries`: `query_spills`), the ledger's backups from before
+/// each migration (`state\backups`: `ledger_backups`), the files in `packages` but those `keep` names, lowercase (the
+/// installed package's zip: `packages`), and what earlier cleanups moved to `_to_delete` (`to_delete`). Nothing else
+/// under the data root is one: not its config, ledger or journal, `logs\serve.log`, nor the save backups. A session's
+/// files carry its boot, from `folders` (as [`scan`] takes them).
+pub fn leftovers(
+    data: &Path,
+    now: SystemTime,
+    folders: &[(String, i64)],
+    keep: &[String],
+) -> Vec<File> {
+    let mut found = Vec::new();
+    for area in [
+        data.join("logs"),
+        data.join("state").join("backups"),
+        data.join("packages"),
+        data.join("_to_delete"),
+    ] {
+        walk(&area, &mut found);
+    }
+    let boot = |session: &str| {
+        let id = session.rsplit_once('-').map(|(_, id)| id.to_lowercase())?;
+        folders.iter().find(|(f, _)| *f == id).map(|(_, b)| *b)
+    };
+    let mut files: Vec<File> = found
+        .into_iter()
+        .filter_map(|(path, meta)| {
+            let rel = relative(data, &path)?;
+            let parts: Vec<&str> = rel.split('/').collect();
+            let (kind, boot) = match parts[..] {
+                ["logs", "queries", ..] => ("query_spills", None),
+                ["logs", session, "backup", _, ..] => ("settings_backups", boot(session)),
+                ["logs", session, _, ..] => ("session_logs", boot(session)),
+                ["state", "backups", ..] => ("ledger_backups", None),
+                ["packages", name] if !keep.contains(&name.to_lowercase()) => ("packages", None),
+                ["_to_delete", _, ..] => ("to_delete", None),
+                _ => return None,
+            };
+            Some(File {
+                boot,
+                kind: kind.into(),
+                leftover: true,
+                ..file(rel, &meta, now)
             })
         })
         .collect();
@@ -291,18 +368,9 @@ impl Select {
 #[serde(rename_all = "snake_case")]
 pub enum To {
     RecycleBin,
-    /// `<data root>\_to_delete\<date>\`, for the user to empty: what the Recycle Bin can't take whole.
-    ToDelete,
-}
-
-impl To {
-    /// `captures.removed_to`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            To::RecycleBin => "recycle_bin",
-            To::ToDelete => "to_delete",
-        }
-    }
+    /// What the Recycle Bin can't take whole: Windows' own dialog asks the user whether to delete it permanently, and
+    /// no keeps it in place.
+    AskDelete,
 }
 
 /// What a cleanup takes, and the cited files it keeps.
@@ -313,7 +381,7 @@ pub struct Plan {
 }
 
 /// The cleanup `select` asks for. `recycle_max`: the largest file the Recycle Bin takes whole, None when it takes
-/// nothing (it would delete instead); bigger files go to `_to_delete`.
+/// nothing (it would delete instead); for bigger files Windows asks the user ([`To::AskDelete`]).
 pub fn plan(files: &[File], select: &Select, recycle_max: Option<u64>) -> Plan {
     let mut out = Plan::default();
     for f in files {
@@ -327,18 +395,17 @@ pub fn plan(files: &[File], select: &Select, recycle_max: Option<u64>) -> Plan {
         }
         let to = match recycle_max {
             Some(max) if f.bytes <= max => To::RecycleBin,
-            _ => To::ToDelete,
+            _ => To::AskDelete,
         };
         out.take.push((f.clone(), to));
     }
     out
 }
 
-/// The folders of `dirs` (every folder under the capture root, [`folders`]) that a cleanup taking `plan` empties,
-/// deepest first: each that holds no file but taken ones, at any depth, and held a taken file or lies in a selected
-/// boot's folder (`boots`: their names, lowercase), with its subfolders (feature tests 2b, 2c).
-pub fn emptied(dirs: &[String], files: &[File], plan: &Plan, boots: &[&str]) -> Vec<String> {
-    let taken: Vec<&str> = plan.take.iter().map(|(f, _)| f.rel.as_str()).collect();
+/// The folders of `dirs` (folders under the root of `files`, [`folders`]) that a cleanup taking `taken` (their `rel`)
+/// empties, deepest first: each that holds no file but taken ones, at any depth, and held a taken file or lies in a
+/// selected boot's folder (`boots`: their names, lowercase), with its subfolders (feature tests 2b, 2c).
+pub fn emptied(dirs: &[String], files: &[File], taken: &[&str], boots: &[&str]) -> Vec<String> {
     let beneath = |dir: &str, rel: &str| {
         rel.strip_prefix(dir)
             .is_some_and(|rest| rest.starts_with('/'))
@@ -384,7 +451,7 @@ impl Plan {
             "files": self.take.len(),
             "gb": gb(self.take.iter().map(|(f, _)| f.bytes).sum()),
             "recycle_bin": to(To::RecycleBin),
-            "to_delete": to(To::ToDelete),
+            "ask_delete": to(To::AskDelete),
             "kept_cited": kept,
         })
     }
@@ -491,6 +558,56 @@ mod tests {
         }
     }
 
+    /// The owner's rule (2026-10-19): one cleanup covers every leftover of quen's under the data root, and only those.
+    #[test]
+    fn leftovers_are_quen_s_own_files_under_the_data_root_by_kind() {
+        let t = Temp::new("leftovers");
+        for rel in [
+            "config.toml",
+            "state/quen.db",
+            "gamesaves/slot.sav",
+            "captures/ab12cd/shot.png",
+            "logs/serve.log",
+            "packages/quen-w3-0.1.8.zip",
+            "logs/1792-ab12cd/game.log",
+            "logs/1792-ab12cd/game-logs/W3Quen.log",
+            "logs/1792-ab12cd/backup/dx12user.settings",
+            "logs/1793-recover/journal.jsonl",
+            "logs/queries/1792-9f.json",
+            "state/backups/quen-v9-20261018T232957Z.db",
+            "packages/quen-w3-0.1.7.zip",
+            "_to_delete/2026-10-18/136/l1b.rdc",
+        ] {
+            t.put(rel, 3);
+        }
+        let folders = [("ab12cd".to_owned(), 130)];
+        let keep = ["quen-w3-0.1.8.zip".to_owned()];
+        let files = leftovers(&t.0, SystemTime::now(), &folders, &keep);
+        let got: Vec<String> = files
+            .iter()
+            .map(|f| format!("{} {} {:?} {}", f.rel, f.kind, f.boot, f.leftover))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "_to_delete/2026-10-18/136/l1b.rdc to_delete None true",
+                "logs/1792-ab12cd/backup/dx12user.settings settings_backups Some(130) true",
+                "logs/1792-ab12cd/game-logs/W3Quen.log session_logs Some(130) true",
+                "logs/1792-ab12cd/game.log session_logs Some(130) true",
+                "logs/1793-recover/journal.jsonl session_logs None true",
+                "logs/queries/1792-9f.json query_spills None true",
+                "packages/quen-w3-0.1.7.zip packages None true",
+                "state/backups/quen-v9-20261018T232957Z.db ledger_backups None true",
+            ]
+        );
+        assert!(files.iter().all(|f| LEFTOVERS.contains(&f.kind.as_str())));
+        // Selected by a leftover's kind or its boot, as a capture is by its extension.
+        let logs = Select::parse(&json!({"kinds": ["session_logs"]})).unwrap();
+        assert_eq!(plan(&files, &logs, Some(9)).take.len(), 3);
+        let boot = Select::parse(&json!({"boots": [130]})).unwrap();
+        assert_eq!(plan(&files, &boot, Some(9)).take.len(), 3);
+    }
+
     #[test]
     fn a_cleanup_takes_what_every_filter_matches_keeps_the_cited_and_routes_by_size() {
         let file = |rel: &str, bytes, age_days, boot, kind: &str, capture, cited| File {
@@ -501,6 +618,7 @@ mod tests {
             kind: kind.into(),
             capture,
             cited,
+            leftover: false,
         };
         let files = [
             file(
@@ -544,15 +662,15 @@ mod tests {
         let rdc = Select::parse(&json!({"boots": [132]})).unwrap();
         assert_eq!(
             take(&rdc, Some(4_000_000_000)),
-            [("132/l1.rdc".into(), To::ToDelete)]
+            [("132/l1.rdc".into(), To::AskDelete)]
         );
         let all = Select::parse(&json!({"older_than_days": 0})).unwrap();
-        assert!(take(&all, None).iter().all(|(_, to)| *to == To::ToDelete));
+        assert!(take(&all, None).iter().all(|(_, to)| *to == To::AskDelete));
         let summary = plan(&files, &all, None).summary();
         assert_eq!(
             (
                 summary["files"].as_u64(),
-                summary["to_delete"]["files"].as_u64()
+                summary["ask_delete"]["files"].as_u64()
             ),
             (Some(4), Some(4))
         );
@@ -582,6 +700,7 @@ mod tests {
             kind: "png".into(),
             capture: None,
             cited: false,
+            leftover: false,
         };
         let files = [
             file("1/a/x.png"),
@@ -593,13 +712,8 @@ mod tests {
             "1", "1/a", "1/a/deep", "1/c", "s1", "s1/l3c", "other", "empty",
         ]
         .map(String::from);
-        let taking = |n: usize| Plan {
-            take: files[..n]
-                .iter()
-                .map(|f| (f.clone(), To::RecycleBin))
-                .collect(),
-            kept: Vec::new(),
-        };
+        let taking =
+            |n: usize| -> Vec<&str> { files[..n].iter().map(|f| f.rel.as_str()).collect() };
         // 1/a held the taken file: it goes with its empty subfolder; 1 still holds b.png; no unrelated folder goes.
         assert_eq!(emptied(&dirs, &files, &taking(1), &[]), ["1/a/deep", "1/a"]);
         // A selected boot's folder keeps kf0.png; its empty l3c goes.

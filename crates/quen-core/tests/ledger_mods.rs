@@ -43,7 +43,7 @@ fn a_0001_ledger_migrates_in_place() {
     let mut l = Ledger::open(&db.0).unwrap();
     let version = rows(&l, "SELECT user_version FROM pragma_user_version", &[]);
     assert_eq!(version, vec![vec![json!(SCHEMA_VERSION)]]);
-    assert_eq!(SCHEMA_VERSION, 12);
+    assert_eq!(SCHEMA_VERSION, 13);
     let entries = rows(
         &l,
         "SELECT mod_set_id, kind, name, parked, content_hash, home, file_count, bytes, config_hash, config_values,

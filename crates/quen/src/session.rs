@@ -518,6 +518,8 @@ pub fn status(shared: &Shared) -> Value {
         fields.insert("startup_replay".into(), startup.clone());
     }
     fields.insert("serve_pid".into(), json!(std::process::id()));
+    // Finding 22: a client keeps the tool list it got when it connected, maybe from an older quen.
+    fields.insert("quen".into(), json!(env!("CARGO_PKG_VERSION")));
     envelope(
         shared,
         "session_status",
