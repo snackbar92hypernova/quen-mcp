@@ -64,6 +64,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0012_pose_yaw_optional.sql",
         "ca2b57c2ca94a77338594d4007b50909c0edfc2cdecb7b16b7d649292398f08e",
     ),
+    (
+        "0013_captures_deleted.sql",
+        "36d7ae7a8640f66a876eef23ce2d153a2028757f1377d13fc1d0453932123dce",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -504,6 +508,17 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
         ] {
             assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
         }
+        // 0013: a capture the user deleted for good is marked so; removed_to takes no other new value.
+        now.execute(
+            "UPDATE captures SET removed_to = 'deleted' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            now.execute("UPDATE captures SET removed_to = 'gone' WHERE id = 1", [])
+                .is_err(),
+            "v{k}"
+        );
         drop(now);
         let run = rows(
             &l,

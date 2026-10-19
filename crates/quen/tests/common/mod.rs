@@ -379,6 +379,8 @@ impl Quen {
         assert_eq!(init["result"]["serverInfo"]["name"], "quen");
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         let status = self.tool("session_status", json!({}));
+        // Finding 22: the running quen's version, to tell a tool list kept from an older one.
+        assert_eq!(status["quen"], init["result"]["serverInfo"]["version"]);
         self.daemon = status["serve_pid"].as_u64().unwrap() as u32;
         assert_ne!(self.daemon, self.child.id(), "the proxy served itself");
         fx.1.lock().unwrap().push(self.daemon);

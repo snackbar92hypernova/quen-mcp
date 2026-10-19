@@ -105,6 +105,9 @@ pub enum Action {
         sha: String,
         file_id: String,
     },
+    /// The log a staged mod may write at `path`, where no file was at the launch. Undo: recycle it if it is there (the
+    /// end copies the boot's logs into the session's game-logs first).
+    NewLog { path: PathBuf },
     /// A file the game rewrites by itself during the session, backed up earlier in the journal, with its sha and write
     /// time then: Witcher 3 recompiles its scripts into `content\content0\x64.final.redscripts` when a script mod is
     /// parked (first experiment boot), and reorders the lines of input.settings at every launch (live boot 1). Undo:
@@ -468,6 +471,16 @@ fn undo(
         Action::GameMemory { what, .. } => report
             .notes
             .push(format!("{what}: nothing to undo, it ended with the game")),
+        Action::NewLog { path } => {
+            if fs.exists(path) {
+                fs.recycle(path)?;
+                report.recycled.push(path.clone());
+                report.undone.push(format!(
+                    "removed {}, a staged mod's log (Recycle Bin)",
+                    path.display()
+                ));
+            }
+        }
         Action::Place { dest, sha, file_id } => {
             if verifies(fs, dest, sha, file_id)? {
                 fs.recycle(dest)?;

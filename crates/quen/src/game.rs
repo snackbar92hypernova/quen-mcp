@@ -17,7 +17,7 @@ use quen_core::bridge_log::{self, FADE, MENU, VALID};
 use quen_core::cvar;
 use quen_core::input::{Event, GAP_MS, GRAVE, HOLD_MS, describe};
 use quen_core::journal::{Action as Step, Journal};
-use quen_core::mem::Write;
+use quen_core::mem::{Module, Write};
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 use windows_sys::Win32::Foundation::{
@@ -1221,6 +1221,15 @@ pub(crate) fn tree() -> io::Result<Vec<(u32, u32, String)>> {
 
 /// The base address of `module` (a file name, any case) in process `pid`, if it is loaded there.
 pub(crate) fn module_base(pid: u32, module: &str) -> io::Result<Option<usize>> {
+    let all = modules(pid)?;
+    let named = all
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(module));
+    Ok(named.map(|m| m.base as usize))
+}
+
+/// The modules loaded in process `pid`, in Toolhelp's order.
+pub(crate) fn modules(pid: u32) -> io::Result<Vec<Module>> {
     // SAFETY: as in `processes`.
     unsafe {
         // The snapshot can fail with ERROR_BAD_LENGTH while the process loads modules: try again.
@@ -1239,14 +1248,17 @@ pub(crate) fn module_base(pid: u32, module: &str) -> io::Result<Option<usize>> {
         let snap = Owned(snap);
         let mut entry: MODULEENTRY32W = std::mem::zeroed();
         entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+        let mut out = Vec::new();
         let mut ok = Module32FirstW(snap.0, &mut entry);
         while ok != 0 {
-            if from_wide(&entry.szModule).eq_ignore_ascii_case(module) {
-                return Ok(Some(entry.modBaseAddr as usize));
-            }
+            out.push(Module {
+                name: from_wide(&entry.szModule),
+                base: entry.modBaseAddr as u64,
+                size: entry.modBaseSize.into(),
+            });
             ok = Module32NextW(snap.0, &mut entry);
         }
-        Ok(None)
+        Ok(out)
     }
 }
 

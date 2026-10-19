@@ -21,15 +21,15 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 - `witcher3.exe`, and around it Nsight Systems or Nsight Graphics if you configured them; PresentMon for the measure tools. Each runs inside a Windows Job Object. quen kills only what is in its job, never a program by name, so a copy of the game you started yourself is left alone.
 - Each of them gets a short, fixed list of environment variables (Windows' own, and quen's), never your whole environment. An API key or token in your agent's environment doesn't reach the game, its mods, a profiler or PresentMon.
 - quen needs no admin rights. PresentMon needs your account in the Windows *Performance Log Users* group ([INSTALL.md](INSTALL.md) §1).
-- quen downloads and installs nothing.
+- quen downloads and installs nothing. A launch's `stage` copies files already on your PC into the game folder for that session only.
 - While a session is live, quen keeps the PC and its display awake (`SetThreadExecutionState` with `ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, on a thread that lives as long as the session); Windows releases it when the session ends, whichever way it ends, or when quen exits.
 
 **Files**
-- During a session quen changes files in the game folder and in the game's Documents folder: settings, the console switch, ReShade's ini files, a `steam_appid.txt`, parked mods, the compiled scripts ([INSTALL.md](INSTALL.md) §6).
+- During a session quen changes files in the game folder and in the game's Documents folder: settings, the console switch, ReShade's ini files, a `steam_appid.txt`, parked mods, test files a launch stages into `bin\x64_dx12` (listed in its plan), the compiled scripts ([INSTALL.md](INSTALL.md) §6).
 - Each change goes into a journal before it is made, and is undone when the session ends, or after a crash at quen's next start.
-- quen never deletes anything for good: what it removes goes to the Recycle Bin, or, for a capture the bin can't take whole, to `<data root>\_to_delete\` for you to empty. It never restores or deletes your saves.
+- quen never deletes anything for good on its own: what it removes goes to the Recycle Bin. A file of a cleanup that the bin can't take whole is deleted only after you answer Yes in Windows' own dialog; No keeps it. It never restores or deletes your saves.
 - It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back). A save you make while you have the controls is yours, and the session's end lists it.
-- It removes captures only through `capture_clean`, which your client asks you about on every call, as for a launch.
+- It removes captures and its other leftovers (session logs, its ledger's backups) only through `capture_clean`, which your client asks you about on every call, as for a launch.
 - Its own data (the ledger, logs, captures, the journal) stays under its data root, `%USERPROFILE%\.quen\` by default.
 
 **The game's memory**

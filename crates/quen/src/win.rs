@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_CANCELLED, ERROR_IO_PENDING,
+    ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_PIPE_NOT_CONNECTED, ERROR_SHARING_VIOLATION, FILETIME, GENERIC_READ, GENERIC_WRITE,
     GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
     SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -84,8 +84,8 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOLDERID_Documents,
-    FOLDERID_Pictures, SHFILEOPSTRUCTW, SHFileOperationW, SHGetKnownFolderPath,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+    FOLDERID_Documents, FOLDERID_Pictures, SHFILEOPSTRUCTW, SHFileOperationW, SHGetKnownFolderPath,
 };
 use windows_sys::core::BOOL;
 use windows_sys::core::GUID;
@@ -1244,6 +1244,42 @@ pub fn recycle(path: &Path) -> io::Result<()> {
         let n = fs::read_dir(&dir)?.count();
         return rename_no_replace(path, &dir.join(n.to_string()));
     }
+    let (code, aborted) = shell_delete_op(path, FOF_ALLOWUNDO | FOF_NOCONFIRMATION)?;
+    if code != 0 || aborted || fs::symlink_metadata(path).is_ok() {
+        return Err(io::Error::other(format!(
+            "{} not sent to the Recycle Bin (SHFileOperationW {code:#x})",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// capture_clean's delete of `path` through the Windows shell, which asks the user before any permanent delete:
+/// `recycle` sends it to the Recycle Bin, and Windows asks first if the bin can't take it (`FOF_WANTNUKEWARNING`);
+/// otherwise Windows asks whether to delete it permanently. Whether it is gone: false when the user said no.
+/// `QUEN_TEST_RECYCLE_TO` (tests only) takes the Recycle Bin's place, as for [`recycle`].
+pub fn shell_delete(path: &Path, to_bin: bool) -> io::Result<bool> {
+    if to_bin && env::var_os("QUEN_TEST_RECYCLE_TO").is_some() {
+        return recycle(path).map(|()| true);
+    }
+    let flags = match to_bin {
+        true => FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING,
+        false => 0,
+    };
+    let (code, aborted) = shell_delete_op(path, flags)?;
+    match fs::symlink_metadata(path).is_err() {
+        true => Ok(true),
+        false if aborted || code == ERROR_CANCELLED as i32 => Ok(false),
+        false => Err(io::Error::other(format!(
+            "{} is still there (SHFileOperationW {code:#x})",
+            path.display()
+        ))),
+    }
+}
+
+/// SHFileOperationW's delete of `path` with `flags`, and always `FOF_NOERRORUI` (an error comes back as its code) and
+/// `FOF_SILENT` (no progress window); no owner window. Its code, and whether an operation was aborted.
+fn shell_delete_op(path: &Path, flags: u32) -> io::Result<(i32, bool)> {
     let mut from = wide(std::path::absolute(path)?.as_os_str())?;
     from.push(0);
     let mut op = SHFILEOPSTRUCTW {
@@ -1251,20 +1287,14 @@ pub fn recycle(path: &Path) -> io::Result<()> {
         wFunc: FO_DELETE,
         pFrom: from.as_ptr(),
         pTo: null(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        fFlags: (flags | FOF_NOERRORUI | FOF_SILENT) as u16,
         fAnyOperationsAborted: 0,
         hNameMappings: null_mut(),
         lpszProgressTitle: null(),
     };
-    // SAFETY: a double-NUL-terminated path list that outlives the call; no window, no progress title.
+    // SAFETY: a double-NUL-terminated path list that outlives the call; no owner window, no progress title.
     let code = unsafe { SHFileOperationW(&mut op) };
-    if code != 0 || op.fAnyOperationsAborted != 0 || fs::symlink_metadata(path).is_ok() {
-        return Err(io::Error::other(format!(
-            "{} not sent to the Recycle Bin (SHFileOperationW {code:#x})",
-            path.display()
-        )));
-    }
-    Ok(())
+    Ok((code, op.fAnyOperationsAborted != 0))
 }
 
 /// `GetDriveTypeW`'s fixed drive (in WindowsProgramming, a feature quen doesn't use).

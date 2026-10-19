@@ -85,12 +85,16 @@ pub enum Change {
     },
     /// Rename `from` to `to`: a mod parked. `to`'s folder must exist.
     Move { from: PathBuf, to: PathBuf },
-    /// Write `bytes` to `stage`, then rename it to `dest`, where nothing is. `stage` is on `dest`'s volume.
+    /// Write `bytes` to `stage`, then rename it to `dest`, where nothing is. `stage` is on `dest`'s volume. `from`: the
+    /// file on this PC the bytes are of, for a staged file ([`stage`]).
     Place {
         stage: PathBuf,
         dest: PathBuf,
         bytes: Vec<u8>,
+        from: Option<PathBuf>,
     },
+    /// A staged mod's log, where no file is: the replay recycles whatever the game wrote there.
+    NewLog { path: PathBuf },
     /// Back `path` up to `backup` and record its write time: the game rewrites it during the session (its compiled
     /// scripts, once a mod is parked; input.settings and dx12user.settings.bak, at every launch), and the replay puts
     /// both back. `keep`: a live file whose lines changed beyond their order is kept beside first (input.settings: the
@@ -111,7 +115,16 @@ impl Change {
                 format!("patch {} (backup {})", path.display(), backup.display())
             }
             Change::Move { from, to } => format!("park {} -> {}", from.display(), to.display()),
+            Change::Place {
+                dest,
+                from: Some(from),
+                ..
+            } => format!("stage {} -> {}", from.display(), dest.display()),
             Change::Place { dest, .. } => format!("place {}", dest.display()),
+            Change::NewLog { path } => format!(
+                "recycle {} at the end if the game writes it (game_logs keeps a copy)",
+                path.display()
+            ),
             Change::Rebuilt { path, backup, .. } => {
                 format!(
                     "keep {} as it is now (backup {}): the game rewrites it",
@@ -246,14 +259,91 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
             stage: bin.join("steam_appid.txt.quen-stage"),
             dest,
             bytes: STEAM_APPID.into(),
+            from: None,
         });
+    }
+    Ok(changes)
+}
+
+/// The changes that copy `files` (on this PC) into bin under their own names for one session, after `earlier` (the
+/// boot's other changes): a file of that name in bin (`bin` lists it) is parked first, unless `earlier` parks it, then
+/// the copy placed. A staged file's `<stem>.log` that isn't in bin is journaled, so the replay recycles it, after the
+/// end copied the boot's logs into game_logs. Refuses, with nothing changed: a name staged twice or on `never`, a
+/// folder or link of that name in bin, one `earlier` changes otherwise, a file that can't be read.
+pub fn stage(
+    fs: &dyn Fs,
+    game_dir: &Path,
+    files: &[PathBuf],
+    never: &[&str],
+    bin: &[Entry],
+    earlier: &[Change],
+) -> Result<Vec<Change>, String> {
+    let dir = bin_dir(game_dir);
+    let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
+    let in_bin = |name: &str| bin.iter().find(|e| e.name.eq_ignore_ascii_case(name));
+    let (mut changes, mut dests) = (Vec::new(), Vec::<PathBuf>::new());
+    for file in files {
+        let name = file.file_name().unwrap_or_default().to_string_lossy();
+        let refused = |why: &str| Err(format!("stage {}: {why}", file.display()));
+        if never.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            return refused("quen never parks that name, so nothing is staged over it");
+        }
+        let found = in_bin(&name);
+        if found.is_some_and(|e| e.is_dir || e.is_link) {
+            return refused("a folder or link of that name is in bin");
+        }
+        // The name as bin spells it, so the original comes back as it was.
+        let dest = dir.join(found.map_or(&*name, |e| e.name.as_str()));
+        if dests.iter().any(|d| same(d, &dest)) {
+            return refused("a second file of that name");
+        }
+        let touches = |c: &Change| match c {
+            Change::Rewrite { path, .. }
+            | Change::Rebuilt { path, .. }
+            | Change::NewLog { path }
+            | Change::Place { dest: path, .. } => same(path, &dest),
+            Change::Move { .. } => false, // a park of it: then only the copy is placed
+        };
+        if let Some(c) = earlier.iter().find(|c| touches(c)) {
+            return refused(&format!("the launch changes it already ({})", c.summary()));
+        }
+        let bytes = fs
+            .read(file)
+            .map_err(|e| format!("stage {}: {e}", file.display()))?;
+        let parked = |c: &Change| matches!(c, Change::Move { from, .. } if same(from, &dest));
+        if let Some(e) = found.filter(|_| !earlier.iter().any(parked)) {
+            changes.push(Change::Move {
+                from: dest.clone(),
+                to: game_dir.join(PARKED).join("bin").join(&e.name),
+            });
+        }
+        let mut stage = dest.clone().into_os_string();
+        stage.push(".quen-stage");
+        changes.push(Change::Place {
+            stage: stage.into(),
+            dest: dest.clone(),
+            bytes,
+            from: Some(file.clone()),
+        });
+        dests.push(dest);
+    }
+    for dest in &dests {
+        let log = dest.with_extension("log");
+        let name = log.file_name().unwrap_or_default().to_string_lossy();
+        let listed = |c: &Change| matches!(c, Change::NewLog { path } if same(path, &log));
+        if in_bin(&name).is_none()
+            && !dests.iter().any(|d| same(d, &log))
+            && !changes.iter().any(listed)
+        {
+            changes.push(Change::NewLog { path: log });
+        }
     }
     Ok(changes)
 }
 
 /// Makes `changes` in order, each step journaled before it acts: a [`Change::Rewrite`] is a Backup step (the copy read
 /// back and compared), then a Patch step (the same); a [`Change::Rebuilt`] the same Backup, then a Rebuilt step with
-/// the file's write time; a move or a place is one step. `stopped` is asked before each
+/// the file's write time; a move, a place or a new log is one step. `stopped` is asked before each
 /// change: once it says yes, this stops with `Interrupted`. On any error the caller unwinds through the journal.
 pub fn apply(
     fs: &dyn Fs,
@@ -315,7 +405,9 @@ pub fn apply(
                 fs.rename(from, to)?;
                 journal.done(id)?;
             }
-            Change::Place { stage, dest, bytes } => {
+            Change::Place {
+                stage, dest, bytes, ..
+            } => {
                 if fs.exists(dest) {
                     let why = format!("{} exists: nothing is placed over a file", dest.display());
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
@@ -347,6 +439,14 @@ pub fn apply(
                     mtime: fs.mtime(path)?,
                     keep: *keep,
                 })?;
+                journal.done(id)?;
+            }
+            Change::NewLog { path } => {
+                if fs.exists(path) {
+                    let why = format!("{} exists: only a new log is recycled", path.display());
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
+                }
+                let id = journal.step(Action::NewLog { path: path.clone() })?;
                 journal.done(id)?;
             }
         }
@@ -1007,7 +1107,9 @@ mod tests {
         let touched: Vec<&Path> = changes
             .iter()
             .map(|c| match c {
-                Change::Rewrite { path, .. } | Change::Rebuilt { path, .. } => path.as_path(),
+                Change::Rewrite { path, .. }
+                | Change::Rebuilt { path, .. }
+                | Change::NewLog { path } => path.as_path(),
                 Change::Move { from, .. } => from.as_path(),
                 Change::Place { dest, .. } => dest.as_path(),
             })
@@ -1035,6 +1137,143 @@ mod tests {
             .filter(|c| matches!(c, Change::Rebuilt { .. }))
             .count();
         assert_eq!(kept, 2, "{changes:?}");
+    }
+
+    fn file(name: &str, is_link: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir: false,
+            is_link,
+        }
+    }
+
+    /// Finding 23: test files copied into bin by hand before each boot and recycled after it. Staged, each is a placed
+    /// copy; the user's file of that name (here in another case) is parked first and comes back; a log a staged mod
+    /// writes where none was is recycled; a file a park moves already isn't moved twice.
+    #[test]
+    fn staged_files_land_park_what_is_there_and_replay_away() {
+        let fs = game();
+        fs.put("GAME/bin/x64_dx12/w3fake.INI", "the user's ini");
+        fs.put("GAME/bin/x64_dx12/Tweaks.asi", "the user's tweaks");
+        for (name, bytes) in [
+            ("W3Test.asi", "test asi"),
+            ("W3Test.ini", "test ini"),
+            ("W3Fake.ini", "test fake ini"),
+            ("Tweaks.asi", "test tweaks"),
+        ] {
+            fs.put(Path::new("PC").join(name), bytes);
+        }
+        let before = fs.files();
+        let bin = [file("w3fake.INI", false), file("Tweaks.asi", false)];
+        let mut inp = inputs(&[], &bin);
+        inp.park = "Tweaks.asi";
+        let mut changes = plan(&fs, &inp).unwrap();
+        let files: Vec<PathBuf> = ["W3Test.asi", "W3Test.ini", "W3Fake.ini", "Tweaks.asi"]
+            .iter()
+            .map(|n| Path::new("PC").join(n))
+            .collect();
+        let game_dir = Path::new("GAME");
+        let staged = stage(&fs, game_dir, &files, park::W3_NEVER_PARK, &bin, &changes).unwrap();
+        let bin_dir = bin_dir(game_dir);
+        let show = |p: &str| bin_dir.join(p).display().to_string();
+        let pc = |p: &str| Path::new("PC").join(p).display().to_string();
+        let lines: Vec<String> = staged.iter().map(Change::summary).collect();
+        let parked = game_dir.join(PARKED).join("bin").join("w3fake.INI");
+        assert_eq!(
+            lines,
+            [
+                format!("stage {} -> {}", pc("W3Test.asi"), show("W3Test.asi")),
+                format!("stage {} -> {}", pc("W3Test.ini"), show("W3Test.ini")),
+                format!("park {} -> {}", show("w3fake.INI"), parked.display()),
+                format!("stage {} -> {}", pc("W3Fake.ini"), show("w3fake.INI")),
+                // The park moves Tweaks.asi already: only the copy.
+                format!("stage {} -> {}", pc("Tweaks.asi"), show("Tweaks.asi")),
+                format!(
+                    "recycle {} at the end if the game writes it (game_logs keeps a copy)",
+                    show("W3Test.log")
+                ),
+                format!(
+                    "recycle {} at the end if the game writes it (game_logs keeps a copy)",
+                    show("w3fake.log")
+                ),
+                format!(
+                    "recycle {} at the end if the game writes it (game_logs keeps a copy)",
+                    show("Tweaks.log")
+                ),
+            ],
+        );
+        changes.extend(staged);
+        let path = Path::new("QUEN/journal.jsonl");
+        let mut journal = Journal::create(&fs, path).unwrap();
+        apply(&fs, &mut journal, &changes, &|| false).unwrap();
+        let read = |p: &str| String::from_utf8(fs.read(&bin_dir.join(p)).unwrap()).unwrap();
+        assert_eq!(read("W3Test.asi"), "test asi");
+        assert_eq!(read("w3fake.INI"), "test fake ini");
+        assert_eq!(read("Tweaks.asi"), "test tweaks");
+        assert_eq!(fs.read(&parked).unwrap(), b"the user's ini");
+        // The staged mod logs; the replay recycles its log and the copies, and puts the user's files back.
+        fs.put(bin_dir.join("W3Test.log"), "a staged mod's log");
+        let report = replay(&fs.read(path).unwrap(), &fs);
+        assert!(report.clean() && report.kept.is_empty(), "{report:#?}");
+        let mut after = fs.files();
+        after.retain(|p, _| !p.starts_with("QUEN"));
+        assert_eq!(after, before);
+        for name in ["W3Test.log", "W3Test.asi", "w3fake.INI", "Tweaks.asi"] {
+            assert!(
+                report.recycled.contains(&bin_dir.join(name)),
+                "{name}: {report:#?}"
+            );
+        }
+    }
+
+    /// Each refusal comes before any change, naming the file: a name quen never parks, a folder or link in bin, a
+    /// second file of one name (in any case), a file another change of the launch makes, a file it can't read.
+    #[test]
+    fn staging_refuses_before_any_change() {
+        let fs = game();
+        fs.put("PC/W3Quen.asi", "x");
+        fs.put("PC/plugins.asi", "x");
+        fs.put("PC/Linked.asi", "x");
+        fs.put("PC/a/W3Test.asi", "x");
+        fs.put("PC/b/w3test.ASI", "x");
+        fs.put("PC/steam_appid.txt", "x");
+        let before = fs.files();
+        let bin = [
+            Entry {
+                name: "plugins.asi".into(),
+                is_dir: true,
+                is_link: false,
+            },
+            file("Linked.asi", true),
+        ];
+        let earlier = plan(&fs, &inputs(&[], &bin)).unwrap();
+        for (files, why) in [
+            (&["PC/W3Quen.asi"][..], "never parks"),
+            (&["PC/plugins.asi"], "a folder or link"),
+            (&["PC/Linked.asi"], "a folder or link"),
+            (&["PC/a/W3Test.asi", "PC/b/w3test.ASI"], "a second file"),
+            (
+                &["PC/steam_appid.txt"],
+                "the launch changes it already (place ",
+            ),
+            (&["PC/Missing.asi"], "not found"),
+        ] {
+            let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+            let got = stage(
+                &fs,
+                Path::new("GAME"),
+                &files,
+                park::W3_NEVER_PARK,
+                &bin,
+                &earlier,
+            );
+            let err = got.unwrap_err();
+            assert!(
+                err.contains(why) && err.contains(&files.last().unwrap().display().to_string()),
+                "{files:?}: {err}"
+            );
+        }
+        assert_eq!(fs.files(), before);
     }
 
     #[test]

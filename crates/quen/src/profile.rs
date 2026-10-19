@@ -445,6 +445,7 @@ fn swap(
             stage: bin.join(format!("{INTERPOSER_JSON}.quen-stage")),
             dest: json,
             bytes: JSON.into(),
+            from: None,
         },
     ])
 }

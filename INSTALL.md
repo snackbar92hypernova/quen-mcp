@@ -34,7 +34,7 @@ What it does, with every check before the first change:
 Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 
 - It refuses, and changes nothing, while a quen session is live or its journal is left: end the session, or run `quen recover`.
-- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live. Then restart your client's sessions (or reconnect quen with `/mcp` in Claude Code): a session keeps the tool list it got when it connected.
+- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live. Then restart Claude Desktop (its MCP dialog has no Reconnect for user-scope servers), or in the Claude Code CLI reconnect quen with `/mcp`: a client session keeps the tool list it got when it connected. `session_status` gives the running quen's version (`quen`).
 - **`-Uninstall`** sends `.quen\bin` and the package to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
 - **`-WhatIf`** prints every step and changes nothing. It still downloads and checks the release, in a temp folder that then goes to the Recycle Bin.
 
@@ -280,13 +280,15 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 | `gamesaves\` | a copy of your `gamesaves` folder, refreshed before every launch |
 | `logs\<time>-<session>\` | one folder per session: the backups of the files it patched (`backup\`), the game's log, a numbered log per tool step (PresentMon's too), the finished journal, and `game-logs\`: copies of the game folder's `*.log` files the boot wrote (quen's, the Native Bridge's, ReShade's, the mods'), which the next launch would overwrite. They can hold personal data (a Steam id, the PC's name): keep them on this PC |
 | `logs\serve.log` | the background `quen serve` log |
-| `captures\<session>\` | screenshots and PresentMon CSVs (or under `capture_root`) |
+| `logs\queries\` | `ledger_query` results too big to answer inline |
+| `state\backups\` | a copy of the ledger from before each upgrade of its schema |
+| `captures\<session>\` | screenshots, PresentMon CSVs and memory-tool results too big to answer inline (or under `capture_root`) |
 | `captures\<boot id>\` | a profiler's output: RenderDoc captures (3-5 GB each), Nsight reports and traces, Tracy captures |
-| `_to_delete\<date>\` | captures you agreed to clean up that the Recycle Bin can't take whole: check and empty it yourself |
+| `_to_delete\<date>\` | from quen 0.1.5 and older: captures you agreed to clean up that the Recycle Bin couldn't take whole. A cleanup takes them now, with your OK |
 
 - quen refuses a data or capture root inside its own source folder, its install folder, any git work tree, the game folder, the game's documents folder, or Pictures.
-- **Captures grow with every session**, and quen tells you: `quen_doctor`, `session_plan`, `session_launch` and `session_end` report the capture root's size, and warn once it passes `capture_budget_gb` (20 GB unless your config says). Your agent can show what is there (`capture_usage`: by boot, kind and age) and, only with your OK, clean up what you pick (`capture_clean`; your client asks you each time). Files go to the Recycle Bin; one the bin can't take whole (over 4 GB, or no bin on that drive) goes to `_to_delete\<date>\` for you to empty. The ledger keeps every row, marked removed. A file a claim or a pose relies on stays unless named.
-- Logs grow too: delete old `logs\` folders yourself when you no longer need them (via the Recycle Bin).
+- **Captures grow with every session**, and quen tells you: `quen_doctor`, `session_plan`, `session_launch` and `session_end` report the capture root's size, and warn once it passes `capture_budget_gb` (20 GB unless your config says). Your agent can show what is there (`capture_usage`: by boot, kind and age) and, only with your OK, clean up what you pick (`capture_clean`; your client asks you each time). Files go to the Recycle Bin. For one the bin can't take whole (over 4 GB, or no bin on that drive), Windows' own dialog asks you whether to delete it permanently: Yes deletes it, No keeps it where it is. quen never deletes a file for good without that answer. The ledger keeps every row, marked removed. A file a claim or a pose relies on stays unless named.
+- **The same cleanup takes quen's other leftovers** under the data root, when you pick them: the session logs (with the settings backups a session kept), `logs\queries\`, the ledger's backups in `state\backups\`, zips in `packages\` other than the installed package's, and what waits in `_to_delete\`. Your config, the ledger, `logs\serve.log` and the `gamesaves\` copy are never taken.
 
 ## 6. What quen changes, and how it puts it back
 
@@ -296,6 +298,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 - `ReShade.ini` in `bin\x64_dx12`, with RenoDX or the devkit configured, and `ReShadePreset.ini`, with RenoDX configured;
 - `steam_appid.txt` beside `witcher3.exe`, only if it is missing: it keeps Steam from restarting the game outside quen's control;
 - parked mods: moved out of `Mods\` and `bin\x64_dx12\` into `quen-parked\Mods\` and `quen-parked\bin\` in the game folder (the journal lists them);
+- staged test files (a launch's `stage`: an ASI, its ini, a DLL from elsewhere on your PC): copied into `bin\x64_dx12` for the session, a file of the same name there parked first. At the end the copies go to the Recycle Bin, with the `<name>.log` a staged mod wrote where none was (after a copy into the session's logs), and the parked files come back;
 - `content\content0\x64.final.redscripts`, the game's compiled scripts: with a mod parked the game recompiles them at launch, so quen backs the file up first and puts it back afterwards with its old write time;
 - the running game's memory: cvar writes and ASI mode switches. These live only in the game process and are gone when it closes;
 - `gamesaves` in the documents folder, only through `game_save` (quen-w3 0.1.4 or later), which your client asks you about on every call: the game writes one new manual save, as its menu's "Empty save slot" does, and names it. It never overwrites a save. quen checks the folder before and after: anything else that changed ends the session.

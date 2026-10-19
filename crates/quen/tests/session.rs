@@ -541,24 +541,184 @@ fn status_and_the_mod_set_see_the_parked_boot() {
     assert_eq!(status["parked"], json!([]));
 }
 
+/// Finding 23: test files were copied into bin by hand before each boot and recycled after it. Staged, the plan lists
+/// each copy and the parking of the user's file it covers; the launch puts the copies in bin, a staged ASI in the
+/// boot's mod set in place of the one it parked; the end copies the staged mod's new log into game_logs, then recycles
+/// it and the copies and puts the user's files back. Each bad entry, and stage in a play session or through a bin
+/// that leads out of the game folder, is refused with nothing changed.
+#[test]
+fn staged_files_load_with_the_boot_and_go_at_its_end() {
+    let fx = Fixture::new();
+    let mut quen = Quen::start(&fx);
+    let pc = fx.path("pc");
+    fs::create_dir_all(pc.join("folder.asi")).unwrap();
+    for name in [
+        "W3Test.asi",
+        "W3Fake.asi",
+        "W3Fake.ini",
+        "W3Quen.asi",
+        "bad name.asi",
+        fx.2.as_str(),
+    ] {
+        fs::write(pc.join(name), format!("a test {name}")).unwrap();
+    }
+    let at = |name: &str| pc.join(name).display().to_string();
+    let bin = fx.path("game/bin/x64_dx12");
+    let refused = |quen: &mut Quen, bad: &Value, why: &str| {
+        for tool in ["session_plan", "session_launch"] {
+            let mut args = bad.clone();
+            if tool == "session_launch" {
+                args["user_ok"] = json!(true);
+            }
+            let out = quen.tool(tool, args);
+            assert_eq!(out["refused"], true, "{bad}: {out}");
+            assert!(out["reason"].to_string().contains(why), "{why}: {out}");
+            assert_eq!(out["state"]["lock"]["free"], true);
+        }
+    };
+    for (bad, why) in [
+        (json!({"stage": at("W3Test.asi")}), "an array"),
+        (json!({"stage": ["W3Test.asi"]}), "not an absolute path"),
+        (json!({"stage": [at("Missing.asi")]}), "no such file"),
+        (json!({"stage": [at("folder.asi")]}), "no such file"),
+        (json!({"stage": [at("bad name.asi")]}), "its name must be"),
+        (json!({"stage": [at("W3Quen.asi")]}), "never parks"),
+        (json!({"stage": [at(&fx.2)]}), "never parks"),
+        (
+            json!({"stage": [at("W3Test.asi"), at("W3Test.asi")]}),
+            "a second file",
+        ),
+        (
+            json!({"stage": [at("W3Test.asi")], "mode": "play"}),
+            "stage isn't taken in a play session",
+        ),
+    ] {
+        refused(&mut quen, &bad, why);
+    }
+    assert!(!fx.path("data/state/journal.jsonl").exists());
+    assert!(!bin.join("W3Test.asi").exists() && !fx.path("game/quen-parked").exists());
+
+    let stage = json!([at("W3Test.asi"), at("W3Fake.asi"), at("W3Fake.ini")]);
+    let plan = quen.tool("session_plan", json!({"stage": stage.clone()}));
+    let changes: Vec<&str> = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    let has = |start: &str, end: &str| {
+        changes
+            .iter()
+            .any(|c| c.starts_with(start) && c.ends_with(end))
+    };
+    for (start, end) in [
+        ("stage ", r"bin\x64_dx12\W3Test.asi"),
+        ("park ", r"quen-parked\bin\W3Fake.asi"),
+        ("stage ", r"bin\x64_dx12\W3Fake.asi"),
+        ("park ", r"quen-parked\bin\W3Fake.ini"),
+        ("stage ", r"bin\x64_dx12\W3Fake.ini"),
+        (
+            "recycle ",
+            r"W3Test.log at the end if the game writes it (game_logs keeps a copy)",
+        ),
+        (
+            "recycle ",
+            r"W3Fake.log at the end if the game writes it (game_logs keeps a copy)",
+        ),
+    ] {
+        assert!(has(start, end), "{start}...{end}: {changes:#?}");
+    }
+    let launched = launch_with(&mut quen, json!({"stage": stage}));
+    assert_eq!(fx.read("game/bin/x64_dx12/W3Test.asi"), "a test W3Test.asi");
+    assert_eq!(fx.read("game/bin/x64_dx12/W3Fake.ini"), "a test W3Fake.ini");
+    assert_eq!(fx.read("game/quen-parked/bin/W3Fake.asi"), "asi");
+    assert!(launched.get("mod_set_error").is_none(), "{launched}");
+    let rows = fx.ledger(
+        "SELECT e.name, e.parked, e.content_hash FROM boots b JOIN mod_set_entries e ON e.mod_set_id = b.mod_set_id
+          WHERE e.kind = 'asi' ORDER BY e.name",
+    );
+    let sha = |text: &str| json!(quen_core::journal::sha256_hex(text.as_bytes()));
+    assert_eq!(
+        rows,
+        [
+            [json!("W3Fake"), json!(0), sha("a test W3Fake.asi")],
+            [json!("W3Quen"), json!(0), sha("synthetic")],
+            [json!("W3Test"), json!(0), sha("a test W3Test.asi")],
+            [json!("WitcherNativeBridge"), json!(0), sha("synthetic")],
+        ],
+    );
+    // The staged mod writes its log; the end keeps a copy, then the folder goes back as it was.
+    fs::write(bin.join("W3Test.log"), "the staged mod's log").unwrap();
+    let ended = quen.tool("session_end", json!({"token": launched["token"]}));
+    assert_eq!(ended["ok"], true, "{ended}");
+    let session = launched["session"].as_str().unwrap();
+    let logs = fs::read_dir(fx.path("data/logs")).unwrap();
+    let logs = logs
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(session));
+    let copy = logs.unwrap().join(r"game-logs\W3Test.log");
+    assert_eq!(fs::read_to_string(copy).unwrap(), "the staged mod's log");
+    let undone = ended["replay"]["undone"].to_string();
+    assert!(undone.contains("W3Test.log, a staged mod's log"), "{ended}");
+    fx.assert_restored();
+    for gone in ["W3Test.asi", "W3Test.log", "W3Fake.log"] {
+        assert!(!bin.join(gone).exists(), "{gone}");
+    }
+    assert_eq!(fx.read("game/bin/x64_dx12/W3Fake.asi"), "asi");
+    assert_eq!(
+        fx.read("game/bin/x64_dx12/W3Fake.ini"),
+        "[General]\nMode=raise\n"
+    );
+    let left = fs::read_dir(&bin).unwrap().map(|e| e.unwrap().file_name());
+    assert!(
+        !left
+            .into_iter()
+            .any(|n| n.to_string_lossy().contains(".quen-"))
+    );
+
+    // bin through a junction out of the game folder: refused before anything changes.
+    fs::rename(fx.path(r"game\bin"), fx.path("elsewhere")).unwrap();
+    let out = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(fx.path(r"game\bin"))
+        .arg(fx.path("elsewhere"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let bad = json!({"stage": [at("W3Test.asi")]});
+    refused(&mut quen, &bad, "leads out of the game folder");
+    assert!(!bin.join("W3Test.asi").exists());
+}
+
 /// The daemon killed mid-session leaves the game to die with the job; the next daemon to start takes the lock,
-/// replays the journal and gives everything back. Kill points: the boot half done (files changed, the game running,
-/// the intros being skipped), and the boot done.
+/// replays the journal and gives everything back, a staged file and its mod's log included (the log copied first).
+/// Kill points: the boot half done (files changed, the game running, the intros being skipped), and the boot done.
 #[test]
 fn a_killed_daemon_is_replayed_at_the_next_start() {
     for hold in [true, false] {
         let fx = Fixture::new();
         let mut quen = Quen::start(&fx);
+        fs::create_dir_all(fx.path("pc")).unwrap();
+        fs::write(fx.path("pc/W3Test.asi"), "a test build").unwrap();
+        let args =
+            json!({"user_ok": true, "park": "modAlpha", "stage": [fx.path("pc/W3Test.asi")]});
         if hold {
             fx.hold("continue");
             quen.post(
                 "tools/call",
-                json!({"name": "session_launch", "arguments": {"user_ok": true, "park": "modAlpha"}}),
+                json!({"name": "session_launch", "arguments": args}),
             );
             fx.wait_at("continue");
         } else {
-            launch_with(&mut quen, json!({"park": "modAlpha"}));
+            launch_with(&mut quen, args);
         }
+        let staged = fx.path("game/bin/x64_dx12/W3Test.asi");
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "a test build");
+        fs::write(
+            fx.path("game/bin/x64_dx12/W3Test.log"),
+            "the staged mod's log",
+        )
+        .unwrap();
         let game = fx.game_pid();
         let changed = fx.settings();
         assert_ne!(changed, SETTINGS);
@@ -588,7 +748,11 @@ fn a_killed_daemon_is_replayed_at_the_next_start() {
             json!([rows[0][0]])
         );
         assert_eq!(rows[0][1], "recovered");
-        assert!(Path::new(rows[0][2].as_str().unwrap()).exists(), "{rows:?}");
+        let journal = Path::new(rows[0][2].as_str().unwrap());
+        assert!(journal.exists(), "{rows:?}");
+        assert!(!staged.exists() && !staged.with_extension("log").exists());
+        let copy = journal.with_file_name(r"game-logs\W3Test.log");
+        assert_eq!(fs::read_to_string(copy).unwrap(), "the staged mod's log");
     }
 }
 
@@ -990,6 +1154,7 @@ fn launch_profiles_check_park_and_flag_before_anything_changes() {
     );
     let changes = nsys["changes"].to_string();
     assert!(changes.contains("dxgi.dll"), "{changes}");
+    let staged = tool(r"pc\dxgi.dll");
     for profiler in ["nsys:run", "ngfx:trace"] {
         for (args, why) in [
             (
@@ -999,6 +1164,10 @@ fn launch_profiles_check_park_and_flag_before_anything_changes() {
             (
                 json!({"profiler": profiler, "park": "ALL", "keep": "dxgi.dll"}),
                 "leave it out of keep",
+            ),
+            (
+                json!({"profiler": profiler, "stage": [&staged]}),
+                "leave it out of stage",
             ),
         ] {
             let refused = dry(&mut quen, args.clone());

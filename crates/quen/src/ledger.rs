@@ -343,7 +343,7 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
         }
         let data =
             json!({"sql": sql, "params": params, "columns": rows.columns, "rows": rows.rows});
-        let file = spill(&queries(config), &data, artifacts)?;
+        let file = spill(&queries(config), "", &data, artifacts)?;
         let mut size = 0;
         let head: Vec<&Vec<Value>> = rows
             .rows
@@ -364,10 +364,11 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
     }
 }
 
-/// `data` written to a new JSON file in `dir`, listed in `artifacts`: its path. ledger_query's go under
-/// `<data root>\logs\queries` ([`queries`]), the mem tools' into the session's capture folder.
+/// `data` written to a new JSON file in `dir`, `<prefix><secs>-<random>.json`, listed in `artifacts`: its path.
+/// ledger_query's go under `<data root>\logs\queries` ([`queries`]), the mem tools' into the session's capture folder.
 pub(crate) fn spill(
     dir: &Path,
+    prefix: &str,
     data: &Value,
     artifacts: &mut Vec<Value>,
 ) -> Result<PathBuf, String> {
@@ -375,7 +376,7 @@ pub(crate) fn spill(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let file = dir.join(format!(
-        "{secs}-{}.json",
+        "{prefix}{secs}-{}.json",
         win::random_hex(4).unwrap_or_default()
     ));
     let data = data.to_string();
@@ -484,7 +485,7 @@ fn about(
         "addresses": len(&answer["addresses"]), "claims": len(&answer["claims"]), "links": len(&answer["links"]),
         "sections": len(&answer["sections"]), "exact": len(&x["exact"]), "near": len(&x["near"]), "gone": len(&x["gone"]),
     });
-    let file = spill(&queries(config), &answer, artifacts)?;
+    let file = spill(&queries(config), "", &answer, artifacts)?;
     Ok(Map::from_iter([
         ("entity".into(), answer["entity"].clone()),
         ("extracted".into(), answer["extracted"].clone()),
