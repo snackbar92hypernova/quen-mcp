@@ -251,6 +251,12 @@ Cursor's timeout can't be changed: about 60 minutes in the editor, 60 s in its C
 
 **Permissions.** Your client asks you before every launch: quen marks `session_launch` so that Claude Code (2.1.214 or newer) shows its permission prompt each time, in every permission mode, with no "always allow". In another client, keep `session_launch` on the permission prompt: allow it once each time it asks, never "always allow". The agent must ask you before a launch (`user_ok`), but quen can't check that it did: the prompt is your check. `session_plan`, which only checks a launch, doesn't ask. What else quen can do on your PC, and what it trusts: [SECURITY.md](SECURITY.md).
 
+**Claude Code's auto mode** may refuse a quen tool in the middle of a session (seen 2026-10-19: `mem_patch` as "Modify Shared Resources", `mem_read` as "Security Weaken"). An allow rule in `%USERPROFILE%\.claude\settings.json`, under `permissions.allow`, names a tool that may run: the rule for quen's tool `<tool>` is `mcp__quen__<tool>`, for example `{"permissions": {"allow": ["mcp__quen__mem_read"]}}`. Which tools you allow is your decision; quen doesn't read Claude Code's settings. The tools on the game's memory:
+- **Only read it:** `mem_read`, `mem_scan`, `mem_follow`, `mem_walk`, `mem_find`.
+- **Write it:** `mem_patch`, `mem_unpatch` (journaled; every save the game writes afterwards is marked tainted).
+- **Both:** `game_cvar` reads a cvar, and with `set` or `restore` writes it. One rule, `mcp__quen__game_cvar`, covers both.
+- `session_launch`, `game_save`, `capture_clean` and `hands_take` prompt on every call, whatever the rules say.
+
 **What runs.** `quen mcp` only relays messages. The first one starts `quen serve` in the background, which holds the game lock, the session and its journal. Several client sessions share that one `quen serve`. It exits a few seconds after the last of them closes. If a game session is still running then, it first ends it (waits for saves to finish, closes the game, puts the folder back), so it can outlive the client by a little while.
 
 **Who drives.** Only one agent drives the game at a time. The launch returns a token, and only the connection that launched the game can end it or act in it. Closing that client session, or reconnecting quen (`/mcp` in Claude Code), ends the game session the normal way: wait for saves to finish, close the game, put the folder back.
