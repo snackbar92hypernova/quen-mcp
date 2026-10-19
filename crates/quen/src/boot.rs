@@ -116,6 +116,7 @@ impl Spec {
             "profiler",
             "photo",
             "extra_env",
+            "stage",
             "user_ok",
             "allow_unknown_build",
         ];
@@ -151,7 +152,7 @@ impl Spec {
             Some(other) => return Err(format!("mode {other:?}: test (the default) or play")),
         };
         // A play session launches the user's game as it is.
-        let refused = ["park", "keep", "profiler", "preset", "extra_env"];
+        let refused = ["park", "keep", "profiler", "preset", "extra_env", "stage"];
         if let Some(key) = refused.iter().find(|k| play && args.contains_key(**k)) {
             return Err(format!(
                 "{key} isn't taken in a play session (mode play): it launches the game with the user's mods and \
@@ -170,6 +171,37 @@ impl Spec {
         let exe = bin.join(&config.game_exe);
         if !exe.is_file() {
             return Err(format!("no game exe {}", exe.display()));
+        }
+        // Files on this PC copied into bin for the session (quen-core's boot::stage).
+        let mut stage = Vec::new();
+        if let Some(list) = args.get("stage") {
+            for path in list.as_array().ok_or("stage must be an array of paths")? {
+                let path = Path::new(path.as_str().ok_or("stage: each entry must be a path")?);
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let why = if !path.is_absolute() {
+                    "not an absolute path"
+                } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
+                    "its name must be ASCII letters, digits, _ . and -"
+                } else if !path.is_file() {
+                    "no such file (missing, or a folder)"
+                } else {
+                    stage.push(path.to_owned());
+                    continue;
+                };
+                return Err(format!("stage {}: {why}", path.display()));
+            }
+        }
+        let canonical = |path: &Path| fs::canonicalize(path).ok();
+        let inside = || {
+            canonical(&bin)
+                .zip(canonical(&game_dir))
+                .is_some_and(|(b, g)| b.starts_with(g))
+        };
+        if !stage.is_empty() && !inside() {
+            return Err(format!(
+                "stage: {} leads out of the game folder (a link or junction)",
+                bin.display()
+            ));
         }
         let mut extra = Map::new();
         if let Some(env) = args.get("extra_env") {
@@ -327,6 +359,14 @@ impl Spec {
                         "profiler {profiler} parks {name}: leave it out of keep"
                     ));
                 }
+                if stage
+                    .iter()
+                    .any(|p| p.file_name().is_some_and(|f| f.eq_ignore_ascii_case(name)))
+                {
+                    return Err(format!(
+                        "profiler {profiler} parks {name}: leave it out of stage"
+                    ));
+                }
                 if !named(&park, name) {
                     park = [park.as_str(), name.as_str()]
                         .into_iter()
@@ -349,11 +389,11 @@ impl Spec {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(",");
-        let (mods, bin_entries) = if park.trim().is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            (listing(&game_dir.join("Mods"))?, listing(&bin)?)
+        let mods = match park.trim().is_empty() {
+            true => Vec::new(),
+            false => listing(&game_dir.join("Mods"))?,
         };
+        let bin_entries = listing(&bin)?;
         // The build under test is the one installed (the harness's add-on check). A play session tests no build.
         if let (Some(addon), Some(build)) = (&config.renodx_addon, &config.renodx_build)
             && !on("W3_ADDON_ANY")
@@ -432,6 +472,20 @@ impl Spec {
         if let Some(profile) = &mut profile {
             changes.append(&mut profile.changes);
         }
+        let never: Vec<&str> = never_park
+            .iter()
+            .copied()
+            .chain([config.game_exe.as_str()])
+            .collect();
+        let staged = boot::stage(
+            &JournalFs,
+            &game_dir,
+            &stage,
+            &never,
+            &bin_entries,
+            &changes,
+        )?;
+        changes.extend(staged);
         let mark = config.renodx_addon.as_ref().filter(|_| !play).map(|_| {
             if on("W3_FOREIGN_ADDON") {
                 "Registered add-on \"RenoDX\""

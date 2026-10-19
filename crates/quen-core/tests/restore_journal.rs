@@ -298,7 +298,9 @@ fn assert_reported(original: &BTreeMap<PathBuf, Vec<u8>>, fs: &MemFs, report: &R
             Action::Patch { path, .. } => vec![path.as_path()],
             Action::Move { from, to, .. } => vec![from.as_path(), to.as_path()],
             Action::Place { dest, .. } => vec![dest.as_path()],
-            Action::Rebuilt { path, .. } | Action::Stage { path, .. } => vec![path.as_path()],
+            Action::Rebuilt { path, .. } | Action::Stage { path, .. } | Action::NewLog { path } => {
+                vec![path.as_path()]
+            }
             Action::GameMemory { .. } => vec![],
         }))
         .collect();
@@ -564,6 +566,9 @@ fn a_native_boot_killed_before_any_write_replays_back() {
             "Techniques=SyntheticA\n",
         );
         fs.put("GAME/bin/x64_dx12/Tweaks.asi", "asi");
+        fs.put("GAME/bin/x64_dx12/Tweaks.ini", "the user's ini");
+        fs.put("PC/W3Test.asi", "a test build");
+        fs.put("PC/Tweaks.ini", "a test ini");
         fs.put("GAME/Mods/modAlpha", "alpha tree");
         fs.put("GAME/Mods/modBeta", "beta tree");
         fs.put(
@@ -582,7 +587,11 @@ fn a_native_boot_killed_before_any_write_replays_back() {
         is_link: false,
     };
     let mods = [entry("modAlpha", true), entry("modBeta", true)];
-    let bin = [entry("Tweaks.asi", false)];
+    let bin = [entry("Tweaks.asi", false), entry("Tweaks.ini", false)];
+    let staged = [
+        PathBuf::from("PC/W3Test.asi"),
+        PathBuf::from("PC/Tweaks.ini"),
+    ];
     let inputs = Inputs {
         game_dir: Path::new("GAME"),
         documents: Path::new("DOCS"),
@@ -608,11 +617,20 @@ fn a_native_boot_killed_before_any_write_replays_back() {
     let mut limit = 0;
     loop {
         let fs = game();
-        let changes = boot::plan(&fs, &inputs).unwrap();
+        let mut changes = boot::plan(&fs, &inputs).unwrap();
+        let stage = boot::stage(
+            &fs,
+            Path::new("GAME"),
+            &staged,
+            park::W3_NEVER_PARK,
+            &bin,
+            &changes,
+        );
+        changes.extend(stage.unwrap());
         assert_eq!(
             changes.len(),
-            3 + 2 + 4 + 1,
-            "3 parked, the compiled scripts and input.settings kept, 4 files patched, steam_appid.txt placed"
+            3 + 2 + 4 + 1 + 5,
+            "3 parked, the compiled scripts and input.settings kept, 4 files patched, steam_appid.txt placed, 2 files              staged (Tweaks.ini parked first), 2 new logs journaled"
         );
         let dying = Dying {
             fs: &fs,
@@ -621,6 +639,9 @@ fn a_native_boot_killed_before_any_write_replays_back() {
         };
         let applied = Journal::create(&dying, Path::new(JOURNAL))
             .and_then(|mut journal| boot::apply(&dying, &mut journal, &changes, &|| false));
+        if applied.is_ok() {
+            fs.put("GAME/bin/x64_dx12/W3Test.log", "the staged mod's log");
+        }
         let journal = fs.read(Path::new(JOURNAL)).unwrap_or_default();
         let report = replay(&journal, &fs);
         let at = format!("killed before write {limit}");
@@ -635,8 +656,8 @@ fn a_native_boot_killed_before_any_write_replays_back() {
         assert!(backups(&fs).is_empty(), "{at}: backups not recycled");
         if applied.is_ok() {
             assert!(limit > 20, "{limit} writes");
-            // The untouched compiled scripts and input.settings need nothing.
-            assert!(report.undone.len() == 3 + 4 + 1, "{report:#?}");
+            // The untouched compiled scripts and input.settings need nothing; the staged mod wrote one log.
+            assert!(report.undone.len() == 3 + 4 + 1 + 3 + 1, "{report:#?}");
             break;
         }
         limit += 1;

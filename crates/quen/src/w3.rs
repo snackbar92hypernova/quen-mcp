@@ -93,7 +93,8 @@ pub fn tidy_parking(game_dir: &Path) {
 }
 
 /// Every mod a boot loaded and every one it parked, fingerprinted: the Mods folders, and the `.asi`, `.addon64`
-/// and `dxgi.dll` files in bin, where they are or in quen's parking folders. An ASI's or
+/// and `dxgi.dll` files in bin, where they are or in quen's parking folders (a parked one only if nothing of its kind and
+/// name is loaded: a staged copy took its place). An ASI's or
 /// add-on's config is its `<name>.ini` beside it, then ReShade.ini `[<name>]`, which overrides it (W3Perf's toggles).
 /// ponytail: dlc folders aren't fingerprinted (the game's own DLCs are GBs); add them with a list of the vanilla ones.
 pub fn mod_set(game_dir: &Path, cache: &mut HashCache) -> io::Result<Vec<ModEntry>> {
@@ -156,6 +157,14 @@ pub fn mod_set(game_dir: &Path, cache: &mut HashCache) -> io::Result<Vec<ModEntr
             config,
         });
     }
+    // A file staged over an installed one: the copy is loaded, the original parked under its name. The ledger keys an
+    // entry by kind and name, so the set holds the loaded one.
+    let loaded: Vec<(Kind, String)> = specs
+        .iter()
+        .filter(|s| !s.parked)
+        .map(|s| (s.kind, s.name.clone()))
+        .collect();
+    specs.retain(|s| !s.parked || !loaded.contains(&(s.kind, s.name.clone())));
     // Each entry's home relative to the game folder, as schema/README.md says (it once held the absolute path).
     let relative = |mut entry: ModEntry| {
         if let Ok(rel) = entry.home.strip_prefix(game_dir) {
