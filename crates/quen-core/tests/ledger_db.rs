@@ -862,12 +862,13 @@ fn rows_deserialize_from_json_and_refuse_unknown_fields() {
 #[test]
 fn several_processes_can_create_the_same_ledger_at_once() {
     let db = TempDb::new();
-    let opened: Vec<bool> = std::thread::scope(|s| {
+    // Each open's error, so a failure says why (2 of 4 failed once on CI's Windows runner, 2026-10-19).
+    let opened: Vec<Result<(), String>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..4)
-            .map(|_| s.spawn(|| Ledger::open(&db.0).is_ok()))
+            .map(|_| s.spawn(|| Ledger::open(&db.0).map(drop).map_err(|e| e.to_string())))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    assert_eq!(opened, [true; 4]);
+    assert!(opened.iter().all(Result::is_ok), "{opened:?}");
     assert_eq!(pragma(&db.0, "user_version"), json!(SCHEMA_VERSION));
 }
