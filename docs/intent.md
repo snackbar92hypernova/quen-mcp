@@ -35,7 +35,7 @@ Every tool checks what it can before it changes anything, and a refusal always m
 
 ### The user decides
 
-The game runs on the user's PC, with the user's saves. Four things happen only with the user's agreement: a launch, a new save, a cleanup of captures, and, in a play session, the agent taking the controls.
+The game runs on the user's PC, with the user's saves. Four things happen only with the user's agreement: a launch, a new save, a cleanup of captures, and the agent taking the controls from the user.
 - The agent passes `user_ok`, its word that it asked the user in the conversation.
 - These tools are marked so that Claude Code shows its permission prompt on every call, in every permission mode, with no "always allow". In other clients the user keeps them behind the client's own prompt.
 - quen can't verify that a person agreed: `user_ok` is the agent's word, and the client's prompt is the real consent. The documentation says so plainly.
@@ -199,9 +199,11 @@ Photo mode's camera can be placed by numbers and read back; a set that falls sho
 
 quen sends the whole path to the game once. The ASI computes it and the script sets the camera on every game tick, so playback is smooth and tied to frames, not to pipe timing. The path keeps the horizon level, takes the short way round, and holds still at a hold. A sweep plays in real time, or frame by frame: the world paused, quen asks for each frame, checks it against its own computation and captures it. A digest over the frames' hashes says at a glance whether two runs are identical.
 
-### Play sessions
+### Play sessions and hand-overs
 
 In a play session the user plays a game quen launched with almost nothing changed: their mods and settings stay as they are, and quen turns on the console line (and adds `steam_appid.txt` if it's missing), both put back at the end. The user has the controls. While they do, quen refuses every tool that sends input, writes to the game or moves the focus. Reads still run (screenshots, frame times, memory reads), and the playbook tells the agent to make one only when the user asks. When the user wants the agent to look at something, the agent takes the controls (the client prompts the user), investigates, and gives them back; it can't give them back while one of its memory writes is still applied, unless the user agrees to keep it. The user's saves stay theirs. The session ends when the user quits the game; closing the chat leaves the game running.
+
+A test session can hand the controls to the user too, to set something up in the game, under the same rules: while the user has them, quen refuses input, writes and focus moves, and a save the user makes is theirs, listed at the end rather than ending the session. The agent's memory writes may stay applied across such a hand-over. When the controls go to the user, the game shows a short notice that they have them and hand them back in the chat.
 
 ### Game knowledge
 
@@ -226,8 +228,9 @@ The command-channel protocol and the game-state source are defined in the core, 
 ## Safety and privacy model
 
 - **The trust boundary is the user's Windows account.** Any program running as the user can drive quen, read what it records and change the files it trusts (its config, its journal, the knowledge base's tables). quen limits its own actions; it doesn't defend against the account itself.
-- **Consent for what matters.** Launches, new saves, capture cleanups and play-session hand-overs need the agent's word and the client's prompt. A denied or pending prompt is the user's answer, and the playbook forbids routing around it.
+- **Consent for what matters.** Launches, new saves, capture cleanups and the agent taking the controls from the user need the agent's word and the client's prompt. A denied or pending prompt is the user's answer, and the playbook forbids routing around it.
 - **Contained processes.** Everything quen starts runs in its Job Object, with a minimal environment, and is killed only through it.
+- **Awake while live.** While a session is live, quen keeps the PC and its display from sleeping, and lets go when the session ends.
 - **Nothing lost, ever.** Undo through the journal, keep both versions when a file changed underneath, Recycle Bin instead of delete, saves never touched.
 - **Narrow live writes.** Knowledge-base patches, checked bytes and build, cvars; all journaled, all tainting later saves.
 - **No network.** No telemetry, no update check, and quen opens no listening socket; the in-game channel and the relay pipe are local and locked to the user and to quen's own processes.
@@ -238,7 +241,7 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 ## Status
 
-- **Early access.** quen is 0.1.0; its in-game package is quen-w3 0.1.7.
+- **Early access.** quen is 0.1.1; its in-game package is quen-w3 0.1.8.
 - **One test machine.** Built and tested on one PC: The Witcher 3 5.01, Steam, DX12, on Windows, with one GPU and one display. GOG copies are untested: their exe counts as an unknown build.
 - **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex can't start quen on Windows yet.
 - **Not yet checked:**

@@ -39,8 +39,8 @@ use crate::capture;
 use crate::channel::{self, REPLY_MAX};
 use crate::config::Config;
 use crate::doctor;
+use crate::hands::Hands;
 use crate::input;
-use crate::play::Hands;
 use crate::session::{self, Call, Done, JournalFs, Live, Session, journal_path};
 
 /// A tool's own result fields.
@@ -1558,9 +1558,11 @@ if os.path.exists(act): exec(open(act).read())
                     sha256: "0".repeat(64),
                     stamp: quen_core::build::Stamp(0),
                 },
-                play: None,
+                play: false,
+                handovers: crate::hands::Handovers::new(Default::default()),
                 paused: Default::default(),
                 path: Default::default(),
+                _awake: crate::win::Awake::hold(),
             });
             session
         }

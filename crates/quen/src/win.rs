@@ -1,8 +1,8 @@
 //! The Win32 pieces: the lock file, the Job Object launch, the detached daemon start, the named pipe
 //! between proxy and daemon with its peer check, the startup mutex, the console Ctrl handler, the token's randomness,
 //! the Documents and Pictures folders, registry reads, version resources and Authenticode, and the journal's file
-//! operations (a rename that never replaces, file ids, the Recycle Bin). The capture module has its own, in the
-//! `windows` crate.
+//! operations (a rename that never replaces, file ids, the Recycle Bin), and the display kept awake during a session.
+//! The capture module has its own, in the `windows` crate.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -15,7 +15,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
@@ -63,6 +64,9 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT, WaitNamedPipeW,
+};
+use windows_sys::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey,
@@ -688,6 +692,45 @@ impl Drop for NamedMutex {
         unsafe {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
+        }
+    }
+}
+
+/// Keeps the PC and its display awake while it lives: a thread of its own holds
+/// `ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, a state Windows keeps per thread and releases when the
+/// thread exits. The thread clears it and exits when this drops, and dies with quen.
+pub struct Awake {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Awake {
+    pub fn hold() -> Awake {
+        let (stop, wait) = mpsc::channel::<()>();
+        let thread = thread::Builder::new().name("quen-awake".into()).spawn(move || {
+            // SAFETY: a call with flags only.
+            if unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) } == 0 {
+                eprintln!("quen: SetThreadExecutionState failed: the display may sleep during the session");
+            }
+            let _ = wait.recv(); // until the Awake drops
+            // SAFETY: as above; the state goes with the thread anyway.
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        });
+        if let Err(e) = &thread {
+            eprintln!("quen: no thread to keep the display awake: {e}");
+        }
+        Awake {
+            stop: Some(stop),
+            thread: thread.ok(),
+        }
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }

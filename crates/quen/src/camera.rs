@@ -85,10 +85,9 @@ pub fn tools() -> Vec<Value> {
             "description": "Read or set the photo-mode camera by numbers. No pos: read the view (camera photomode: \
                 the photo-mode camera's own pose; game: the game camera's, outside photo mode). pos and rot (fov \
                 optional): set the photo-mode camera, photo mode only, and read it back; off is the largest \
-                difference from what was asked (pos_m, deg). A pose is what sweep_save takes as a keyframe. \
-                Recording keyframes: set a pose, game_screenshot and look at the picture, adjust, set again; keep \
-                each pose with its screenshot's capture id. Photo mode's camera collides with geometry: set poses \
-                along a free path, in path order. Not journaled: no save holds the photo-mode camera. Through quen's \
+                difference from what was asked (pos_m, deg). rot is [pitch, yaw, roll] in degrees; the camera's \
+                forward is (-sin yaw, cos yaw, 0) in world xy, so +yaw turns left (observed once, 2026-10-19). A pose \
+                is what sweep_save takes as a keyframe. Photo mode's camera collides with geometry. Not journaled: no save holds the photo-mode camera. Through quen's \
                 command channel: needs quen's in-game package. Refused, nothing sent: wrong token, pos without rot, \
                 no loaded game, a set outside photo mode (quen's state). Failed: no reply within 5 s, or the read-back \
                 off by more than 0.01 m or 0.1 degrees (the game kept the camera short of the pose).",
@@ -418,7 +417,7 @@ fn save(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let mut ledger = open_ledger(config)?;
     let player = sweep.world.player.map(|p| PlayerPose {
         position: p.pos,
-        yaw: p.yaw,
+        yaw: Some(p.yaw),
     });
     let (id, poses) = ledger
         .atomic(|l| {
@@ -665,7 +664,7 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         let what = serde_json::to_string(&verb).unwrap_or_default();
         let lifts = matches!(verb, Verb::Pause { .. });
         let sent = send(&cx, verb, &Map::new());
-        // A path that may still be loaded: play_return stops it.
+        // A path that may still be loaded: hands_give stops it.
         if !lifts {
             cx.live.path.set(sent.is_err());
         }

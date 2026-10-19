@@ -110,7 +110,7 @@ quen never downloads or installs third-party tools: you install them yourself, u
   - it backs up the save folder before each launch and reports what the game wrote;
   - a save other than the game's own autosaves and checkpoints ends the session, except the one new manual save `game_save` writes when you approve it (in a play session your own saves are yours, and one written while the agent has the controls gives them back to you);
   - a save written after a memory patch or a cvar write is flagged as tainted.
-- **Your approval:** the launch tool is marked so that Claude Code prompts you on every launch, in every permission mode. Capture cleanup, `game_save` and `play_take` (the agent taking the controls in a play session) prompt too.
+- **Your approval:** the launch tool is marked so that Claude Code prompts you on every launch, in every permission mode. Capture cleanup, `game_save` and `hands_take` (the agent taking the controls from you) prompt too.
 - **quen itself sends nothing off your PC:** no telemetry, no update check. During a Tracy launch, the Tracy client in the game and Tracy's capture tool talk over the loopback interface, which stays on your PC.
 - **Single-player only.** quen reads and writes the running game's memory. Never point it at a game with anti-cheat.
 - [SECURITY.md](SECURITY.md) has the full list: what quen may do on your PC, what it trusts, and its limits.

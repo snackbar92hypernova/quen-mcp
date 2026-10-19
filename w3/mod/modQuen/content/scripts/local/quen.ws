@@ -20,7 +20,8 @@
 //   cam.get, cam.set, cam.path and cam.frame "<camera> x y z pitch yaw roll fov". The ASI guarantees each verb's
 //   number count; a script error mid-command comes back to quen as "no reply" at the next poll. save (from quen-w3
 //   0.1.4) writes a new manual save as the menu's "Empty save slot" does; the game names the file. world.get (from
-//   quen-w3 0.1.5) reads back "x y z heading day hour weather" and changes nothing.
+//   quen-w3 0.1.5) reads back "x y z heading day hour weather" and changes nothing. notice (from quen-w3 0.1.8) shows
+//   quen's text on screen for 8 s, as QUEN_Say does, and changes nothing.
 // - Camera paths: cam.path loads one on the photo-mode camera, played from CR4Game.OnTick, one
 //   set per tick: real time, or frame step (cam.frame sets frame n, then holds). W3Quen.asi checks and interpolates the
 //   path as quen-core sweep.rs does, in double precision (its offline test checks sweep.rs's reference vectors), and
@@ -338,6 +339,7 @@ function QUENRPC_PhotoPose() : string
 	var saves : array<SSavegameInfo>;
 	var weathers : array<name>;
 	var t : GameTime;
+	var gui : CR4GuiManager;
 
 	line = QUEN_Next();
 	if (line == "")
@@ -468,7 +470,7 @@ function QUENRPC_PhotoPose() : string
 			return;
 
 		case "settime":
-			// As vanilla exec function settime (engine\gameTime.ws). Photo mode's time slider overrides it while open.
+			// As vanilla exec function settime (engine\gameTime.ws). In photo mode it moved the sun at once (2026-10-19).
 			QUENRPC_Split(args, head, rest);
 			theGame.SetGameTime(GameTimeCreate(StringToInt(head), StringToInt(rest), 0, 0), true);
 			QUEN_Reply(handle, true, "game time set to day " + head + " hour " + rest, "");
@@ -543,6 +545,18 @@ function QUENRPC_PhotoPose() : string
 				FloatToStringPrec(pos.X, 4) + " " + FloatToStringPrec(pos.Y, 4) + " " + FloatToStringPrec(pos.Z, 4) + " "
 				+ FloatToStringPrec(thePlayer.GetHeading(), 4) + " " + IntToString(GameTimeDays(t)) + " "
 				+ IntToString(GameTimeHours(t)) + " " + NameToString(GetWeatherConditionName()));
+			return;
+
+		case "notice":
+			// quen's own text, which the ASI checked: 1 to 160 bytes, no control character.
+			gui = theGame.GetGuiManager();
+			if (!gui)
+			{
+				QUEN_Reply(handle, false, "no GUI manager to show a notice", "");
+				return;
+			}
+			gui.ShowNotification(args, 8000);
+			QUEN_Reply(handle, true, "notice shown", "");
 			return;
 
 		case "pause":

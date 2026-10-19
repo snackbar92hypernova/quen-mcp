@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 
 use crate::game::{self, Action, Ctx, Cvar, Fields, ctx, flag};
-use crate::play::Hands;
+use crate::hands::Hands;
 use crate::session::{Call, Done, Session, last_line, utc_ms};
 use crate::win::Job;
 use crate::{doctor, input};
@@ -335,9 +335,9 @@ impl PresentMon {
 /// The run id of quen's rows for `tag`: `<session>-<tag>`, in a play session `<session>-h<n>-<tag>` with n the
 /// hand-overs so far.
 fn run_id(cx: &Ctx, tag: &str) -> String {
-    match &cx.live.play {
-        Some(play) => format!("{}-h{}-{tag}", cx.live.id, play.takes.get()),
-        None => format!("{}-{tag}", cx.live.id),
+    match cx.live.play {
+        true => format!("{}-h{}-{tag}", cx.live.id, cx.live.handovers.takes.get()),
+        false => format!("{}-{tag}", cx.live.id),
     }
 }
 

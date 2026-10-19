@@ -8,7 +8,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quen_core::journal::sha256_hex;
@@ -20,7 +20,7 @@ use crate::session::{Done, Shared, envelope};
 use crate::win;
 
 /// Query results longer than this go to a file; the envelope keeps the first rows that fit.
-const INLINE_BYTES: usize = 16 * 1024;
+pub(crate) const INLINE_BYTES: usize = 16 * 1024;
 const TIME_LIMIT_S: f64 = 10.0;
 const TIME_LIMIT_MAX_S: f64 = 30.0;
 const LOCK_HELD: &str = "another quen holds the game lock (a live session): only the lock holder records captures, \
@@ -72,8 +72,8 @@ pub fn tools() -> Vec<Value> {
                             null}. Tables: measurements (method_family lowercase: presentmon, tracy, perf_func, nsight...; \
                             tag M, O, I, U or static_re), captures (path relative to the harness's cap folder; t in UTC \
                             like 2026-10-17T13:15:00Z), saves, poses (camera [x, y, z], rotation [pitch, yaw, roll], fov, \
-                            player {position, yaw}), mod_versions, boot_mod_status, re_refs (target {\"measurement\": id} \
-                            or {\"claim\": id}, kb_path)",
+                            player {position, optional yaw}), mod_versions, boot_mod_status, re_refs (target \
+                            {\"measurement\": id} or {\"claim\": id}, kb_path)",
                     },
                     "token": {"type": "string", "description": "the token session_launch returned: rows without a boot_id key go on its boot"},
                 },
@@ -226,7 +226,10 @@ fn lock_held_elsewhere(config: &Config) -> bool {
 }
 
 /// The arguments as an object with only `known` keys.
-fn object<'a>(args: &'a Value, known: &[&str]) -> Result<&'a Map<String, Value>, String> {
+pub(crate) fn object<'a>(
+    args: &'a Value,
+    known: &[&str],
+) -> Result<&'a Map<String, Value>, String> {
     let args = args.as_object().ok_or("arguments must be an object")?;
     match args.keys().find(|k| !known.contains(&k.as_str())) {
         Some(key) => Err(format!("unknown argument {key:?} ({})", known.join(", "))),
@@ -340,7 +343,7 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
         }
         let data =
             json!({"sql": sql, "params": params, "columns": rows.columns, "rows": rows.rows});
-        let file = spill(config, &data, artifacts)?;
+        let file = spill(&queries(config), &data, artifacts)?;
         let mut size = 0;
         let head: Vec<&Vec<Value>> = rows
             .rows
@@ -361,9 +364,13 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
     }
 }
 
-/// `data` written to a new JSON file under `<data root>\logs\queries`, listed in `artifacts`: its path.
-fn spill(config: &Config, data: &Value, artifacts: &mut Vec<Value>) -> Result<PathBuf, String> {
-    let dir = config.data_root.join("logs").join("queries");
+/// `data` written to a new JSON file in `dir`, listed in `artifacts`: its path. ledger_query's go under
+/// `<data root>\logs\queries` ([`queries`]), the mem tools' into the session's capture folder.
+pub(crate) fn spill(
+    dir: &Path,
+    data: &Value,
+    artifacts: &mut Vec<Value>,
+) -> Result<PathBuf, String> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -372,11 +379,16 @@ fn spill(config: &Config, data: &Value, artifacts: &mut Vec<Value>) -> Result<Pa
         win::random_hex(4).unwrap_or_default()
     ));
     let data = data.to_string();
-    fs::create_dir_all(&dir)
+    fs::create_dir_all(dir)
         .and_then(|()| fs::write(&file, &data))
         .map_err(|e| format!("{}: {e}", file.display()))?;
     artifacts.push(json!({"path": file, "sha256": sha256_hex(data.as_bytes())}));
     Ok(file)
+}
+
+/// Where ledger_query and ledger_about put a result too big to answer inline.
+fn queries(config: &Config) -> PathBuf {
+    config.data_root.join("logs").join("queries")
 }
 
 fn done(fields: Result<Map<String, Value>, String>) -> Done {
@@ -472,7 +484,7 @@ fn about(
         "addresses": len(&answer["addresses"]), "claims": len(&answer["claims"]), "links": len(&answer["links"]),
         "sections": len(&answer["sections"]), "exact": len(&x["exact"]), "near": len(&x["near"]), "gone": len(&x["gone"]),
     });
-    let file = spill(config, &answer, artifacts)?;
+    let file = spill(&queries(config), &answer, artifacts)?;
     Ok(Map::from_iter([
         ("entity".into(), answer["entity"].clone()),
         ("extracted".into(), answer["extracted"].clone()),

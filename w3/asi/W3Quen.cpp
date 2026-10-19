@@ -31,12 +31,14 @@
 
 // quen-w3's release, named on W3Quen.log's first line and by pack.py's zip. Each release's ASI then differs from the last,
 // which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.7";
+constexpr char kVersion[] = "0.1.8";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
 constexpr size_t kMaxReply = 64 * 1024;
 constexpr size_t kMaxQueued = 16;
+// protocol.rs's MAX_NOTICE_BYTES: notice's text, from quen-w3 0.1.8.
+constexpr size_t kMaxNotice = 160;
 
 namespace sweep {
 struct Path;
@@ -731,6 +733,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   const std::string& v = cmd.verb;
   if (v == "load" || v == "weather") {
     ok = name(v == "load" ? "save" : "name");
+  } else if (v == "notice") {
+    ok = name("text") && cmd.args.size() <= kMaxNotice + 1;
   } else if (v == "loadlast" || v == "listsaves" || v == "cam.get" || v == "cam.stop" || v == "save" ||
              v == "world.get") {
     ok = true;
@@ -765,7 +769,7 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   }
   if (!ok) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
-            "character, fov not above 0, hour past 23)";
+            "character, fov not above 0, hour past 23, a notice over 160 bytes)";
     return false;
   }
   if (!fields.empty()) {

@@ -1,6 +1,6 @@
 [package]
 name = "quen"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,6 +30,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

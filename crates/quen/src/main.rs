@@ -21,6 +21,8 @@ mod focus;
 #[cfg(windows)]
 mod game;
 #[cfg(windows)]
+mod hands;
+#[cfg(windows)]
 mod input;
 #[cfg(windows)]
 mod ledger;
@@ -30,8 +32,6 @@ mod mcp;
 mod measure;
 #[cfg(windows)]
 mod mem;
-#[cfg(windows)]
-mod play;
 #[cfg(windows)]
 mod profile;
 #[cfg(windows)]

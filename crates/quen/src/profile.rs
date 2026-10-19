@@ -85,6 +85,7 @@ const TRACY_PACKAGES: &[&str] = &[
     "quen-w3 0.1.5",
     "quen-w3 0.1.6",
     "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
     "test",
 ];
 /// The functions W3Quen.asi hooks in a tracy launch: the list it is built from.

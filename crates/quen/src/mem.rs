@@ -1,7 +1,8 @@
-//! The live-memory tools: `mem_read`, `mem_scan`, `mem_follow`, `mem_patch` and `mem_unpatch`, and the Windows
-//! half of quen-core's `mem`. [`Process`] reads the game through a handle with read access only, on the pid from the
-//! session's job (never "the first witcher3.exe"). [`Ctx::write`] journals a planned write, then makes it with a handle
-//! open for that write only. game_cvar and measure_ab's cvar actions (game.rs) go through the same two.
+//! The live-memory tools: `mem_read`, `mem_scan`, `mem_find`, `mem_follow`, `mem_walk`, `mem_patch` and
+//! `mem_unpatch`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
+//! access only, on the pid from the session's job (never "the first witcher3.exe"). [`Ctx::write`] journals a planned
+//! write, then makes it with a handle open for that write only. game_cvar and measure_ab's cvar actions (game.rs) go
+//! through the same two.
 
 use std::ffi::c_void;
 use std::fmt::Display;
@@ -10,7 +11,10 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use quen_core::mem::{self, Image, Kind, Memory, Op, Pattern, Region, Scope, Section, Type, Write};
+use quen_core::mem::{
+    self, Field, Filter, Image, Kind, Memory, Op, Pattern, Region, Scope, Section, Type, Walk,
+    Write,
+};
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FlushInstructionCache, ReadProcessMemory, WriteProcessMemory,
@@ -26,10 +30,13 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::doctor;
 use crate::game::{self, Ctx, Fields, ctx, text};
+use crate::ledger::{self, INLINE_BYTES};
 use crate::session::{Call, Done, Session};
 
-/// A scan page's hits when the call gives no `limit`.
+/// A scan or find page's hits when the call gives no `limit`.
 const LIMIT: usize = 100;
+/// A find hit's context bytes on each side when the call gives no `context`.
+const CONTEXT: u64 = 16;
 
 pub fn tools() -> Vec<Value> {
     let token = json!({"type": "string", "description": "the token session_launch returned"});
@@ -41,6 +48,14 @@ pub fn tools() -> Vec<Value> {
         json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
     };
     let number = |what: &str| json!({"type": "string", "description": format!("{what}: a number or 0x hex")});
+    let chain = |what: &str| json!({"type": "array", "items": {"type": "string"}, "description": format!("{what}: numbers or (-)0x hex")});
+    let types = json!([
+        "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64", "ptr", "bytes"
+    ]);
+    let ty = json!({"type": "string", "enum": types, "description": "a number's type (ptr: a u64 shown as 0x hex), or bytes (with len)"});
+    let len =
+        json!({"type": "integer", "minimum": 1, "maximum": 4096, "description": "bytes: how many"});
+    let limit = json!({"type": "integer", "minimum": 1, "maximum": 1000, "description": "hits per page, default 100"});
     let name = json!({"type": "string", "description": "a patch's name in the KB's patches.tsv"});
     let patch = |verb: &str, does: &str| {
         json!({
@@ -63,8 +78,8 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": schema(json!({
                 "address": number("where"),
                 "rva": number("where, from the game's image base"),
-                "type": {"type": "string", "enum": ["u8", "u16", "u32", "u64", "i32", "f32", "f64", "bytes"], "description": "a number's type, or bytes (with len)"},
-                "len": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "bytes: how many"},
+                "type": ty,
+                "len": len,
             }), &["type"]),
         }),
         json!({
@@ -82,8 +97,23 @@ pub fn tools() -> Vec<Value> {
                 "sections": {"type": "array", "items": {"type": "string"}, "description": "image sections: .text, .rdata, .data"},
                 "regions": {"type": "array", "items": {"type": "string"}, "description": "region bases from an earlier result: numbers or 0x hex"},
                 "from": number("search from"),
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "hits per page, default 100"},
+                "limit": limit,
             }), &[]),
+        }),
+        json!({
+            "name": "mem_find",
+            "description": "Search the running game's image and private regions for a 64-bit value at 8-byte-aligned \
+                addresses, each hit with up to context bytes before and after it (default 16, at most 256), cut at the \
+                edges of its region. The game is the one in the session's job, with read access only. One page of \
+                hits (default 100, at most 1000); pass next as from for the page after. skipped lists what couldn't \
+                be read, so may hold hits nobody saw. A result over 16 KB comes back as its first hits and the path \
+                of a JSON file holding all of it.",
+            "inputSchema": schema(json!({
+                "value": number("the qword to find"),
+                "context": {"type": "integer", "minimum": 0, "maximum": 256, "description": "bytes before and after each hit, default 16"},
+                "from": number("search from"),
+                "limit": limit,
+            }), &["value"]),
         }),
         json!({
             "name": "mem_follow",
@@ -93,8 +123,44 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": schema(json!({
                 "base": number("where the chain starts"),
                 "rva": number("where it starts, from the game's image base"),
-                "offsets": {"type": "array", "items": {"type": "string"}, "description": "numbers or (-)0x hex"},
+                "offsets": chain("offsets"),
             }), &["offsets"]),
+        }),
+        json!({
+            "name": "mem_walk",
+            "description": "Read an array of structs in the running game, with read access only: count elements stride \
+                bytes apart from address, or rva (from the image base), or the end of the pointer chain offsets from \
+                there (as mem_follow). fields are read from each element or, with deref, from the struct at the end of \
+                that pointer chain from it. One row per element: index, address, target (deref's struct), each field \
+                (ptr as 0x hex, bytes as hex), or why it couldn't be read. filter keeps the rows where one field holds \
+                (eq) or doesn't hold (ne) a value, compared as the field's bytes; rows with why stay. Refused, nothing \
+                read: count over 100000, stride over 65536, a field past the stride (with deref: past 65536 bytes), \
+                over 16 MiB to read in all (per element: its fields' span, 8 bytes per deref hop), a broken offsets \
+                chain. A result over 16 KB comes back as its first rows and the path of a JSON file holding all of it.",
+            "inputSchema": schema(json!({
+                "address": number("the first element"),
+                "rva": number("the first element, from the game's image base"),
+                "offsets": chain("a pointer chain from address or rva, followed first: the array starts at its end"),
+                "stride": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "bytes from one element to the next"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "how many elements"},
+                "deref": chain("a pointer chain from each element to the struct its fields are in, as mem_follow's offsets"),
+                "fields": {"type": "array", "minItems": 1, "description": "what to read from each struct", "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "its key in each row"},
+                        "offset": number("from the struct's start"),
+                        "type": ty,
+                        "len": len,
+                    },
+                    "required": ["name", "offset", "type"],
+                    "additionalProperties": false,
+                }},
+                "filter": {"type": "object", "description": "keep only the rows that match", "properties": {
+                    "field": {"type": "string", "description": "a field's name"},
+                    "eq": {"type": "string", "description": "the field holds this: a number, 0x hex, a float, or hex bytes"},
+                    "ne": {"type": "string", "description": "the field doesn't hold this (0: nonzero)"},
+                }, "required": ["field"], "additionalProperties": false},
+            }), &["stride", "count", "fields"]),
         }),
         patch(
             "patch",
@@ -112,7 +178,9 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
     let out = match name {
         "mem_read" => read(session, call, args),
         "mem_scan" => scan(session, call, args),
+        "mem_find" => find(session, call, args),
         "mem_follow" => follow(session, call, args),
+        "mem_walk" => walk(session, call, args),
         "mem_patch" => patch(session, call, args, Op::Patch),
         "mem_unpatch" => patch(session, call, args, Op::Unpatch),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
@@ -368,17 +436,43 @@ fn signed(v: &Value) -> Option<i128> {
     if let Some(n) = v.as_u64() {
         return Some(n.into());
     }
-    let s = v.as_str()?;
-    let (negative, s) = s.strip_prefix('-').map_or((false, s), |rest| (true, rest));
-    let n = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) => i128::from_str_radix(hex, 16).ok()?,
-        None => s.parse().ok()?,
-    };
-    Some(if negative { -n } else { n })
+    v.as_str().and_then(mem::number)
 }
 
 fn unsigned(v: &Value) -> Option<u64> {
     signed(v).and_then(|n| u64::try_from(n).ok())
+}
+
+/// The `type` in `args`, with its `len`.
+fn ty(args: &Value) -> Result<Type, String> {
+    let len = match args.get("len") {
+        Some(v) => Some(v.as_u64().ok_or("len must be a whole number")? as usize),
+        None => None,
+    };
+    Type::named(text(args, "type")?, len)
+}
+
+/// A pointer chain's offsets: `args[key]`.
+fn offsets(args: &Value, key: &str) -> Result<Vec<i64>, String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .and_then(|o| o.iter().map(|v| signed(v)?.try_into().ok()).collect())
+        .ok_or(format!(
+            "{key} must be an array of whole numbers or (-)0x hex"
+        ))
+}
+
+/// A scan or find page's `from` and `limit`.
+fn paging(args: &Value) -> Result<(u64, usize), String> {
+    let from = match args.get("from") {
+        Some(v) => unsigned(v).ok_or("from must be a number or 0x hex")?,
+        None => 0,
+    };
+    let limit = match args.get("limit") {
+        Some(v) => v.as_u64().ok_or("limit must be a whole number")? as usize,
+        None => LIMIT,
+    };
+    Ok((from, limit))
 }
 
 /// The address `args` give: `key`, or `rva` from the game's image base; exactly one of them.
@@ -395,24 +489,7 @@ fn address(game: &Process, args: &Value, key: &str) -> Result<u64, String> {
 
 fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = checked(session, args, &["address", "rva", "type", "len"])?;
-    let ty = match text(args, "type")? {
-        "u8" => Type::U8,
-        "u16" => Type::U16,
-        "u32" => Type::U32,
-        "u64" => Type::U64,
-        "i32" => Type::I32,
-        "f32" => Type::F32,
-        "f64" => Type::F64,
-        "bytes" => Type::Bytes(
-            args.get("len")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| String::from("bytes needs len"))? as usize,
-        ),
-        other => return Err(format!("type {other:?}: u8 u16 u32 u64 i32 f32 f64 or bytes").into()),
-    };
-    if args.get("len").is_some() && !matches!(ty, Type::Bytes(_)) {
-        return Err("len is for type bytes only".to_string().into());
-    }
+    let ty = ty(args)?;
     let game = cx.game()?;
     let address = address(&game, args, "address")?;
     let value = mem::read(&game, address, ty).map_err(|e| format!("{address:#x}: {e}"))?;
@@ -462,17 +539,7 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         ),
         _ => return Err("sections or regions, not both".to_string().into()),
     };
-    let from = match args.get("from") {
-        Some(v) => unsigned(v).ok_or_else(|| String::from("from must be a number or 0x hex"))?,
-        None => 0,
-    };
-    let limit = match args.get("limit") {
-        Some(v) => {
-            v.as_u64()
-                .ok_or_else(|| String::from("limit must be a whole number"))? as usize
-        }
-        None => LIMIT,
-    };
+    let (from, limit) = paging(args)?;
     let game = cx.game()?;
     let page = mem::scan(&game, &pattern, &scope, from, limit)
         .map_err(|e| format!("the game's regions: {e}"))?;
@@ -482,16 +549,126 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
 
 fn follow(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = checked(session, args, &["base", "rva", "offsets"])?;
-    let offsets: Vec<i64> = args
-        .get("offsets")
-        .and_then(Value::as_array)
-        .and_then(|o| o.iter().map(|v| signed(v)?.try_into().ok()).collect())
-        .ok_or_else(|| String::from("offsets must be an array of whole numbers or (-)0x hex"))?;
+    let offsets = offsets(args, "offsets")?;
     let game = cx.game()?;
     let base = address(&game, args, "base")?;
     let chain = mem::follow(&game, base, &offsets);
     call.lap("follow");
     Ok(fields(json!(chain)))
+}
+
+fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let cx = checked(session, args, &["value", "context", "from", "limit"])?;
+    let value = args.get("value").and_then(unsigned);
+    let value = value.ok_or_else(|| String::from("value must be a number or 0x hex of 64 bits"))?;
+    let context = match args.get("context") {
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| String::from("context must be a whole number"))?,
+        None => CONTEXT,
+    };
+    let (from, limit) = paging(args)?;
+    let game = cx.game()?;
+    let page = mem::find(&game, value, from, limit, context)
+        .map_err(|e| format!("the game's regions: {e}"))?;
+    call.lap("find");
+    inline(&cx, call, fields(json!(page)), "hits")
+}
+
+fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let known = [
+        "address", "rva", "offsets", "stride", "count", "deref", "fields", "filter",
+    ];
+    let cx = checked(session, args, &known)?;
+    let whole = |key: &str| {
+        let n = args.get(key).and_then(Value::as_u64);
+        n.ok_or(format!("{key} must be a whole number"))
+    };
+    let (stride, count) = (whole("stride")?, whole("count")?);
+    let wanted = args.get("fields").and_then(Value::as_array);
+    let wanted =
+        wanted.ok_or_else(|| String::from("fields must be an array of {name, offset, type}"))?;
+    let mut columns = Vec::new();
+    for f in wanted {
+        ledger::object(f, &["name", "offset", "type", "len"])
+            .map_err(|e| format!("fields: {e}"))?;
+        let name = text(f, "name").map_err(|e| format!("fields: {e}"))?;
+        let offset = f.get("offset").and_then(unsigned);
+        let offset = offset.ok_or(format!("field {name}: offset must be a number or 0x hex"))?;
+        let ty = ty(f).map_err(|e| format!("field {name}: {e}"))?;
+        let name = name.into();
+        columns.push(Field { name, offset, ty });
+    }
+    let filter = match args.get("filter") {
+        None => None,
+        Some(f) => {
+            ledger::object(f, &["field", "eq", "ne"]).map_err(|e| format!("filter: {e}"))?;
+            let field = text(f, "field").map_err(|e| format!("filter: {e}"))?.into();
+            let (eq, value) = match (f.get("eq"), f.get("ne")) {
+                (Some(v), None) => (true, v),
+                (None, Some(v)) => (false, v),
+                _ => return Err("filter: give eq or ne, one of them".to_string().into()),
+            };
+            let value = value
+                .as_str()
+                .map_or_else(|| value.to_string(), String::from);
+            Some(Filter { field, eq, value })
+        }
+    };
+    let deref = match args.get("deref") {
+        Some(_) => offsets(args, "deref")?,
+        None => Vec::new(),
+    };
+    let chain = match args.get("offsets") {
+        Some(_) => offsets(args, "offsets")?,
+        None => Vec::new(),
+    };
+    let game = cx.game()?;
+    let start = address(&game, args, "address")?;
+    let followed = mem::follow(&game, start, &chain);
+    let base = followed.end.ok_or_else(|| {
+        let why = followed.broken.map(|b| b.why).unwrap_or_default();
+        format!("offsets: {why}")
+    })?;
+    let w = Walk {
+        base,
+        stride,
+        count,
+        deref,
+        fields: columns,
+        filter,
+    };
+    let rows = mem::walk(&game, &w)?;
+    call.lap("walk");
+    let errors = rows.iter().filter(|r| r.contains_key("why")).count();
+    let out = json!({"base": base, "row_count": rows.len(), "errors": errors, "rows": rows});
+    inline(&cx, call, fields(out), "rows")
+}
+
+/// `out` as it is or, over [`INLINE_BYTES`], all of it in a file (`file`, in the call's artifacts) and inline only the
+/// first of its `list` that fit (`truncated`), as ledger_query does.
+fn inline(cx: &Ctx, call: &mut Call, out: Fields, list: &str) -> Result<Fields, Done> {
+    let data = Value::Object(out);
+    if data.to_string().len() <= INLINE_BYTES {
+        return Ok(fields(data));
+    }
+    // spill lists the file in a list of its own; the call's artifacts are Call::artifact's, which hashes it again.
+    let dir = cx.config.capture_root().join(&cx.live.id);
+    let file = ledger::spill(&dir, &data, &mut Vec::new())?;
+    call.artifact(&file);
+    let mut out = fields(data);
+    if let Some(Value::Array(items)) = out.get_mut(list) {
+        let mut size = 0;
+        let fit = items.iter().take_while(|item| {
+            size += item.to_string().len() + 1;
+            size <= INLINE_BYTES / 2
+        });
+        let fit = fit.count();
+        items.truncate(fit);
+    }
+    out.insert("truncated".into(), json!(true));
+    out.insert("file".into(), json!(file));
+    Ok(out)
 }
 
 fn patch(session: &Session, call: &mut Call, args: &Value, op: Op) -> Result<Fields, Done> {
@@ -594,8 +771,9 @@ pub(crate) mod tests {
     /// A known buffer: a string to scan for, and a qword to patch.
     pub(crate) static BUF: Cell<Aligned> =
         Cell(UnsafeCell::new(Aligned(*b"quen-dummy-buf\x01\x02")));
-    /// A pointer chain's first hop: BUF's address.
-    static HOP: Cell<*const u8> = Cell(UnsafeCell::new((&raw const BUF).cast()));
+    /// A pointer chain's first hop: BUF's address. Then a null pointer: with it, an array of two to walk.
+    static HOP: Cell<[*const u8; 2]> =
+        Cell(UnsafeCell::new([(&raw const BUF).cast(), std::ptr::null()]));
 
     /// The dummy game's `cvar_layout.tsv`, for `build`.
     pub(crate) fn layout_tsv(build: &str) -> String {
@@ -718,6 +896,108 @@ pub(crate) mod tests {
             (Some(second), Some(buf)),
             "{chain}"
         );
+
+        // BUF as two 8-byte elements, at the end of a chain from HOP.
+        let walked = fx.run(
+            "mem_walk",
+            json!({"token": "tok", "rva": hop, "offsets": [0], "stride": 8, "count": 2, "fields": [
+                {"name": "head", "offset": 0, "type": "bytes", "len": 4},
+                {"name": "last", "offset": "0x7", "type": "u8"},
+            ]}),
+        );
+        assert_eq!(walked["base"], buf, "{walked}");
+        assert_eq!(
+            walked["rows"],
+            json!([
+                {"index": 0, "address": buf, "head": "71 75 65 6e", "last": 0x6d},
+                {"index": 1, "address": buf + 8, "head": "6d 79 2d 62", "last": 0x02},
+            ])
+        );
+        // HOP's two pointers, as they are, filtered, and followed to their structs.
+        let hops = game.image.base + hop;
+        let ptr = json!([{"name": "p", "offset": 0, "type": "ptr"}]);
+        let on_hop = |more: Value| {
+            let mut args = json!({"token": "tok", "address": hops, "stride": 8, "count": 2});
+            args.as_object_mut()
+                .unwrap()
+                .extend(more.as_object().unwrap().clone());
+            fx.run("mem_walk", args)
+        };
+        let pointers = on_hop(json!({"fields": ptr}));
+        let p = |row: usize| pointers["rows"][row]["p"].clone();
+        assert_eq!((p(0), p(1)), (json!(format!("{buf:#x}")), json!("0x0")));
+        let nonzero = on_hop(json!({"fields": ptr, "filter": {"field": "p", "ne": 0}}));
+        assert_eq!(nonzero["row_count"], 1, "{nonzero}");
+        let head = json!([{"name": "head", "offset": 0, "type": "bytes", "len": 4}]);
+        let derefs = on_hop(json!({"fields": head, "deref": [0]}));
+        let rows = &derefs["rows"];
+        assert_eq!(
+            (&rows[0]["target"], &rows[0]["head"]),
+            (&json!(buf), &json!("71 75 65 6e"))
+        );
+        assert_eq!(
+            (&rows[1]["target"], &derefs["errors"]),
+            (&json!(0), &json!(1))
+        );
+        assert!(
+            rows[1]["why"].as_str().unwrap().contains("at 0x0"),
+            "{derefs}"
+        );
+        // Over 16 KB: all rows in a file, the first inline.
+        let q = json!([{"name": "q", "offset": 0, "type": "u64"}]);
+        let image = json!({"token": "tok", "address": game.image.base, "stride": 8, "count": 2000, "fields": q});
+        let big = fx.run("mem_walk", image);
+        assert_eq!(big["truncated"], true, "{}", big["reason"]);
+        let file = big["file"].as_str().unwrap();
+        let text = fs::read_to_string(file).unwrap();
+        assert_eq!(
+            big["artifacts"],
+            json!([{"path": file, "sha256": quen_core::journal::sha256_hex(text.as_bytes())}])
+        );
+        let all: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            (all["rows"].as_array().unwrap().len(), &big["row_count"]),
+            (2000, &json!(2000))
+        );
+        let inline = big["rows"].as_array().unwrap().len();
+        assert!(0 < inline && inline < 2000, "{inline}");
+
+        let found = fx.run(
+            "mem_find",
+            json!({"token": "tok", "value": format!("{buf:#x}"), "from": hops, "limit": 1, "context": 8}),
+        );
+        let hit = &found["hits"][0];
+        assert_eq!(
+            (&hit["address"], &hit["after"]),
+            (&json!(hops), &json!("00 00 00 00 00 00 00 00")),
+            "{found}"
+        );
+        assert_eq!(found["next"], hops + 1);
+
+        for args in [
+            json!({"count": 0, "fields": ptr}),
+            json!({"fields": [{"name": "p", "offset": 0, "type": "ptr", "size": 8}]}),
+            json!({"fields": [{"name": "p", "type": "ptr"}]}),
+            json!({"fields": ptr, "filter": {"field": "p", "eq": 0, "ne": 0}}),
+            json!({"fields": ptr, "deref": "0"}),
+        ] {
+            assert_eq!(on_hop(args.clone())["refused"], true, "{args}");
+        }
+        let broken = fx.run(
+            "mem_walk",
+            json!({"token": "tok", "address": 8, "offsets": [0], "stride": 8, "count": 1, "fields": ptr}),
+        );
+        assert!(
+            broken["reason"].as_str().unwrap().starts_with("offsets: "),
+            "{broken}"
+        );
+        for args in [
+            json!({"token": "tok"}),
+            json!({"token": "tok", "value": "x"}),
+            json!({"token": "tok", "value": 1, "context": -1}),
+        ] {
+            assert_eq!(fx.run("mem_find", args.clone())["refused"], true, "{args}");
+        }
         for args in [
             json!({"token": "tok", "type": "u8"}),
             json!({"token": "tok", "address": 1, "rva": 1, "type": "u8"}),
@@ -873,6 +1153,11 @@ rva	name
             (
                 "mem_scan",
                 json!({"token": "tok", "ascii": "quen-dummy-buf"}),
+            ),
+            ("mem_find", json!({"token": "tok", "value": 1})),
+            (
+                "mem_walk",
+                json!({"token": "tok", "address": 8, "stride": 8, "count": 1, "fields": []}),
             ),
             ("mem_patch", json!({"token": "tok", "name": "dummy"})),
             ("game_cvar", json!({"token": "tok", "name": "X"})),

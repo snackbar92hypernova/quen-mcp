@@ -378,6 +378,9 @@ static void Channel() {
             R"("time":{"day":3,"hour":22},"weather":"WT_Clear"}})");
   RoundTrip(h, R"({"id":52,"ttl_ms":5000,"verb":"world.get"})", L"world.get", false, "no player (not in a game session)",
             "", R"x({"id":52,"ok":false,"text":"no player (not in a game session)"})x");
+  RoundTrip(h, R"x({"id":53,"ttl_ms":5000,"verb":"notice","text":"quen: you have the controls (Alt+Tab)"})x",
+            L"notice quen: you have the controls (Alt+Tab)", true, "notice shown", "",
+            R"({"id":53,"ok":true,"text":"notice shown"})");
   RoundTrip(h, R"({"id":9,"ttl_ms":2000,"verb":"listsaves"})", L"listsaves", true, "2 saves", "save \"one\"|C:\\two",
             R"({"id":9,"ok":true,"text":"2 saves","data":["save \"one\"","C:\\two"]})");
   RoundTrip(h, R"({"id":10,"ttl_ms":2000,"verb":"listsaves"})", L"listsaves", true, "0 saves", "",
@@ -423,6 +426,10 @@ static void Channel() {
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"cam.set","pos":[0,0],"rot":[0,0,0]})", refused1, "invalid cam.set");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"teleport","pos":[0,0,0],"rot":[0,0,0],"fov":1})", refused1, "unknown field");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"load"})", refused1, "invalid load");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":""})", refused1, "invalid notice");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"a\nb"})", refused1, "invalid notice");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":")" + std::string(161, 'x') + "\"}", refused1, "invalid notice");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"x","ms":1})", refused1, "unknown field");
   Refused(h, R"({"id":1,"verb":"loadlast"})", refused1, "ttl_ms");
   Refused(h, R"({"id":-1,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");
   Refused(h, R"({"id":1.0,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");

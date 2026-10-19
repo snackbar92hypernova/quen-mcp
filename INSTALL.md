@@ -34,7 +34,7 @@ What it does, with every check before the first change:
 Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 
 - It refuses, and changes nothing, while a quen session is live or its journal is left: end the session, or run `quen recover`.
-- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live.
+- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live. Then restart your client's sessions (or reconnect quen with `/mcp` in Claude Code): a session keeps the tool list it got when it connected.
 - **`-Uninstall`** sends `.quen\bin` and the package to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
 - **`-WhatIf`** prints every step and changes nothing. It still downloads and checks the release, in a temp folder that then goes to the Recycle Bin.
 
@@ -251,6 +251,12 @@ Cursor's timeout can't be changed: about 60 minutes in the editor, 60 s in its C
 
 **Permissions.** Your client asks you before every launch: quen marks `session_launch` so that Claude Code (2.1.214 or newer) shows its permission prompt each time, in every permission mode, with no "always allow". In another client, keep `session_launch` on the permission prompt: allow it once each time it asks, never "always allow". The agent must ask you before a launch (`user_ok`), but quen can't check that it did: the prompt is your check. `session_plan`, which only checks a launch, doesn't ask. What else quen can do on your PC, and what it trusts: [SECURITY.md](SECURITY.md).
 
+**Claude Code's auto mode** may refuse a quen tool in the middle of a session (seen 2026-10-19: `mem_patch` as "Modify Shared Resources", `mem_read` as "Security Weaken"). An allow rule in `%USERPROFILE%\.claude\settings.json`, under `permissions.allow`, names a tool that may run: the rule for quen's tool `<tool>` is `mcp__quen__<tool>`, for example `{"permissions": {"allow": ["mcp__quen__mem_read"]}}`. Which tools you allow is your decision; quen doesn't read Claude Code's settings. The tools on the game's memory:
+- **Only read it:** `mem_read`, `mem_scan`, `mem_follow`, `mem_walk`, `mem_find`.
+- **Write it:** `mem_patch`, `mem_unpatch` (journaled; every save the game writes afterwards is marked tainted).
+- **Both:** `game_cvar` reads a cvar, and with `set` or `restore` writes it. One rule, `mcp__quen__game_cvar`, covers both.
+- `session_launch`, `game_save`, `capture_clean` and `hands_take` prompt on every call, whatever the rules say.
+
 **What runs.** `quen mcp` only relays messages. The first one starts `quen serve` in the background, which holds the game lock, the session and its journal. Several client sessions share that one `quen serve`. It exits a few seconds after the last of them closes. If a game session is still running then, it first ends it (waits for saves to finish, closes the game, puts the folder back), so it can outlive the client by a little while.
 
 **Who drives.** Only one agent drives the game at a time. The launch returns a token, and only the connection that launched the game can end it or act in it. Closing that client session, or reconnecting quen (`/mcp` in Claude Code), ends the game session the normal way: wait for saves to finish, close the game, put the folder back.
@@ -294,8 +300,12 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 - the running game's memory: cvar writes and ASI mode switches. These live only in the game process and are gone when it closes;
 - `gamesaves` in the documents folder, only through `game_save` (quen-w3 0.1.4 or later), which your client asks you about on every call: the game writes one new manual save, as its menu's "Empty save slot" does, and names it. It never overwrites a save. quen checks the folder before and after: anything else that changed ends the session.
 
+**While a session is live,** quen keeps the PC and its display from sleeping. That ends with the session, however it ends.
+
+**In a test session the agent can hand you the controls** (`hands_give`), to set something up in the game, and takes them back after you agree (`hands_take`, Claude Code asks you each time). While you have them quen sends no key and writes nothing to the game, and a save you make is yours: the end lists it.
+
 **A play session** (you play, and hand the agent the controls when you want it to look at something): quen changes only `general.ini`'s console line, and places `steam_appid.txt` if it is missing. Your `dx12user.settings`, `input.settings` and ReShade's ini stay as they are, unless you ask the agent for a settings override, the devkit, or frame generation or VSync off. It parks nothing.
-- The agent sends no key and writes nothing to the game until you ask it in the chat and approve the hand-over (Claude Code asks you each time); you get the controls back with `play_return`. With your OK it may take screenshots, record frame times or read the game's memory while you play.
+- The agent sends no key and writes nothing to the game until you ask it in the chat and approve the hand-over (Claude Code asks you each time); you get the controls back with `hands_give`. With your OK it may take screenshots, record frame times or read the game's memory while you play.
 - Your saves stay yours; the end lists them. A save written while the agent has the controls gives them back to you.
 - After a memory write, cvar write, teleport, time or weather change, every save the game writes in that session is marked tainted in quen's ledger.
 - The session ends when you quit the game: quen then puts the console line and `steam_appid.txt` back by itself. Closing the agent's chat leaves the game running. If `quen serve` itself exits (a crash, an update that stops it), the game closes with it.

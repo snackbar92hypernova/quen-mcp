@@ -359,9 +359,44 @@ fn a_manual_save_after_keys_ends_the_session_at_once() {
     assert_eq!(after["refused"], true, "{after}");
 }
 
+/// A test session hands the controls to the user and takes them back: while the user has them, input is refused and
+/// their save is theirs, not an end; the end lists it as saves.user.
+#[test]
+fn a_test_session_hands_the_controls_to_the_user_and_back() {
+    let fx = Fixture::new();
+    let mut quen = Quen::start(&fx);
+    let launched = launch(&mut quen);
+    let token = launched["token"].clone();
+    assert_eq!(launched["state"]["hands"], "agent", "{launched}");
+    let given = quen.tool("hands_give", json!({"token": token}));
+    assert_eq!(given["ok"], true, "{given}");
+    assert_eq!(given["state"]["hands"], "user", "{given}");
+    let keys = quen.tool("game_keys", json!({"token": token, "tokens": ["e"]}));
+    assert_eq!(keys["refused"], true, "{keys}");
+    fs::write(fx.path("docs/gamesaves/ManualSave_user.sav"), "the user's").unwrap();
+    let taken = quen.tool("hands_take", json!({"token": token, "user_ok": true}));
+    assert_eq!(taken["ok"], true, "{taken}");
+    assert_eq!(
+        taken["user_saves"],
+        json!(["ManualSave_user.sav"]),
+        "{taken}"
+    );
+    let keys = quen.tool("game_keys", json!({"token": token, "tokens": ["e"]}));
+    assert_eq!(keys["ok"], true, "{keys}");
+    let end = quen.tool("session_end", json!({"token": token}));
+    assert_eq!(end["ok"], true, "{end}");
+    assert_eq!(
+        end["saves"]["user"],
+        json!(["ManualSave_user.sav"]),
+        "{end}"
+    );
+    assert_eq!(end["saves"]["unexpected"], json!([]), "{end}");
+    fx.assert_restored();
+}
+
 /// A play session: the launch changes only general.ini's console (the fixture has steam_appid.txt), sends no key
 /// without a save, and its boot row says play. The user has the controls: input, writes and focus moves are refused;
-/// play_take (with the user's OK) gives them to the agent, play_return gives them back, and the user's save is theirs,
+/// hands_take (with the user's OK) gives them to the agent, hands_give gives them back, and the user's save is theirs,
 /// not an end. The launching connection closing leaves the game running; the session ends by itself when it exits.
 #[test]
 fn a_play_session_runs_on_without_the_client_until_the_game_exits() {
@@ -402,20 +437,20 @@ fn a_play_session_runs_on_without_the_client_until_the_game_exits() {
             "game_cvar",
             json!({"token": token, "name": "X", "set": "1"}),
         ),
-        ("play_return", json!({"token": token})),
+        ("hands_give", json!({"token": token})),
     ] {
         let out = quen.tool(tool, args);
         assert_eq!(out["refused"], true, "{tool}: {out}");
     }
     // The user saves; the hand-over sorts it as theirs.
     fs::write(fx.path("docs/gamesaves/ManualSave_user.sav"), "the user's").unwrap();
-    let taken = quen.tool("play_take", json!({"token": token, "user_ok": true}));
+    let taken = quen.tool("hands_take", json!({"token": token, "user_ok": true}));
     assert_eq!(taken["ok"], true, "{taken}");
     assert_eq!(taken["user_saves"], json!(["ManualSave_user.sav"]));
     assert_eq!(taken["state"]["hands"], "agent");
     let keys = quen.tool("game_keys", json!({"token": token, "tokens": ["e"]}));
     assert_eq!(keys["ok"], true, "{keys}");
-    let back = quen.tool("play_return", json!({"token": token}));
+    let back = quen.tool("hands_give", json!({"token": token}));
     assert_eq!(back["ok"], true, "{back}");
     assert_eq!(back["state"]["hands"], "user");
     let end = quen.tool("session_end", json!({"token": token}));
@@ -1161,7 +1196,7 @@ fn a_launch_needs_the_native_bridge_and_quen_s_package_whole() {
     off_in(&fx, r"Mods\modQuenRpc");
     fs::write(fx.path("game").join(PARTS[4]), "another release").unwrap();
     broken(
-        "quen.ws is not the version quen expects (quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
+        "quen.ws is not the version quen expects (quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
     );
     off_in(&fx, PARTS[4]); // quen.ws
     broken(r"W3Quen.asi without Mods\modQuen, half the package");
@@ -2115,8 +2150,8 @@ fn game_and_measure_tools_need_a_live_session() {
         "game_teleport",
         "game_save",
         "focus",
-        "play_take",
-        "play_return",
+        "hands_take",
+        "hands_give",
         "world_get",
         "measure_presentmon",
         "measure_ab",
