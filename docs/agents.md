@@ -171,6 +171,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 - **Compare frame times within one boot only:** drift across boots is about 2 ms with path tracing on. A result is a verdict, "outside drift", or nothing.
 - **One PresentMode per comparison:** `measure_ab` stops on a change. With frame generation on, generated frames count as presents.
 - **No other capture while a PresentMon window runs** (a devkit dump, another tool's grab): it changes the frame times. quen's own screenshots can't overlap one, since quen runs one call at a time.
+- **No memory search during a PresentMon window,** a PresentMon run outside quen included: reading write-combined memory raised the mean frame time from 17.3 to 21.6 ms while it was read (one PC, 2026-10-19; §2, REA / Ghidra, Live). Right after the read, frame times were at their baseline again.
 
 ### Tracy: quen's `tracy` launch profile
 
@@ -262,8 +263,12 @@ Only M, O and static_re count towards proven. Never tag an inference M.
    - `mem_regions` for the readable regions: counts and bytes by kind, protection (`protect`, Windows' `PAGE_*` value) and image section, the 16 largest, and with `list: true` every region;
    - `mem_follow` for pointer chains;
    - `mem_walk` for an array of structs: `count` elements `stride` bytes apart from `address` or `rva`, or from the end of an `offsets` chain; each element's `fields` (`{name, offset, type}`) read from the element or, with `deref`, from the struct at the end of that pointer chain; one row per element, `why` on a row it couldn't read; `filter` keeps the rows where one field is (`eq`) or isn't (`ne`) a value;
-   - `mem_find` for a 64-bit value at 8-byte-aligned addresses in the image and private regions, with up to 256 bytes of context on each side of each hit, paged like `mem_scan`. A `mem_walk` or `mem_find` result over 16 KB goes to a JSON file in the session's capture folder (`file`, in `artifacts`), its first rows inline (`truncated`);
+   - `mem_find` for a 64-bit value at 8-byte-aligned addresses, by default in the image and private regions, with up to 256 bytes of context on each side of each hit, paged like `mem_scan`. A `mem_walk` or `mem_find` result over 16 KB goes to a JSON file in the session's capture folder (`file`, in `artifacts`), its first rows inline (`truncated`);
    - `mem_scan` and `mem_find` take one scope: `sections`, `regions` (bases, as `mem_regions` lists them) or `kinds` (`image`, `mapped`, `private`). A page stops at its hit `limit` or after `deadline_s` (default 60, at most 600): `stopped` (`deadline`) says it stopped early, `next` is the first address not searched; pass it as `from` and no hit comes twice. A range that can't be read whole is read page by page (4 KiB): `skipped` lists only the pages that couldn't be read. A match never spans two regions. Both report progress while they run, and both take `wait: false`;
+   - **write-combined and no-cache memory:** `mem_scan` and `mem_find` leave out the regions whose `protect` has `0x400` (write-combined) or `0x200` (no-cache), unless `uncached: true`; a region named in `regions` is searched whatever its protection. `left_out` gives the regions and bytes left out, which may hold hits; `mem_regions` still lists them. Measured on one PC on 2026-10-19 (Witcher 3 5.01, quen 0.1.2):
+     - 13.42 GB of the game's 21.06 GB readable memory was private `0x404` (`PAGE_READWRITE | PAGE_WRITECOMBINE`), in 511 regions. It read at 107 MB/s, against 2,390 MB/s for private `0x4`. A `mem_find` of the image and private regions, these included, took 131.75 s.
+     - While that search read the write-combined regions at high addresses, the game's mean frame time rose from 17.3 to 21.6 ms. In the gaps between the search's pages (3.5 and 3.9 s) and after its last page, frame times were at their baseline: no settle time was needed after a search. Don't search during a PresentMon window (§2, PresentMon);
+     - the one page that stayed unreadable (error 299) was private `0x202` (`PAGE_READONLY | PAGE_NOCACHE`);
    - a `game_cvar` read.
 
    `mem_patch` applies only KB-defined patches, and it taints saves. Get the user's explicit OK before a `mem_patch`. Claude Code's auto mode and allow rules: §1, step 6.

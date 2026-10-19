@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use quen_core::mem::{
     self, Field, Filter, Image, Kind, Memory, Op, Pattern, Region, Scope, Section, Type, Walk,
-    Write,
+    Which, Write,
 };
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -68,6 +68,10 @@ pub fn tools() -> Vec<Value> {
     let sections = json!({"type": "array", "items": {"type": "string"}, "description": "image sections: .text, .rdata, .data"});
     let regions = json!({"type": "array", "items": {"type": "string"}, "description": "region bases (mem_regions, skipped): numbers or 0x hex"});
     let kinds = json!({"type": "array", "items": {"type": "string", "enum": ["image", "mapped", "private"]}, "description": "what backs the regions"});
+    let uncached = json!({"type": "boolean", "description": "true: also search the write-combined (protect 0x400) and \
+        no-cache (0x200) regions. Default false. Measured on one PC on 2026-10-19: 13.42 of the game's 21.06 GB \
+        readable was private 0x404, read at 107 MB/s against 2,390 MB/s for private 0x4, and frame times rose while it \
+        was read"});
     let name = json!({"type": "string", "description": "a patch's name in the KB's patches.tsv"});
     let patch = |verb: &str, does: &str| {
         json!({
@@ -99,11 +103,13 @@ pub fn tools() -> Vec<Value> {
             "description": "Search the running game's memory for a byte pattern (IDA-style `48 8B ?? ?? 4?`, with an \
                 optional hex bit mask), an ASCII string or a UTF-16LE one (exact, no terminator). Scope, one of: \
                 sections of the game's image (.text, .rdata, .data), region bases (mem_regions lists them), kinds \
-                (image, mapped, private); by default every readable region. One page of hits (default 100, at most \
-                1000); pass next as from for the page after. deadline_s (default 60, at most 600) ends a page early: \
-                stopped says why, next where to go on. A region that can't be read whole is read page by page: \
-                skipped lists the pages that couldn't be read, so may hold hits nobody saw. A match never spans two \
-                regions.",
+                (image, mapped, private); by default every readable region. The scope leaves out the regions whose \
+                protect has 0x400 (write-combined) or 0x200 (no-cache) unless uncached: true; a region named in \
+                regions is searched whatever its protect. left_out counts the regions and bytes left out, which may \
+                hold hits. Don't search during a PresentMon window. One page of hits (default 100, at most 1000); \
+                pass next as from for the page after. deadline_s (default 60, at most 600) ends a page early: stopped \
+                says why, next where to go on. A region that can't be read whole is read page by page: skipped lists \
+                the pages that couldn't be read, so may hold hits nobody saw. A match never spans two regions.",
             "inputSchema": schema(json!({
                 "pattern": {"type": "string", "description": "bytes in hex, ?? or 4? for any byte or nibble"},
                 "mask": {"type": "string", "description": "hex, one byte per pattern byte"},
@@ -112,6 +118,7 @@ pub fn tools() -> Vec<Value> {
                 "sections": sections,
                 "regions": regions,
                 "kinds": kinds,
+                "uncached": uncached,
                 "from": number("search from"),
                 "limit": limit,
                 "deadline_s": deadline,
@@ -122,17 +129,19 @@ pub fn tools() -> Vec<Value> {
             "description": "Search the running game's memory for a 64-bit value at 8-byte-aligned addresses, each hit \
                 with up to context bytes before and after it (default 16, at most 256), cut at the edges of its \
                 region. The game is the one in the session's job, with read access only. Scope as mem_scan's, one of \
-                sections, regions and kinds; by default the image and private regions. One page of hits (default \
-                100, at most 1000); pass next as from for the page after. deadline_s (default 60, at most 600) ends a \
-                page early: stopped says why, next where to go on. skipped lists the pages that couldn't be read, so \
-                may hold hits nobody saw. A result over 16 KB comes back as its first hits and the path of a JSON \
-                file holding all of it.",
+                sections, regions and kinds; by default the image and private regions. As mem_scan, it leaves out \
+                write-combined and no-cache regions unless uncached: true or named in regions, and left_out counts \
+                them. One page of hits (default 100, at most 1000); pass next as from for the page after. deadline_s \
+                (default 60, at most 600) ends a page early: stopped says why, next where to go on. skipped lists the \
+                pages that couldn't be read, so may hold hits nobody saw. A result over 16 KB comes back as its first \
+                hits and the path of a JSON file holding all of it.",
             "inputSchema": schema(json!({
                 "value": number("the qword to find"),
                 "context": {"type": "integer", "minimum": 0, "maximum": 256, "description": "bytes before and after each hit, default 16"},
                 "sections": sections,
                 "regions": regions,
                 "kinds": kinds,
+                "uncached": uncached,
                 "from": number("search from"),
                 "limit": limit,
                 "deadline_s": deadline,
@@ -190,8 +199,9 @@ pub fn tools() -> Vec<Value> {
             "description": "List the running game's readable memory regions (committed, neither guard nor no-access \
                 pages), with read access only: regions and bytes in all; groups, the count and bytes per kind \
                 (image, mapped, private), protection and image section, most bytes first; largest, the 16 biggest \
-                regions. protect is Windows' PAGE_* value as 0x hex. list: true adds every region in address order \
-                (base, size, kind, protect, section). A result over 16 KB comes back as its first regions and the \
+                regions. protect is Windows' PAGE_* value as 0x hex; mem_scan and mem_find leave out by default the \
+                regions whose protect has 0x400 (write-combined) or 0x200 (no-cache). list: true adds every region in \
+                address order (base, size, kind, protect, section). A result over 16 KB comes back as its first regions and the \
                 path of a JSON file holding all of it.",
             "inputSchema": schema(json!({
                 "list": {"type": "boolean", "description": "true: every region too. Default false"},
@@ -512,32 +522,34 @@ fn paging(args: &Value) -> Result<(u64, usize), String> {
     Ok((from, limit))
 }
 
-/// The scope `args` give: `sections`, `regions` or `kinds`, at most one of them; `default` without.
-fn scope(args: &Value, default: Scope) -> Result<Scope, String> {
+/// The scope `args` give: `sections`, `regions` or `kinds`, at most one of them, `default` without; and `uncached`.
+fn scope(args: &Value, default: Which) -> Result<Scope, String> {
     let list = |key: &str| {
         args.get(key)
             .map(|v| v.as_array().ok_or(format!("{key} must be an array")))
     };
-    Ok(match (list("sections"), list("regions"), list("kinds")) {
+    let which = match (list("sections"), list("regions"), list("kinds")) {
         (None, None, None) => default,
-        (Some(s), None, None) => Scope::Sections(
+        (Some(s), None, None) => Which::Sections(
             s?.iter()
                 .map(|v| v.as_str().map(String::from))
                 .collect::<Option<_>>()
                 .ok_or("sections must be names")?,
         ),
-        (None, Some(r), None) => Scope::Regions(
+        (None, Some(r), None) => Which::Regions(
             r?.iter()
                 .map(unsigned)
                 .collect::<Option<_>>()
                 .ok_or("regions must be bases: numbers or 0x hex")?,
         ),
-        (None, None, Some(k)) => Scope::Kinds(
+        (None, None, Some(k)) => Which::Kinds(
             serde_json::from_value(Value::Array(k?.clone()))
                 .map_err(|_| "kinds must be image, mapped or private")?,
         ),
         _ => return Err("one of sections, regions and kinds, not two".into()),
-    })
+    };
+    let uncached = flag(args, "uncached")?;
+    Ok(Scope { which, uncached })
 }
 
 /// A scan or find page's `deadline_s`.
@@ -599,6 +611,7 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         "sections",
         "regions",
         "kinds",
+        "uncached",
         "from",
         "limit",
         "deadline_s",
@@ -621,7 +634,7 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         Some(mask) => pattern.masked(mask?)?,
         None => pattern,
     };
-    let scope = scope(args, Scope::All)?;
+    let scope = scope(args, Which::All)?;
     let (from, limit) = paging(args)?;
     let budget = deadline(args)?;
     let game = cx.game()?;
@@ -655,6 +668,7 @@ fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         "sections",
         "regions",
         "kinds",
+        "uncached",
         "from",
         "limit",
         "deadline_s",
@@ -668,7 +682,7 @@ fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             .ok_or_else(|| String::from("context must be a whole number"))?,
         None => CONTEXT,
     };
-    let scope = scope(args, Scope::Kinds(vec![Kind::Image, Kind::Private]))?;
+    let scope = scope(args, Which::Kinds(vec![Kind::Image, Kind::Private]))?;
     let (from, limit) = paging(args)?;
     let budget = deadline(args)?;
     let game = cx.game()?;
@@ -835,8 +849,12 @@ pub(crate) mod tests {
     use std::fs::File;
     use std::mem::offset_of;
     use std::path::Path;
+    use std::ptr::null;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Memory::{
+        MEM_RESERVE, PAGE_NOCACHE, PAGE_READWRITE, PAGE_WRITECOMBINE, VirtualAlloc,
+    };
 
     /// A static of this test binary's that another process may write: the cell keeps it in a writable section.
     #[repr(transparent)]
@@ -957,11 +975,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// The qword at the base of the dummy game's write-combined and no-cache regions, each [`UNCACHED_SIZE`] bytes.
+    const MARK: u64 = 0x5155_454e_5743_4e43;
+    const UNCACHED_SIZE: usize = 0x1_0000;
+
     #[test]
     #[ignore = "the dummy game other tests start: it only sleeps"]
     fn dummy_game() {
         if std::env::var_os("QUEN_DUMMY_GAME").is_some() {
             std::hint::black_box((&VAR, &BUF, &HOP));
+            for modifier in [PAGE_WRITECOMBINE, PAGE_NOCACHE] {
+                let commit = MEM_COMMIT | MEM_RESERVE;
+                // SAFETY: a fresh allocation, checked, then written at its base only.
+                unsafe {
+                    let at = VirtualAlloc(null(), UNCACHED_SIZE, commit, PAGE_READWRITE | modifier);
+                    assert!(!at.is_null(), "{}", io::Error::last_os_error());
+                    at.cast::<u64>().write_volatile(MARK);
+                }
+            }
             sleep(Duration::from_secs(120));
         }
     }
@@ -1379,6 +1410,69 @@ pub(crate) mod tests {
             let out = fx.run(tool, tok(args.clone()));
             assert_eq!(out["refused"], true, "{tool} {args}: {out}");
         }
+    }
+
+    /// The dummy game's write-combined (0x404) and no-cache (0x204) regions: mem_find and mem_scan leave them out by
+    /// default and count them in left_out; named in regions, or with uncached: true, they are searched.
+    #[test]
+    fn uncached_regions_in_the_dummy_game() {
+        let fx = Fake::new("memuncached");
+        let session = fx.session();
+        let cx = ctx(&session, &json!({"token": "tok"}), &[]).unwrap();
+        let game = cx.game().unwrap();
+        let start = Instant::now();
+        let bases = loop {
+            let regions = game.regions().unwrap();
+            let base = |protect| {
+                let r = regions.iter().find(|r| r.protect == protect);
+                r.filter(|r| r.size == UNCACHED_SIZE as u64).map(|r| r.base)
+            };
+            if let (Some(wc), Some(nc)) = (base(0x404), base(0x204)) {
+                break vec![wc, nc];
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "no uncached regions yet"
+            );
+            sleep(Duration::from_millis(20));
+        };
+        let find = |more: Value| {
+            let mut args =
+                json!({"token": "tok", "value": format!("{MARK:#x}"), "context": 0, "limit": 1000});
+            let args_map = args.as_object_mut().unwrap();
+            args_map.extend(more.as_object().unwrap().clone());
+            let out = fx.run("mem_find", args);
+            let hits = out["hits"].as_array().unwrap().iter();
+            let hits: Vec<u64> = hits.map(|h| h["address"].as_u64().unwrap()).collect();
+            (hits, out)
+        };
+        let none = json!({"regions": 0, "bytes": 0});
+        let (hits, out) = find(json!({}));
+        let left = |out: &Value, key: &str| out["left_out"][key].as_u64().unwrap();
+        assert!(!hits.iter().any(|h| bases.contains(h)), "{out}");
+        assert!(left(&out, "regions") >= 2, "{out}");
+        assert!(left(&out, "bytes") >= 2 * UNCACHED_SIZE as u64, "{out}");
+        let (hits, out) = find(json!({"regions": bases}));
+        assert_eq!((&hits, &out["left_out"]), (&bases, &none), "{out}");
+        let (hits, out) = find(json!({"uncached": true}));
+        assert!(bases.iter().all(|b| hits.contains(b)), "{out}");
+        assert_eq!(out["left_out"], none, "{out}");
+        let pattern = MARK.to_le_bytes().map(|b| format!("{b:02x}")).join(" ");
+        let scan = fx.run(
+            "mem_scan",
+            json!({"token": "tok", "pattern": pattern, "limit": 1000}),
+        );
+        let hits = scan["hits"].as_array().unwrap();
+        assert!(
+            !hits.iter().any(|h| bases.contains(&h.as_u64().unwrap())),
+            "{scan}"
+        );
+        assert!(left(&scan, "regions") >= 2, "{scan}");
+        let refused = fx.run(
+            "mem_scan",
+            json!({"token": "tok", "ascii": "a", "uncached": 1}),
+        );
+        assert_eq!(refused["refused"], true, "{refused}");
     }
 
     /// While the KB's tables name a build, the mem_* tools and game_cvar refuse a session whose exe is another.
