@@ -9,9 +9,9 @@
 
 use std::fmt;
 use std::io;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::build::Stamp;
@@ -31,12 +31,47 @@ pub struct Region {
     pub base: u64,
     pub size: u64,
     pub kind: Kind,
+    /// Its protection as VirtualQueryEx's `Protect` gives it (Windows' `PAGE_*` bits), shown as 0x hex.
+    #[serde(serialize_with = "hex::number")]
+    pub protect: u32,
     /// The image section the region lies in (`.text`, `.rdata`), when the platform layer knows it.
     pub section: Option<String>,
 }
 
+/// The regions of one kind, protection and section: how many, and their bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Group {
+    pub kind: Kind,
+    #[serde(serialize_with = "hex::number")]
+    pub protect: u32,
+    pub section: Option<String>,
+    pub count: usize,
+    pub bytes: u64,
+}
+
+/// `regions` grouped by kind, protection and section, most bytes first.
+pub fn census(regions: &[Region]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    for r in regions {
+        let same =
+            |g: &&mut Group| (g.kind, g.protect, &g.section) == (r.kind, r.protect, &r.section);
+        match groups.iter_mut().find(same) {
+            Some(g) => (g.count, g.bytes) = (g.count + 1, g.bytes + r.size),
+            None => groups.push(Group {
+                kind: r.kind,
+                protect: r.protect,
+                section: r.section.clone(),
+                count: 1,
+                bytes: r.size,
+            }),
+        }
+    }
+    groups.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    groups
+}
+
 /// What backs a region (VirtualQueryEx's `MEM_IMAGE`, `MEM_MAPPED`, `MEM_PRIVATE`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Image,
@@ -153,7 +188,7 @@ pub enum Value {
     I64(i64),
     F32(f32),
     F64(f64),
-    Ptr(#[serde(serialize_with = "hex::address")] u64),
+    Ptr(#[serde(serialize_with = "hex::number")] u64),
     Bytes(#[serde(with = "hex")] Vec<u8>),
 }
 
@@ -275,6 +310,42 @@ impl Pattern {
             .zip(&self.mask)
             .all(|((b, p), m)| (b ^ p) & m == 0)
     }
+
+    /// Calls `each` with the address of every match that starts in `b` (read at `at`) and lies wholly in it, ascending,
+    /// until `each` breaks. Only aligned starts are tried; a whole qword at 8-byte alignment is one u64 compare, any
+    /// other pattern first checks its most-fixed byte.
+    fn hits(
+        &self,
+        at: u64,
+        b: &[u8],
+        mut each: impl FnMut(u64) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let n = self.bytes.len();
+        let Some(last) = b.len().checked_sub(n) else {
+            return ControlFlow::Continue(());
+        };
+        let first = (at.next_multiple_of(self.align) - at) as usize;
+        let starts = (first..=last).step_by(self.align as usize);
+        if self.align == 8 && n == 8 && self.mask.iter().all(|&m| m == 0xff) {
+            let want = u64::from_le_bytes(sized(&self.bytes));
+            for i in starts {
+                if u64::from_le_bytes(sized(&b[i..i + 8])) == want {
+                    each(at + i as u64)?;
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        let k = (0..n)
+            .max_by_key(|&k| self.mask[k].count_ones())
+            .unwrap_or(0);
+        let (key, m) = (self.bytes[k], self.mask[k]);
+        for i in starts {
+            if (b[i + k] ^ key) & m == 0 && self.matches(&b[i..i + n]) {
+                each(at + i as u64)?;
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Which regions a scan reads.
@@ -295,19 +366,25 @@ pub const MAX_HITS: usize = 1000;
 /// The longest single read of a scan: a bigger region is read in chunks, each overlapping the next by the pattern's
 /// length less one byte, so no match is lost between them.
 pub(crate) const CHUNK: u64 = 1 << 20;
+/// A memory page: what a chunk that can't be read whole is read again in.
+pub const PAGE: u64 = 0x1000;
 
 /// One page of scan hits, and what the page covered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ScanPage<H = u64> {
     /// Where the pattern matches, ascending ([`find`]'s: with their context).
     pub hits: Vec<H>,
-    /// The `from` of the next page when this one is full; `None` when the scope is done.
+    /// The `from` of the next page when this one is full or stopped; `None` when the scope is done.
     pub next: Option<u64>,
+    /// Why the page stopped before its scope was done, when its tick said so (`deadline`, `cancelled`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<&'static str>,
     /// The regions this page searched, in whole or in part, and the bytes it covered in them (from a region's base or
-    /// `from`, to the region's end or where the page stopped).
+    /// `from`, to the region's end or where the page stopped), the skipped ones included.
     pub regions: usize,
     pub bytes: u64,
-    /// What in scope couldn't be read, so may hold matches nobody saw.
+    /// What in scope couldn't be read, so may hold matches nobody saw: runs of unreadable pages, or a region that
+    /// wasn't listed.
     /// ponytail: unbounded; a dying process lists every region here. Cap it if that ever floods a result.
     pub skipped: Vec<Skipped>,
 }
@@ -322,14 +399,17 @@ pub struct Skipped {
 }
 
 /// Searches `scope` for `pattern`, from address `from` on, for at most `limit` hits (clamped to 1 ..= [`MAX_HITS`]).
-/// Pass a full page's `next` as `from` for the page after it.
-/// ponytail: a naive match (bytes × pattern length at worst), and a match never spans two regions, even adjacent ones.
+/// Before each chunk but the page's first it calls `tick(bytes covered so far, bytes in scope)`, which may stop the
+/// page (`stopped`, its reason; `next`, the first address not searched). Pass a full or stopped page's `next` as
+/// `from` for the page after it: no hit is seen twice.
+/// ponytail: a match never spans two regions, even adjacent ones.
 pub fn scan(
     mem: &dyn Memory,
     pattern: &Pattern,
     scope: &Scope,
     from: u64,
     limit: usize,
+    tick: &mut dyn FnMut(u64, u64) -> ControlFlow<&'static str>,
 ) -> io::Result<ScanPage> {
     let limit = limit.clamp(1, MAX_HITS);
     let mut page = ScanPage::default();
@@ -350,45 +430,46 @@ pub fn scan(
         }
     }
     regions.sort_by_key(|r| r.base);
-    let n = pattern.bytes.len() as u64;
-    for region in regions {
-        let end = region.base.saturating_add(region.size);
-        let start = region.base.max(from);
-        if start >= end {
-            continue;
-        }
-        let (mut at, mut stop) = (start, end);
-        while end.saturating_sub(at) >= n {
-            let mut buf = vec![0; (end - at).min(CHUNK + n - 1) as usize];
-            if let Err(e) = mem.read(at, &mut buf) {
-                let (size, why) = (end - at, e.to_string());
-                page.skipped.push(Skipped {
-                    base: at,
-                    size,
-                    why,
-                });
-                stop = at;
-                break;
-            }
-            // At most CHUNK windows: matches starting past them are the next chunk's.
-            for (i, window) in buf.windows(n as usize).enumerate() {
-                let hit = at + i as u64;
-                if hit.is_multiple_of(pattern.align) && pattern.matches(window) {
-                    page.hits.push(hit);
-                    if page.hits.len() == limit {
-                        page.regions += 1;
-                        page.bytes += hit + 1 - start;
-                        page.next = Some(hit + 1);
-                        return Ok(page);
-                    }
+    let spans: Vec<(u64, u64)> = regions
+        .iter()
+        .map(|r| (r.base.max(from), r.base.saturating_add(r.size)))
+        .filter(|(start, end)| start < end)
+        .collect();
+    let total = spans.iter().map(|(start, end)| end - start).sum();
+    let tail = pattern.bytes.len() as u64 - 1;
+    let (mut buf, mut done) = (Vec::new(), 0);
+    for (start, end) in spans {
+        page.regions += 1;
+        let flow = chunks(
+            mem,
+            start,
+            end - start,
+            tail,
+            &mut buf,
+            &mut page.skipped,
+            |at, b| {
+                page.bytes = done + (at - start);
+                if page.bytes > 0
+                    && let ControlFlow::Break(why) = tick(page.bytes, total)
+                {
+                    (page.stopped, page.next) = (Some(why), Some(at));
+                    return ControlFlow::Break(());
                 }
-            }
-            at = at.saturating_add(CHUNK);
+                pattern.hits(at, b, |hit| {
+                    page.hits.push(hit);
+                    if page.hits.len() < limit {
+                        return ControlFlow::Continue(());
+                    }
+                    (page.bytes, page.next) = (done + hit + 1 - start, Some(hit + 1));
+                    ControlFlow::Break(())
+                })
+            },
+        );
+        if flow.is_break() {
+            return Ok(page);
         }
-        if stop > start {
-            page.regions += 1;
-            page.bytes += stop - start;
-        }
+        done += end - start;
+        page.bytes = done;
     }
     Ok(page)
 }
@@ -409,17 +490,18 @@ pub struct Found {
     pub why: Option<String>,
 }
 
-/// [`scan`]'s page for the qword `value` at 8-byte-aligned addresses in the image and private regions, each hit with up
-/// to `context` bytes (clamped to [`MAX_CONTEXT`]) on each side, cut at the edges of its region.
+/// [`scan`]'s page for the qword `value` at 8-byte-aligned addresses in `scope`, each hit with up to `context` bytes
+/// (clamped to [`MAX_CONTEXT`]) on each side, cut at the edges of its region.
 pub fn find(
     mem: &dyn Memory,
     value: u64,
+    scope: &Scope,
     from: u64,
     limit: usize,
     context: u64,
+    tick: &mut dyn FnMut(u64, u64) -> ControlFlow<&'static str>,
 ) -> io::Result<ScanPage<Found>> {
-    let scope = Scope::Kinds(vec![Kind::Image, Kind::Private]);
-    let page = scan(mem, &Pattern::qword(value), &scope, from, limit)?;
+    let page = scan(mem, &Pattern::qword(value), scope, from, limit, tick)?;
     let regions = mem.regions()?;
     let n = context.min(MAX_CONTEXT);
     let hits = page
@@ -454,6 +536,7 @@ pub fn find(
     Ok(ScanPage {
         hits,
         next: page.next,
+        stopped: page.stopped,
         regions: page.regions,
         bytes: page.bytes,
         skipped: page.skipped,
@@ -730,31 +813,72 @@ pub fn image(mem: &dyn Memory, base: u64) -> io::Result<Image> {
     })
 }
 
-/// Reads `[base, base + size)` in chunks of at most [`CHUNK`] + `tail` bytes, each starting [`CHUNK`] after the last,
-/// and calls `f(address, bytes)` on each: its windows of `tail + 1` bytes start in that chunk only, so none is seen
-/// twice or lost at a seam. A chunk that can't be read goes in `skipped`.
+/// Reads `[base, base + size)` into `buf` (reused across calls) in chunks of at most [`CHUNK`] + `tail` bytes, each
+/// starting [`CHUNK`] after the last, and calls `f(address, bytes)` on what it read, until `f` breaks. The windows of
+/// `tail + 1` bytes that lie wholly in what `f` gets and start before the next chunk are that chunk's, so none is seen
+/// twice or lost at a seam. A chunk that can't be read whole is read again page by page: `f` gets each run of readable
+/// pages, and the pages that can't be read go in `skipped` (adjacent ones as one).
 pub(crate) fn chunks(
     mem: &dyn Memory,
     base: u64,
     size: u64,
     tail: u64,
+    buf: &mut Vec<u8>,
     skipped: &mut Vec<Skipped>,
-    mut f: impl FnMut(u64, &[u8]),
-) {
+    mut f: impl FnMut(u64, &[u8]) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     let end = base.saturating_add(size);
     let mut at = base;
-    while at < end {
-        let mut buf = vec![0; (end - at).min(CHUNK + tail) as usize];
-        match mem.read(at, &mut buf) {
-            Ok(()) => f(at, &buf),
-            Err(e) => skipped.push(Skipped {
-                base: at,
-                size: (end - at).min(CHUNK),
-                why: e.to_string(),
-            }),
+    while end - at > tail {
+        let len = (end - at).min(CHUNK + tail);
+        let next = at.saturating_add(CHUNK);
+        // Windows starting at or past `own` are the next chunk's, when there is one.
+        let own = if end.saturating_sub(next) > tail {
+            next
+        } else {
+            end
+        };
+        if buf.len() < len as usize {
+            buf.resize(len as usize, 0);
         }
-        at = at.saturating_add(CHUNK);
+        let b = &mut buf[..len as usize];
+        if mem.read(at, b).is_ok() {
+            f(at, b)?;
+        } else {
+            let mut run = at;
+            let mut p = at;
+            while p < at + len {
+                let q = (p + 1).next_multiple_of(PAGE).min(at + len);
+                let page = (p - at) as usize..(q - at) as usize;
+                if let Err(e) = mem.read(p, &mut b[page]) {
+                    if run < p && run < own {
+                        f(run, &b[(run - at) as usize..(p - at) as usize])?;
+                    }
+                    if p < own {
+                        let size = q.min(own) - p;
+                        match skipped.last_mut() {
+                            Some(s) if s.base + s.size == p => s.size += size,
+                            _ => skipped.push(Skipped {
+                                base: p,
+                                size,
+                                why: e.to_string(),
+                            }),
+                        }
+                    }
+                    run = q;
+                }
+                p = q;
+            }
+            if run < own && run < at + len {
+                f(run, &b[(run - at) as usize..])?;
+            }
+        }
+        if own == end {
+            break;
+        }
+        at = next;
     }
+    ControlFlow::Continue(())
 }
 
 /// The most bytes a patch changes, all inside one 8-byte-aligned qword.
@@ -1023,16 +1147,17 @@ fn to_hex(bytes: &[u8]) -> String {
     hex.join(" ")
 }
 
-/// Serde for bytes as spaced lowercase hex, and for an address as 0x hex.
+/// Serde for bytes as spaced lowercase hex, and for a number as 0x hex.
 mod hex {
     use serde::Serializer;
+    use std::fmt::LowerHex;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&super::to_hex(bytes))
     }
 
-    pub fn address<S: Serializer>(address: &u64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{address:#x}"))
+    pub fn number<S: Serializer, N: LowerHex>(n: &N, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{n:#x}"))
     }
 }
 
@@ -1040,7 +1165,6 @@ mod hex {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::ops::Range;
 
     /// A process built by the test: regions holding bytes, and address ranges every read fails on.
     #[derive(Default)]
@@ -1056,6 +1180,7 @@ mod tests {
                 base,
                 size: bytes.len() as u64,
                 kind: section.map_or(Kind::Private, |_| Kind::Image),
+                protect: 0x04,
                 section: section.map(Into::into),
             };
             self.regions.push((region, bytes));
@@ -1172,13 +1297,13 @@ mod tests {
             .with(0x9000, [0xaa, 0xaa], None);
         let p = Pattern::parse("aa aa").unwrap();
         let all = [0x1000, 0x1001, 0x1004, 0x2001, 0x9000];
-        let page = scan(&mem, &p, &Scope::All, 0, 100).unwrap();
+        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
         assert_eq!(page.hits, all, "overlapping matches too");
         assert_eq!((page.next, page.regions, page.bytes), (None, 3, 11));
         assert!(page.skipped.is_empty());
         let (mut hits, mut from) = (Vec::new(), 0);
         loop {
-            let page = scan(&mem, &p, &Scope::All, from, 2).unwrap();
+            let page = scan(&mem, &p, &Scope::All, from, 2, &mut go).unwrap();
             assert!(page.hits.len() <= 2);
             hits.extend(page.hits);
             match page.next {
@@ -1188,23 +1313,35 @@ mod tests {
         }
         assert_eq!(hits, all, "pages resume after their last hit");
         let text = Scope::Sections(vec![".text".into()]);
-        assert_eq!(scan(&mem, &p, &text, 0x1002, 100).unwrap().hits, [0x1004]);
+        assert_eq!(
+            scan(&mem, &p, &text, 0x1002, 100, &mut go).unwrap().hits,
+            [0x1004]
+        );
         let regions = Scope::Regions(vec![0x9000, 0x2000]);
         assert_eq!(
-            scan(&mem, &p, &regions, 0, 100).unwrap().hits,
+            scan(&mem, &p, &regions, 0, 100, &mut go).unwrap().hits,
             [0x2001, 0x9000]
         );
-        let page = scan(&mem, &p, &Scope::All, 0, 0).unwrap();
+        let page = scan(&mem, &p, &Scope::All, 0, 0, &mut go).unwrap();
         assert_eq!(
             (page.hits, page.next, page.bytes),
             (vec![0x1000], Some(0x1001), 1)
         );
-        let page = scan(&mem, &p, &Scope::All, 0, usize::MAX).unwrap();
+        let page = scan(&mem, &p, &Scope::All, 0, usize::MAX, &mut go).unwrap();
         assert_eq!(
             page.hits.len(),
             all.len(),
             "the limit is clamped, not refused"
         );
+    }
+
+    /// A tick that never stops a scan.
+    fn go(_: u64, _: u64) -> ControlFlow<&'static str> {
+        ControlFlow::Continue(())
+    }
+
+    fn image_private() -> Scope {
+        Scope::Kinds(vec![Kind::Image, Kind::Private])
     }
 
     #[test]
@@ -1216,9 +1353,14 @@ mod tests {
         );
         mem.bad.push(0x2000..0x2001);
         let p = Pattern::parse("aa").unwrap();
-        let page = scan(&mem, &p, &Scope::Sections(vec![".text".into()]), 0, 100).unwrap();
+        let text = Scope::Sections(vec![".text".into()]);
+        let page = scan(&mem, &p, &text, 0, 100, &mut go).unwrap();
         assert_eq!(page.hits, [0x1000, 0x1001, 0x1002, 0x1003]);
-        assert_eq!((page.regions, page.bytes), (1, 4));
+        assert_eq!(
+            (page.regions, page.bytes),
+            (2, 8),
+            "skipped bytes count as covered"
+        );
         let why = "no 4 readable bytes at 0x2000".into();
         assert_eq!(
             page.skipped,
@@ -1228,7 +1370,8 @@ mod tests {
                 why
             }]
         );
-        let page = scan(&mem, &p, &Scope::Regions(vec![0x1000, 0x5000]), 0, 100).unwrap();
+        let regions = Scope::Regions(vec![0x1000, 0x5000]);
+        let page = scan(&mem, &p, &regions, 0, 100, &mut go).unwrap();
         let why = "not a readable region now".into();
         assert_eq!(
             page.skipped,
@@ -1242,24 +1385,46 @@ mod tests {
     }
 
     #[test]
-    fn scans_match_across_chunk_seams_and_keep_what_preceded_a_failed_chunk() {
+    fn scans_match_across_chunk_seams_and_read_around_a_bad_page() {
         let base = 0x10_0000;
         let size = 2 * CHUNK + 8;
         let mut bytes = vec![0; size as usize];
         let seam = CHUNK as usize;
-        bytes[seam - 2..seam + 2].copy_from_slice(&[1, 2, 3, 4]);
-        bytes[size as usize - 4..].copy_from_slice(&[1, 2, 3, 4]);
+        // Across the first seam, either side of the second chunk's second page, and at the region's end.
+        let at = [
+            seam - 2,
+            seam + PAGE as usize - 4,
+            seam + 2 * PAGE as usize,
+            size as usize - 4,
+        ];
+        for i in at {
+            bytes[i..i + 4].copy_from_slice(&[1, 2, 3, 4]);
+        }
+        let all = at.map(|i| base + i as u64);
         let mut mem = Fake::default().with(base, bytes, None);
         let p = Pattern::parse("01 02 03 04").unwrap();
-        let page = scan(&mem, &p, &Scope::All, 0, 100).unwrap();
-        assert_eq!(page.hits, [base + CHUNK - 2, base + size - 4]);
+        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
+        assert_eq!(page.hits, all);
         assert_eq!((page.regions, page.bytes), (1, size));
-        mem.bad.push(base + CHUNK + 100..base + CHUNK + 101);
-        let page = scan(&mem, &p, &Scope::All, 0, 100).unwrap();
-        assert_eq!(page.hits, [base + CHUNK - 2]);
-        assert_eq!((page.regions, page.bytes), (1, CHUNK));
-        let (at, rest) = (base + CHUNK, size - CHUNK);
-        assert!(matches!(&page.skipped[..], [s] if (s.base, s.size) == (at, rest)));
+        assert!(page.skipped.is_empty());
+        let bad = base + CHUNK + PAGE;
+        mem.bad.push(bad + 100..bad + 101);
+        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
+        assert_eq!(
+            page.hits, all,
+            "before and after the page, and the region's rest"
+        );
+        assert_eq!((page.regions, page.bytes), (1, size));
+        let why = format!("no {PAGE} readable bytes at {bad:#x}");
+        assert_eq!(
+            page.skipped,
+            [Skipped {
+                base: bad,
+                size: PAGE,
+                why
+            }],
+            "that page only"
+        );
     }
 
     #[test]
@@ -1267,21 +1432,302 @@ mod tests {
         let base = 0x10_0000;
         let size = 2 * CHUNK + 5;
         let mut mem = Fake::default().with(base, vec![0; size as usize], None);
-        let mut starts = Vec::new();
-        let mut skipped = Vec::new();
-        chunks(&mem, base, size, 3, &mut skipped, |at, b| {
-            starts.extend(b.windows(4).enumerate().map(|(i, _)| at + i as u64));
-        });
+        let windows = |mem: &Fake, skipped: &mut Vec<Skipped>| {
+            let mut starts = Vec::new();
+            let flow = chunks(mem, base, size, 3, &mut Vec::new(), skipped, |at, b| {
+                starts.extend((0..b.len().saturating_sub(3)).map(|i| at + i as u64));
+                ControlFlow::Continue(())
+            });
+            assert_eq!(flow, ControlFlow::Continue(()));
+            starts
+        };
         let all: Vec<u64> = (base..base + size - 3).collect();
-        assert_eq!((starts, skipped), (all, vec![]));
-        mem.bad.push(base + CHUNK..base + CHUNK + 1);
         let mut skipped = Vec::new();
-        chunks(&mem, base, size, 3, &mut skipped, |_, _| {});
+        assert_eq!(windows(&mem, &mut skipped), all);
+        assert!(skipped.is_empty());
+        // The second chunk's first byte: the first chunk's tail reads it too.
+        let bad = base + CHUNK;
+        mem.bad.push(bad..bad + 1);
+        let starts = windows(&mem, &mut skipped);
+        assert!(
+            starts.windows(2).all(|w| w[0] < w[1]),
+            "each once, in order"
+        );
+        let lost: Vec<u64> = all
+            .into_iter()
+            .filter(|a| starts.binary_search(a).is_err())
+            .collect();
+        let touch: Vec<u64> = (bad - 3..bad + PAGE).collect();
+        assert_eq!(lost, touch, "the windows that touch the page");
         let skips: Vec<(u64, u64)> = skipped.iter().map(|s| (s.base, s.size)).collect();
         assert_eq!(
             skips,
-            [(base, CHUNK), (base + CHUNK, CHUNK)],
-            "a chunk's tail reads into the next one"
+            [(bad, PAGE)],
+            "listed once, by the chunk it starts in"
+        );
+        let mut calls = 0;
+        let flow = chunks(
+            &mem,
+            base,
+            size,
+            3,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            |_, _| {
+                calls += 1;
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(
+            (flow, calls),
+            (ControlFlow::Break(()), 1),
+            "a break ends the read"
+        );
+    }
+
+    /// Synthetic bytes, from a xorshift.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// Every window in turn, as scans matched before the fast paths: what they must agree with.
+    fn naive(mem: &Fake, p: &Pattern) -> Vec<u64> {
+        let mut hits = Vec::new();
+        for (r, bytes) in &mem.regions {
+            for (i, w) in bytes.windows(p.bytes.len()).enumerate() {
+                let at = r.base + i as u64;
+                if at.is_multiple_of(p.align) && p.matches(w) {
+                    hits.push(at);
+                }
+            }
+        }
+        hits.sort_unstable();
+        hits
+    }
+
+    #[test]
+    fn the_fast_paths_find_what_every_window_does() {
+        let v: u64 = 0x7ff6_1234_5678_9abc;
+        let c = CHUNK as usize;
+        let mut mem = Fake::default();
+        // Odd-sized regions over chunk seams, the value planted aligned and not, at the seams and the ends.
+        for (base, len) in [
+            (0x10_0000u64, c + 21),
+            (0x40_0000, 2 * c + 13),
+            (0x90_0000, 100),
+        ] {
+            let mut bytes = noise(base, len);
+            for at in [
+                0,
+                3,
+                8,
+                c - 8,
+                c - 4,
+                c,
+                2 * c - 1,
+                len - 8,
+                len - 13,
+                len - 16,
+            ] {
+                if at + 8 <= len {
+                    bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            mem = mem.with(base, bytes, None);
+        }
+        let all = |p: &Pattern| {
+            let (mut hits, mut from) = (Vec::new(), 0);
+            loop {
+                let page = scan(&mem, p, &Scope::All, from, MAX_HITS, &mut go).unwrap();
+                hits.extend(page.hits);
+                match page.next {
+                    Some(next) => from = next,
+                    None => return hits,
+                }
+            }
+        };
+        let hex: Vec<String> = v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let exact = Pattern::parse(&hex.join(" ")).unwrap();
+        let aligned: Vec<u64> = all(&exact)
+            .into_iter()
+            .filter(|a| a.is_multiple_of(8))
+            .collect();
+        assert_eq!(
+            all(&Pattern::qword(v)),
+            aligned,
+            "the u64 compare and the byte compare"
+        );
+        assert!(
+            aligned.len() >= 4 && all(&exact).len() > aligned.len(),
+            "{aligned:?}"
+        );
+        let wild = Pattern {
+            align: 8,
+            ..Pattern::parse(&format!("{} ?? {}", hex[0], hex[2..].join(" "))).unwrap()
+        };
+        for p in [
+            exact,
+            Pattern::qword(v),
+            wild,
+            Pattern::parse("?c 9a 7? 56").unwrap(),
+            Pattern::parse("4? ?2").unwrap(),
+        ] {
+            assert_eq!(all(&p), naive(&mem, &p), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_scan_goes_on_from_next_and_sees_no_hit_twice() {
+        let base = 0x10_0000;
+        let mut bytes = vec![0; 3 * CHUNK as usize + 5];
+        for i in (0..bytes.len() - 1).step_by(7 * PAGE as usize + 1) {
+            bytes[i..i + 2].copy_from_slice(&[0xaa, 0xbb]);
+        }
+        let mem = Fake::default().with(base, bytes, None).with(
+            0x80_0000,
+            [0xaa, 0xbb, 0, 0xaa, 0xbb],
+            Some(".data"),
+        );
+        let p = Pattern::parse("aa bb").unwrap();
+        let every = scan(&mem, &p, &Scope::All, 0, MAX_HITS, &mut go).unwrap();
+        assert_eq!((every.next, every.stopped), (None, None));
+        // A deadline at every page's second tick.
+        let (mut hits, mut from, mut pages) = (Vec::new(), 0, 0);
+        loop {
+            let mut ticks = 0;
+            let mut tick = |_, _| {
+                ticks += 1;
+                match ticks {
+                    2 => ControlFlow::Break("deadline"),
+                    _ => ControlFlow::Continue(()),
+                }
+            };
+            let page = scan(&mem, &p, &Scope::All, from, MAX_HITS, &mut tick).unwrap();
+            pages += 1;
+            hits.extend(page.hits.iter().copied());
+            let Some(next) = page.next else { break };
+            assert_eq!(json!(&page)["stopped"], "deadline", "{page:?}");
+            assert!(next > from);
+            from = next;
+        }
+        assert_eq!(hits, every.hits);
+        assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn finds_in_the_scope_given() {
+        let v: u64 = 0x1122_3344_5566_7788;
+        let q = v.to_le_bytes();
+        let mut mem = Fake::default()
+            .with(0x1000, q, Some(".data"))
+            .with(0x2000, q, Some(".rdata"))
+            .with(0x3000, q, None);
+        let mapped = Region {
+            base: 0x5000,
+            size: 8,
+            kind: Kind::Mapped,
+            protect: 0x02,
+            section: None,
+        };
+        mem.regions.push((mapped, q.into()));
+        let at = |scope: Scope| -> Vec<u64> {
+            let page = find(&mem, v, &scope, 0, 100, 0, &mut go).unwrap();
+            page.hits.iter().map(|h| h.address).collect()
+        };
+        assert_eq!(at(Scope::Sections(vec![".data".into()])), [0x1000]);
+        assert_eq!(at(Scope::Kinds(vec![Kind::Mapped])), [0x5000]);
+        assert_eq!(at(Scope::Regions(vec![0x3000])), [0x3000]);
+        assert_eq!(at(image_private()), [0x1000, 0x2000, 0x3000]);
+    }
+
+    /// The scan before the fast paths (f9e9353): a fresh zeroed buffer per chunk, every window, the alignment check,
+    /// then the masked compare. Kept to measure the new one against.
+    fn old_scan(mem: &Fake, p: &Pattern) -> Vec<u64> {
+        let n = p.bytes.len() as u64;
+        let mut hits = Vec::new();
+        for (r, _) in &mem.regions {
+            let (mut at, end) = (r.base, r.base + r.size);
+            while end - at >= n {
+                let mut buf = vec![0; (end - at).min(CHUNK + n - 1) as usize];
+                mem.read(at, &mut buf).unwrap();
+                for (i, window) in buf.windows(n as usize).enumerate() {
+                    let hit = at + i as u64;
+                    if hit.is_multiple_of(p.align) && p.matches(window) {
+                        hits.push(hit);
+                    }
+                }
+                at += CHUNK;
+            }
+        }
+        hits
+    }
+
+    /// Old and new scan over 256 MiB of synthetic memory, once each, single-threaded. A copy from a Vec stands in for
+    /// ReadProcessMemory, so this measures the matching, not a game's copy rate.
+    #[test]
+    #[ignore = "a measurement: cargo test --release -p quen-core --lib -- --ignored --nocapture scan_speed"]
+    fn scan_speed() {
+        let size = 64 << 20;
+        let v: u64 = 0x7ff6_1234_5678_9abc;
+        let mut mem = Fake::default();
+        for i in 1..=4u64 {
+            let mut bytes = noise(i, size);
+            for at in [8, size / 2, size - 64] {
+                bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                bytes[at + 25..at + 31].copy_from_slice(b"quen-d");
+            }
+            mem = mem.with(i << 28, bytes, None);
+        }
+        let total = (4 * size) as f64 / 1e6;
+        for (name, p) in [
+            ("qword (mem_find)", Pattern::qword(v)),
+            ("ascii, 6 bytes", Pattern::ascii("quen-d").unwrap()),
+        ] {
+            let t = std::time::Instant::now();
+            let old = old_scan(&mem, &p);
+            let old_s = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let new = scan(&mem, &p, &Scope::All, 0, MAX_HITS, &mut go).unwrap();
+            let new_s = t.elapsed().as_secs_f64();
+            assert_eq!(new.hits, old);
+            println!(
+                "{name}: {total:.0} MB, old {:.0} MB/s, new {:.0} MB/s",
+                total / old_s,
+                total / new_s
+            );
+        }
+    }
+
+    #[test]
+    fn a_census_groups_regions_by_kind_protection_and_section() {
+        let r = |base, size, kind, protect, section: Option<&str>| Region {
+            base,
+            size,
+            kind,
+            protect,
+            section: section.map(Into::into),
+        };
+        let groups = census(&[
+            r(0, 0x1000, Kind::Image, 0x20, Some(".text")),
+            r(0x1000, 0x3000, Kind::Private, 0x04, None),
+            r(0x5000, 0x1000, Kind::Private, 0x04, None),
+            r(0x9000, 0x1000, Kind::Private, 0x404, None),
+        ]);
+        assert_eq!(
+            json!(groups),
+            json!([
+                {"kind": "private", "protect": "0x4", "section": null, "count": 2, "bytes": 0x4000},
+                {"kind": "image", "protect": "0x20", "section": ".text", "count": 1, "bytes": 0x1000},
+                {"kind": "private", "protect": "0x404", "section": null, "count": 1, "bytes": 0x1000},
+            ])
         );
     }
 
@@ -1356,10 +1802,11 @@ mod tests {
             base: 0x5000,
             size: 8,
             kind: Kind::Mapped,
+            protect: 0x04,
             section: None,
         };
         mem.regions.push((mapped, v.to_le_bytes().into()));
-        let page = find(&mem, v, 0, 100, 4).unwrap();
+        let page = find(&mem, v, &image_private(), 0, 100, 4, &mut go).unwrap();
         let found = |address, before, after| Found {
             address,
             before,
@@ -1379,21 +1826,26 @@ mod tests {
             json!(page.hits[1]),
             json!({"address": 0x3000, "before": "", "after": "22 22 22 22"})
         );
-        let wide = find(&mem, v, 0, 100, 10_000).unwrap();
+        let wide = find(&mem, v, &image_private(), 0, 100, 10_000, &mut go).unwrap();
         let sides: Vec<(usize, usize)> = wide
             .hits
             .iter()
             .map(|h| (h.before.len(), h.after.len()))
             .collect();
         assert_eq!(sides, [(8, 16), (0, 8)], "the region's bytes, at most");
-        let first = find(&mem, v, 0, 1, 0).unwrap();
+        let first = find(&mem, v, &image_private(), 0, 1, 0, &mut go).unwrap();
         assert_eq!(first.next, Some(0x1009));
-        let second = find(&mem, v, 0x1009, 1, 0).unwrap();
+        let second = find(&mem, v, &image_private(), 0x1009, 1, 0, &mut go).unwrap();
         assert_eq!(
             (second.hits[0].address, second.next),
             (0x3000, Some(0x3001))
         );
-        assert!(find(&mem, v, 0x3001, 1, 0).unwrap().hits.is_empty());
+        assert!(
+            find(&mem, v, &image_private(), 0x3001, 1, 0, &mut go)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
     }
 
     /// Three 16-byte elements: an id, a float and a pointer to a 32-byte struct (null for the second).

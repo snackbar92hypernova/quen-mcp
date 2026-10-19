@@ -5,19 +5,22 @@
 //! moves the focus, and lets reads run. `hands_take` (the client asks the user on every call) gives the agent the
 //! controls, `hands_give` gives them to the user. quen sorts gamesaves at each hand-over: what changed while the user had
 //! the controls is theirs (allowed, listed at the end); a save while the agent had them fails that call, and gives the
-//! controls back to the user in a play session or ends a test session.
+//! controls back to the user in a play session or ends a test session. When the connection that launched a play session
+//! closes while the agent has the controls, quen undoes that hand-over's memory writes, then gives the user the controls
+//! ([`dropped`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
+use quen_core::mem::Write;
 use quen_core::protocol::Verb;
 use quen_core::saves::{self, Snapshot};
 use serde_json::{Map, Value, json};
 
 use crate::channel::{self, REPLY_MAX};
 use crate::doctor;
-use crate::game::{self, Fields, flag, schema};
+use crate::game::{self, Ctx, Fields, flag, hex_bytes, schema};
 use crate::session::{Call, Done, Live, Session};
 
 /// What the game shows on screen when the user gets the controls (quen-w3 0.1.8's notice verb).
@@ -114,9 +117,8 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_screenshot" | "game_listsaves" | "world_get" | "measure_presentmon" | "mem_read"
-        | "mem_scan" | "mem_follow" | "mem_walk" | "mem_find" | "sweep_save" | "capture_clean" => {
-            true
-        }
+        | "mem_scan" | "mem_follow" | "mem_walk" | "mem_find" | "mem_regions" | "sweep_save"
+        | "capture_clean" => true,
         tool => tool.starts_with("session_") || tool.starts_with("hands_"),
     }
 }
@@ -193,14 +195,10 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     let (applied, kept) = {
         let patches = cx.live.patches.borrow();
         let mine = patches.get(h.since.get()..).unwrap_or_default();
-        let kept: Vec<Value> = mine
-            .iter()
-            .filter(|(_, p)| p["write"].is_null() && p["taints"] == true)
-            .map(|(_, p)| p["what"].clone())
-            .collect();
         // A test session's writes stay applied across its hand-overs: all of them count.
         let writes = if cx.live.play { mine } else { &patches[..] };
-        (applied(writes), kept)
+        let applied: Vec<Value> = applied(writes).iter().map(|a| a[3].clone()).collect();
+        (applied, kept(mine))
     };
     let mut fields = Map::new();
     if !applied.is_empty() {
@@ -260,24 +258,100 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     Ok(fields)
 }
 
-/// The memory writes among `patches` (mem_patch and mem_unpatch, game_cvar's, measure_ab's cvars) still applied: per
-/// address, the last write's new bytes differ from what the first found there. Each one's last `what`.
-fn applied(patches: &[(SystemTime, Value)]) -> Vec<Value> {
-    // (address, the first write's old bytes, the last write's new bytes, its what)
-    let mut seen: Vec<[&Value; 4]> = Vec::new();
-    for (_, patch) in patches {
-        let w = &patch["write"];
-        if w.is_null() {
-            continue;
-        }
-        match seen.iter_mut().find(|s| *s[0] == w["address"]) {
-            Some(s) => (s[2], s[3]) = (&w["new"], &patch["what"]),
-            None => seen.push([&w["address"], &w["old"], &w["new"], &patch["what"]]),
+/// The connection that launched a play session closed. While the agent has the controls, this hand-over's memory
+/// patches and cvar writes still applied are undone, newest first: each journaled like any write, and only while the
+/// bytes there are still the ones it wrote, as mem_unpatch checks (another writer's are left). A write kept by agreement
+/// (hands_give's keep_writes) is an earlier hand-over's and stays. Then the user has the controls. What it undid, what it
+/// left and why, and the hand-over's teleports, settime and weather (kept), for the log.
+pub(crate) fn dropped(session: &Session) -> Value {
+    let Some(live) = &session.live else {
+        return Value::Null;
+    };
+    let (mut undone, mut left, mut keep) = (Vec::new(), Vec::new(), Vec::new());
+    if session.shared.hands() == Some(Hands::Agent) {
+        let todo: Vec<(u64, Vec<u8>, Vec<u8>, String)> = {
+            let patches = live.patches.borrow();
+            let mine = patches
+                .get(live.handovers.since.get()..)
+                .unwrap_or_default();
+            keep = kept(mine);
+            let applied = applied(mine)
+                .into_iter()
+                .filter_map(|[address, old, new, what]| {
+                    let what = what.as_str().unwrap_or_default();
+                    let what = what.rsplit_once(" at ").map_or(what, |(w, _)| w);
+                    Some((
+                        address.as_u64()?,
+                        hex_bytes(old)?,
+                        hex_bytes(new)?,
+                        what.into(),
+                    ))
+                });
+            applied.collect()
+        };
+        let game = session.config().and_then(|config| {
+            let cx = Ctx {
+                config,
+                live,
+                hands: Some(Hands::Agent),
+            };
+            cx.game().map(|game| (cx, game))
+        });
+        for (address, old, new, what) in todo {
+            let undo = Write {
+                address,
+                old: new,
+                new: old,
+            };
+            let made = match &game {
+                Ok((cx, game)) => {
+                    cx.write(game, &format!("undo of {what}"), &undo, &mut Map::new())
+                }
+                Err(why) => Err(Done::Refused(why.clone())),
+            };
+            match made {
+                Ok(()) => undone.push(what),
+                Err(Done::Failed(why, _) | Done::Refused(why)) => {
+                    left.push(format!("{what}: {why}"))
+                }
+                Err(_) => left.push(what),
+            }
         }
     }
-    seen.into_iter()
-        .filter(|s| s[1] != s[2])
-        .map(|s| s[3].clone())
+    session.shared.set_hands(Some(Hands::User));
+    json!({"undone": undone, "left": left, "kept": keep})
+}
+
+/// The memory writes among `patches` (mem_patch and mem_unpatch, game_cvar's, measure_ab's cvars) still applied, newest
+/// first: per address, the last write's new bytes differ from what the first found there. Each as the address, the
+/// first write's old bytes, the last one's new bytes and its `what`.
+fn applied(patches: &[(SystemTime, Value)]) -> Vec<[&Value; 4]> {
+    let writes = || {
+        let all = patches.iter().map(|(_, p)| (&p["write"], &p["what"]));
+        all.filter(|(w, _)| !w.is_null())
+    };
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for (w, what) in writes().rev() {
+        if seen.contains(&&w["address"]) {
+            continue;
+        }
+        seen.push(&w["address"]);
+        let first = writes().find(|(f, _)| f["address"] == w["address"]);
+        let old = &first.unwrap_or((w, what)).0["old"];
+        if *old != w["new"] {
+            out.push([&w["address"], old, &w["new"], what]);
+        }
+    }
+    out
+}
+
+/// The teleports, settime and weather among `patches`: what taints without a write.
+fn kept(patches: &[(SystemTime, Value)]) -> Vec<Value> {
+    patches
+        .iter()
+        .filter(|(_, p)| p["write"].is_null() && p["taints"] == true)
+        .map(|(_, p)| p["what"].clone())
         .collect()
 }
 
@@ -332,6 +406,7 @@ mod tests {
             "mem_follow",
             "mem_walk",
             "mem_find",
+            "mem_regions",
             "sweep_save",
             "session_end",
             "hands_take",
@@ -458,6 +533,109 @@ mod tests {
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["applied"], json!(["mem_patch cull at 0x20"]), "{out}");
         assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// The connection that launched a play session closes while the agent has the controls: this hand-over's two dummy
+    /// patches are undone, newest first and journaled; a write another writer changed since is left; a write kept by
+    /// agreement at an earlier hand-over stays; the teleport is listed as kept; the user has the controls.
+    #[test]
+    fn a_dropped_play_session_undoes_the_hand_overs_writes() {
+        use crate::mem::tests::{BUF, this_exe};
+        let fx = Fake::new("play-drop");
+        let (_, image) = this_exe();
+        let buf = BUF.address() - image.base;
+        let row = |name: &str, at: u64, old: &str, new: &str| {
+            format!(
+                "{name}\t{:#x}\t{old}\t{new}\t{}\ttest\n",
+                buf + at,
+                image.stamp
+            )
+        };
+        let tsv = [
+            "name\trva\told\tnew\tbuild\tboundaries-checked\n".to_string(),
+            row("kept", 11, "62 75", "42 55"),
+            row("a", 0, "71 75 65 6e", "51 55 45 4e"),
+            row("b", 8, "6d 79", "4d 59"),
+        ];
+        std::fs::write(fx.dir.join("kb/patches.tsv"), tsv.concat()).unwrap();
+        let mut session = handed_over(&fx, true);
+        let mem = |session: &mut Session, tool: &str, args: Value| {
+            let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+            let done = crate::mem::call(session, &mut call, tool, &args);
+            session.envelope(tool, call, done)
+        };
+        let on = |name: &str| json!({"token": "tok", "name": name});
+        assert_eq!(mem(&mut session, "mem_patch", on("kept"))["ok"], true);
+        let back = run(
+            &session,
+            "hands_give",
+            json!({"token": "tok", "keep_writes": true}),
+        );
+        assert_eq!(back["ok"], true, "{back}");
+        let took = run(
+            &session,
+            "hands_take",
+            json!({"token": "tok", "user_ok": true}),
+        );
+        assert_eq!(took["ok"], true, "{took}");
+        for name in ["a", "b"] {
+            let out = mem(&mut session, "mem_patch", on(name));
+            assert_eq!(out["ok"], true, "{out}");
+        }
+        patch(&session, "channel {\"verb\":\"teleport\"}", Value::Null);
+        // A write quen thinks it made at BUF + 4, whose bytes aren't what it wrote: another writer's.
+        let game = crate::game::ctx(&session, &json!({"token": "tok"}), &[])
+            .unwrap()
+            .game()
+            .unwrap();
+        let other = game.image.base + buf + 4;
+        patch(
+            &session,
+            &format!("mem_patch other at {other:#x}"),
+            json!({"address": other, "old": "aa", "new": "bb"}),
+        );
+
+        let out = dropped(&session);
+        assert_eq!(
+            out["undone"],
+            json!(["mem_patch b", "mem_patch a"]),
+            "{out}"
+        );
+        let left = out["left"].as_array().unwrap();
+        assert!(
+            left.len() == 1 && left[0].as_str().unwrap().starts_with("mem_patch other: "),
+            "{out}"
+        );
+        assert!(
+            left[0].as_str().unwrap().contains("another writer"),
+            "{out}"
+        );
+        assert_eq!(
+            out["kept"],
+            json!(["channel {\"verb\":\"teleport\"}"]),
+            "{out}"
+        );
+        assert_eq!(fx.shared.hands(), Some(Hands::User));
+        let now = mem(
+            &mut session,
+            "mem_read",
+            json!({"token": "tok", "rva": buf, "type": "bytes", "len": 16}),
+        );
+        assert_eq!(
+            now["value"], "71 75 65 6e 2d 64 75 6d 6d 79 2d 42 55 66 01 02",
+            "a and b undone, kept still applied: {now}"
+        );
+        let journal = std::fs::read_to_string(fx.dir.join("data/state/journal.jsonl")).unwrap();
+        let b = journal.find("undo of mem_patch b at 0x").unwrap();
+        let a = journal.find("undo of mem_patch a at 0x").unwrap();
+        assert!(b < a, "newest first: {journal}");
+        assert!(
+            !journal.contains("undo of mem_patch other"),
+            "taken back: {journal}"
+        );
+        // With the user's hands, a drop changes nothing.
+        let again = dropped(&session);
+        assert_eq!(again, json!({"undone": [], "left": [], "kept": []}));
     }
 
     /// hands_take: refused without user_ok and while the agent has the controls; then it sorts the user's saves since

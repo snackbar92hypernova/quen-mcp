@@ -201,6 +201,12 @@ pub(crate) fn text<'v>(args: &'v Value, key: &str) -> Result<&'v str, String> {
         .ok_or(format!("{key} must be a string"))
 }
 
+/// The bytes a patch list's write holds as spaced hex (`old`, `new`).
+pub(crate) fn hex_bytes(v: &Value) -> Option<Vec<u8>> {
+    let bytes = v.as_str()?.split(' ');
+    bytes.map(|b| u8::from_str_radix(b, 16).ok()).collect()
+}
+
 /// An optional boolean argument, false when absent.
 pub(crate) fn flag(args: &Value, key: &str) -> Result<bool, String> {
     match args.get(key) {
@@ -276,8 +282,7 @@ impl Ctx<'_> {
             .iter()
             .map(|(_, patch)| &patch["write"])
             .find(|write| write["address"] == address)?;
-        let old = first["old"].as_str()?.split(' ');
-        old.map(|b| u8::from_str_radix(b, 16).ok()).collect()
+        hex_bytes(&first["old"])
     }
 
     /// game_keys' work, w3ctl.py's `keys`: the plan, then (unless a dry run) each key to the game's window while it is
