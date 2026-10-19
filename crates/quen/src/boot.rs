@@ -17,15 +17,13 @@ use quen_core::boot::{self, Change, Inputs, RenoDx};
 use quen_core::bridge_log;
 use quen_core::journal::sha256_hex;
 use quen_core::park::{self, Entry};
-use quen_core::protocol::Verb;
 use quen_core::saves;
 use serde_json::{Map, Value, json};
 
-use crate::channel::REPLY_MAX;
 use crate::config::Config;
 use crate::profile::{Profile, Tool};
 use crate::session::{Call, Done, JournalFs, Session, outside};
-use crate::{capture, doctor, game, profile, w3, win};
+use crate::{capture, channel, doctor, game, profile, w3, win};
 
 /// The boot switches `extra_env` may carry, as the harness named them.
 const EXTRA_ENV: &[&str] = &[
@@ -796,11 +794,8 @@ pub(crate) fn play(
             };
             next = Instant::now() + MENU_EVERY;
             if menu_open {
-                let load = Verb::Load {
-                    save: stem.clone().into_owned(),
-                };
                 let tried = match cx.channel() {
-                    Ok(channel) => channel.call(load, REPLY_MAX).map_err(|e| {
+                    Ok(channel) => channel::load(&cx, channel, &stem).map_err(|e| {
                         let why = json!({"ok": false, "why": e.why(), "game_text": e.game_text()});
                         (why, false)
                     }),
