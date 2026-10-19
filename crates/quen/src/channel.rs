@@ -203,8 +203,8 @@ pub fn tools() -> Vec<Value> {
     let game = "no game loaded (quen's state shows the main menu or a load)";
     let taints = "Journaled, and every save the game writes after it counts as tainted";
     let confirms = "Then reads the world back (as world_get) until it shows the change, for about 3 s; world is the \
-        last read-back. Failed, the change sent: not shown in time (the reason says when quen's state shows photo \
-        mode), or no read-back (unverified; quen-w3 0.1.4 and older have none).";
+        last read-back. Failed, the change sent: not shown in time (the reason names photo mode or quen's pause, \
+        after which a change not shown may still apply), or no read-back (unverified; quen-w3 0.1.4 and older have none).";
     let vec3 = |what: &str| json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": what});
     vec![
         json!({
@@ -417,8 +417,27 @@ fn confirm(cx: &Ctx, verb: &Verb, fields: &mut Fields) -> Result<(), String> {
         "the game didn't read back {what} in {:.1} s: world.{key} is what it read last",
         start.elapsed().as_secs_f32()
     );
-    if cx.last_flags().is_some_and(|f| f & PHOTO != 0) {
+    // A weather change not shown in photo mode or under quen's pause was applied once they ended (finding 31).
+    let (photo, paused) = (
+        cx.last_flags().is_some_and(|f| f & PHOTO != 0),
+        cx.live.paused.get(),
+    );
+    let ends = match (photo, paused) {
+        (true, true) => Some("photo mode closes and quen's pause lifts"),
+        (true, false) => Some("photo mode closes"),
+        (false, true) => Some("quen's pause lifts"),
+        (false, false) => None,
+    };
+    if photo {
         why += "; quen's state shows photo mode";
+    }
+    if paused {
+        why += "; quen's pause is on";
+    }
+    if let Some(ends) = ends {
+        why += &format!(
+            "; the change may still apply once {ends} (seen 2026-10-19): read world_get before you measure"
+        );
     }
     Err(why)
 }
@@ -879,6 +898,8 @@ pub(crate) mod tests {
             }),
         );
         let mut session = fx.session();
+        // Photo mode (flags 129) and quen's pause: both named, and the change said to be possibly pending (finding 31).
+        session.live.as_ref().unwrap().paused.set(true);
         let weather = json!({"token": "tok", "name": "WT_Mid_Clouds"});
         let out = run(&mut session, "game_weather", weather);
         assert_eq!(
@@ -889,6 +910,11 @@ pub(crate) mod tests {
         let why = out["reason"].as_str().unwrap();
         assert!(
             why.contains("WT_Mid_Clouds") && why.contains("photo mode"),
+            "{out}"
+        );
+        assert!(
+            why.contains("quen's pause is on")
+                && why.contains("may still apply once photo mode closes and quen's pause lifts"),
             "{out}"
         );
         assert_eq!(out["world"]["weather"], "WT_Clear", "{out}");
