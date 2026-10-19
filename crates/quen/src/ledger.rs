@@ -379,7 +379,7 @@ pub(crate) fn spill(
         win::random_hex(4).unwrap_or_default()
     ));
     let data = data.to_string();
-    fs::create_dir_all(&dir)
+    fs::create_dir_all(dir)
         .and_then(|()| fs::write(&file, &data))
         .map_err(|e| format!("{}: {e}", file.display()))?;
     artifacts.push(json!({"path": file, "sha256": sha256_hex(data.as_bytes())}));
