@@ -105,7 +105,9 @@ foreach ($p in $crates) {
 [IO.File]::WriteAllText($thirdParty, $sb.ToString(), [Text.UTF8Encoding]::new($false))
 
 Native python -I "$repo\w3\pack.py"
-$w3Version = [regex]::Match((Get-Content -Raw -LiteralPath "$repo\w3\pack.py"), '(?m)^VERSION = "([^"]+)"').Groups[1].Value
+# The release W3Quen.cpp names (kVersion), as pack.py reads it.
+$w3Version = [regex]::Match((Get-Content -Raw -LiteralPath "$repo\w3\asi\W3Quen.cpp"), 'kVersion\[\] = "([0-9.]+)"').Groups[1].Value
+if (-not $w3Version) { throw "release: no kVersion in w3\asi\W3Quen.cpp" }
 $w3Zip = "$repo\w3\out\quen-w3-$w3Version.zip"
 # Both files must be the build the doctor accepts as this version, or testers' doctors would call it the wrong one.
 $pinned = [regex]::Matches((Get-Content -Raw -LiteralPath "$repo\crates\quen\src\doctor.rs"),
