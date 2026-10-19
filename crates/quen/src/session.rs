@@ -29,7 +29,7 @@ use crate::hands::{self, Hands};
 use crate::mcp::{self, Conn, Msg};
 use crate::w3;
 use crate::win::{self, Child, Job, try_lock};
-use crate::{camera, disk, doctor, focus, game, measure, mem, profile, save};
+use crate::{camera, data, disk, doctor, focus, game, measure, mem, profile, save};
 
 /// What an unfinished harness session leaves, relative to the harness folder (ini_session.py's own `recover` list).
 const HARNESS_LEFTOVERS: &[&str] = &[
@@ -444,6 +444,9 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                         measure::call(&mut session, &mut call, n, &args)
                     }
                     n if n.starts_with("mem_") => mem::call(&mut session, &mut call, n, &args),
+                    n @ ("data_read" | "data_scan" | "script_compile") => {
+                        data::call(&mut session, &mut call, n, &args)
+                    }
                     _ => session.recover(&mut call, true),
                 };
                 let cancelled = call.stopped();
@@ -1706,7 +1709,7 @@ impl<'a> Session<'a> {
     /// parking folders it emptied go. Otherwise the journal stays for `session_recover`. Never while the game runs
     /// outside quen's job: it holds the files open and rewrites some as it exits. Needs the lock: a quen without it
     /// never gets here.
-    fn unwind(
+    pub(crate) fn unwind(
         &mut self,
         call: &mut Call,
         journal_to: &Path,

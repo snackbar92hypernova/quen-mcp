@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
-    camera, capture, channel, config, disk, doctor, focus, game, hands, ledger, measure, mem,
+    camera, capture, channel, config, data, disk, doctor, focus, game, hands, ledger, measure, mem,
     photo, save, setup,
 };
 
@@ -38,7 +38,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// sets another for its client; 0 waits for every call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 12] = [
+const LONG: [&str; 14] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -51,12 +51,15 @@ const LONG: [&str; 12] = [
     "mem_scan",
     "mem_find",
     "sweep_play",
+    "data_scan",
+    "script_compile",
 ];
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
 /// every unannotated call). Their own files there count as nothing changed: ledger_query's spill files, and the mem
-/// tools' results over 16 KB with their captures rows. world_get and game_listsaves read through the game's channel.
-const READ_ONLY: [&str; 16] = [
+/// and data tools' results over 16 KB with their captures rows. world_get and game_listsaves read through the game's
+/// channel.
+const READ_ONLY: [&str; 19] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -73,6 +76,9 @@ const READ_ONLY: [&str; 16] = [
     "mem_walk",
     "mem_find",
     "mem_regions",
+    "data_find",
+    "data_read",
+    "data_scan",
 ];
 
 /// A tool call for the session thread, a connection that closed, the config file changed (quen_setup wrote it, or a
@@ -560,6 +566,8 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                 "quen_doctor" => tool_result(&doctor::call(shared, &args)),
                 "quen_guide" => tool_result(&guide(shared, &args)),
                 "capture_usage" => tool_result(&disk::usage(shared, &args)),
+                // Tables of contents and folder listings only: beside a live session, from any connection.
+                "data_find" => tool_result(&data::find(shared, &args)),
                 name if name.starts_with("ledger_") => {
                     tool_result(&ledger::call(shared, name, &args))
                 }
@@ -901,6 +909,7 @@ pub(crate) fn tools() -> Value {
     list.push(photo::tool());
     list.extend(measure::tools());
     list.extend(mem::tools());
+    list.extend(data::tools());
     list.extend(ledger::tools());
     list.extend(disk::tools());
     let job = json!({

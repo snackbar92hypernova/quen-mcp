@@ -12,6 +12,8 @@
 //! capture_budget_gb = '20'                                       # optional, the default: GB of captures before quen
 //!                                                                # warns (capture_usage, capture_clean)
 //! kb = '%USERPROFILE%\Projects\witcher3-mods\re'                # optional: the RE KB the mem_* tools read
+//! redkit = '%REDKIT%'                                            # optional: The Witcher 3 REDkit's folder (script_compile,
+//!                                                                # the data tools' where: redkit)
 //! presentmon = '%PRESENTMON%'                                    # optional: PresentMon's console exe; unset: on PATH
 //! known_builds = 'steam <sha256> <label>; gog <sha256> <label>'   # optional: game builds verified here, beside the
 //!                                                                # adapter's own (quen_core::build::KnownBuilds)
@@ -80,6 +82,9 @@ pub struct Config {
     pub force_duplication: bool,
     /// The game's RE knowledge base: the per-build tables the `mem_*` tools and game_cvar read.
     pub kb: Option<PathBuf>,
+    /// The Witcher 3 REDkit's folder (its `bin\x64_RedKit\wcc_lite.exe`, its depot `r4data`): script_compile and the data
+    /// tools' `where: redkit`. The user installs it; quen never does.
+    pub redkit: Option<PathBuf>,
     /// PresentMon's console exe (a prerequisite, never bundled); unset: `PresentMon.exe` on PATH.
     pub presentmon: Option<PathBuf>,
     /// The game builds a launch accepts: the adapter's own ([`crate::w3::KNOWN_BUILDS`]), then `known_builds`.
@@ -218,6 +223,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
                 }
             }
             "kb" => config.kb = Some(value.into()),
+            "redkit" => config.redkit = Some(value.into()),
             "presentmon" => config.presentmon = Some(value.into()),
             "known_builds" => {
                 KnownBuilds::parse(value).map_err(|e| format!("{}: {e}", at()))?;
@@ -245,6 +251,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
         ),
         ("tracy_capture", &config.tracy_capture),
         ("kb", &config.kb),
+        ("redkit", &config.redkit),
         ("presentmon", &config.presentmon),
     ];
     for (key, value) in paths {

@@ -18,7 +18,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 ## What quen does on your PC
 
 **Programs it starts**
-- `witcher3.exe`, and around it Nsight Systems or Nsight Graphics if you configured them; PresentMon for the measure tools. Each runs inside a Windows Job Object. quen kills only what is in its job, never a program by name, so a copy of the game you started yourself is left alone.
+- `witcher3.exe`, and around it Nsight Systems or Nsight Graphics if you configured them; PresentMon for the measure tools; REDkit's `wcc_lite.exe` for `script_compile`. Each runs inside a Windows Job Object. quen kills only what is in its job, never a program by name, so a copy of the game you started yourself is left alone.
 - Each of them gets a short, fixed list of environment variables (Windows' own, and quen's), never your whole environment. An API key or token in your agent's environment doesn't reach the game, its mods, a profiler or PresentMon.
 - quen needs no admin rights. PresentMon needs your account in the Windows *Performance Log Users* group ([INSTALL.md](INSTALL.md) §1).
 - quen downloads and installs nothing. A launch's `stage` copies files already on your PC into the game folder for that session only.
@@ -31,6 +31,8 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 - It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back). A save you make while you have the controls is yours, and the session's end lists it.
 - It removes captures and its other leftovers (session logs, its ledger's backups) only through `capture_clean`, which your client asks you about on every call, as for a launch.
 - Its own data (the ledger, logs, captures, the journal) stays under its data root, `%USERPROFILE%\.quen\` by default.
+- The data tools (`data_find`, `data_read`, `data_scan`) read the game's bundles and REDkit's depot, and write nothing there.
+- `script_compile` runs wcc_lite on a copy of the scripts under the data root. wcc_lite writes its `wcc.log` in REDkit's `bin` folder, and rewrites `editoruser.settings` and `profile.settings` (and their `.bak`) in the game's documents folder: quen backs up every `*.settings` and `*.settings.bak` there first and puts them back after, journaled like a session's changes.
 
 **The game's memory**
 - quen reads the running game's memory (the `mem_*` tools, `game_cvar`).
@@ -69,7 +71,7 @@ Only your account can write these. A program running as you could change them, b
 
 | Input | What quen takes from it |
 |---|---|
-| The config file (`%USERPROFILE%\.quen\config.toml`, or the file `QUEN_CONFIG` names) | the game and data folders, and the programs quen starts (PresentMon, Nsight) |
+| The config file (`%USERPROFILE%\.quen\config.toml`, or the file `QUEN_CONFIG` names) | the game and data folders, and the programs quen starts (PresentMon, Nsight, REDkit's wcc_lite) |
 | The journal (`<data root>\state\journal.jsonl`) | what to move back, restore and send to the Recycle Bin after a crash. The replay checks hashes and file ids before it undoes a step. |
 | The RE knowledge base (`kb` in the config): `patches.tsv`, `cvar_layout.tsv` | which memory patches are allowed, and where a cvar's value lives in memory |
 | A PresentMon quen finds itself | without `presentmon` in the config, quen runs the newest `PresentMon-<version>-x64.exe` in its installer's folder under Program Files, else the first `PresentMon.exe` on your PATH. Set the config's absolute path instead. The measure tools return the path they ran, as `presentmon`. |

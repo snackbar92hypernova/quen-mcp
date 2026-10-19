@@ -16,3 +16,6 @@ rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 half = "2.7"
 png = "0.18"
 exr = "1.74"
+# The game-data readers: zlib entries and crc32s. Both were in the tree already (through png).
+flate2 = "1"
+crc32fast = "1"

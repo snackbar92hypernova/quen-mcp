@@ -58,7 +58,7 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     }
 }
 
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -115,8 +115,9 @@ pub enum Action {
         sha: String,
         file_id: String,
     },
-    /// The log a staged mod may write at `path`, where no file was at the launch. Undo: recycle it if it is there (the
-    /// end copies the boot's logs into the session's game-logs first).
+    /// A file that may appear at `path`, where none was when the journal began: the log a staged mod may write (the end
+    /// copies the boot's logs into the session's game-logs first), or a file wcc_lite writes in the game's documents
+    /// folder (script_compile). Undo: recycle it if it is there.
     NewLog { path: PathBuf },
     /// A mod folder about to be copied to `path` (`Mods\<name>`) from this PC, where nothing was at the launch
     /// (finding 38). Undo: recycle it if it is there, a copy cut off by a crash included: its source stays on the PC.
@@ -507,7 +508,7 @@ fn undo(
                 fs.recycle(path)?;
                 report.recycled.push(path.clone());
                 report.undone.push(format!(
-                    "removed {}, a staged mod's log (Recycle Bin)",
+                    "removed {}, new since the journal began (Recycle Bin)",
                     path.display()
                 ));
             }

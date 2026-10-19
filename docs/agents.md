@@ -105,6 +105,7 @@ This text is the `quen_guide` tool's `playbook` topic, compiled into the quen yo
 | Where does the time go? | Nsight Systems, Nsight Graphics GPU Trace, Tracy (all three through `profiler`) | Timing of the unprofiled game: a profiler boot is its own condition, with ReShade parked. GPU Trace locks the GPU clocks (`clocks_locked_to_base`), so its times are relative. Tracy times only what its hooks mark, and the hooks cost time. |
 | What was drawn, or bound? | RenderDoc (`profiler` `renderdoc:NAME`), the RenoDX devkit | The frame as the user plays it: the RenderDoc profile turns DLSS RR, path tracing and ray tracing off. Timing: the devkit roughly doubles frame time. |
 | What code is this? | REA / Ghidra (static), then `mem_*` and `game_cvar` reads (live) | What the code does at runtime, from the static reading alone: a live check counts only if it tests what the static reading predicts (REA, below). |
+| What does a game file hold, and which files import or name something? | quen's data tools: `data_find`, `data_read`, `data_scan` (below) | What the engine makes of it once loaded: a `mem` read counts as a second method only if it tests what the file predicts. |
 
 **Method families.** One name per method, not per tool, so two tools doing the same thing can't pass as two methods. Use this list. Don't invent a family to make a claim proven. `ledger_ingest` and `quen ledger add` refuse any other family, nothing written; `quen_doctor`'s `unknown_families` lists the rows an older quen took with another, which stay as written. Game data you read (files from the game's bundles) is `files`.
 
@@ -118,7 +119,7 @@ This text is the `quen_guide` tool's `playbook` topic, compiled into the quen yo
 | RenderDoc | quen: `session_launch` `profiler` `renderdoc:NAME`, then `game_screenshot` `method: "renderdoc"` | captures (quen writes the `.rdc` row), measurements | `renderdoc` | M |
 | REA / Ghidra, any disassembler, shader decompilers (DXC, the RenoDX devkit's) | its own MCP server, no boot | measurements (`boot_id` null, `extraction_id` when read from an imported REA record), re_refs | `static_re` | static_re |
 | Live memory: any read of the running game's memory, whichever tool made it (`mem_read` / `mem_scan` / `mem_follow` / `mem_walk` / `mem_find`, `game_cvar` reads, a read-only script of yours) | quen, or you | measurements, re_refs | `mem` | M |
-| Game scripts, mod configs, logs, read by you | you | measurements | `files` | O |
+| Game scripts, mod configs, logs, read by you; the game's data files (its bundles, REDkit's depot), read by you or quen's data tools | you, or quen | measurements | `files` | O |
 
 **Tags.**
 - **M:** measured or run.
@@ -292,6 +293,16 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 - **Links:** a `re_refs` row for each finding, and for the claim: `{"table": "re_refs", "target": {"measurement": 901}, "kb_path": "notes/<topic>.md"}` (the path relative to the KB root).
 
 ---
+
+### Game data and REDkit: quen's data tools
+
+- **Sources (`where`):** the game's bundles (`game`: `content\content0`'s; `mods`: `Mods\*\content`'s; `all`, the default) and REDkit's editor depot (`redkit`: the loose files under its `r4data`; needs `redkit` in quen's config). During a session a parked mod's bundles are gone: a read sees that boot's mod set.
+- **Copies:** a path can sit in several bundles (a mod's copy beside the game's). `data_find` lists every copy; when their crc32s differ, `data_read` needs `bundle`: which copy the game loads is unknown.
+- **`data_read`:** a CR2W file's tables and property tree. A type quen doesn't decode comes back raw; a crc or version mismatch is reported, not refused. Older CR2W files (REDkit's depot, versions 139 to 154): names and imports only.
+- **`data_scan`:** one names-level question (`has_names`, `lacks_names`, `imports`) over many files; `limit: 0` counts only. Names compare exactly; import paths ignore case.
+- **Recording:** `data_read` and `data_scan` return `evidence` (method_family `files`, tag O, a note with the bundle, path, sha256 and content build): a `measurements` row copies it. A static read and a live `mem` read of the same thing are two methods only when the live read tests what the file predicts (a value the engine computed, not the loaded file's bytes).
+- **Load:** `data_find` reads tables of contents and folder listings, from any connection, beside a session. `data_read` and `data_scan` run on the session thread, with the session's token while one is live. Not between a measurement's settle and its windows.
+- **`script_compile`:** REDkit's `wcc_lite compilescripts` on a copy of the game's and the mods' scripts under the data root. wcc_lite rewrites `editoruser.settings`, `profile.settings` and their `.bak` in the game's documents folder (2026-10-20: the same bytes, new write times, nothing else there); quen backs up every `*.settings` and `*.settings.bak` there first and puts them back after, journaled. Refused while a session is live. About 25 s on the game's scripts: tell the user first.
 
 ## 3. Two independent methods: how a claim becomes proven
 

@@ -95,7 +95,7 @@ pub enum Change {
         bytes: Vec<u8>,
         from: Option<PathBuf>,
     },
-    /// A staged mod's log, where no file is: the replay recycles whatever the game wrote there.
+    /// A file where none is (a staged mod's log; a file wcc_lite writes): the replay recycles whatever was written there.
     NewLog { path: PathBuf },
     /// Copy the mod folder `from` (on this PC) to `dest` in Mods, where nothing is ([`stage_mods`]): the replay
     /// recycles the copy.

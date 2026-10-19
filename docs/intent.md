@@ -140,7 +140,7 @@ The ledger is a SQLite database under the data root, never in git. Big files sta
 
 ### Claims and proof
 
-Each measurement names its method family, one name per method rather than per tool, so two tools doing the same thing can't pass as two methods: PresentMon, Tracy, Nsight, RenderDoc, the RenoDX devkit, quen's screenshots, static reverse engineering, live memory, and files read by the agent. Each also carries a tag: measured, observed in code or files, static reverse engineering, inferred, or unverified. Only the first three count towards proof.
+Each measurement names its method family, one name per method rather than per tool, so two tools doing the same thing can't pass as two methods: PresentMon, Tracy, Nsight, RenderDoc, the RenoDX devkit, quen's screenshots, static reverse engineering, live memory, and files read by the agent or by quen's data tools. Each also carries a tag: measured, observed in code or files, static reverse engineering, inferred, or unverified. Only the first three count towards proof.
 
 A claim is proven while it is open, has support from at least two distinct method families, and has no standing contradiction. A contradiction stands until two families support the claim again from boots that started after the contradicting one. Grades written by a knowledge-base author are kept as labels; they never count as proof.
 
@@ -215,7 +215,7 @@ Reverse engineering a game binary is expensive, and its results get lost between
 
 ### Setup and paths
 
-quen keeps its config, ledger, logs and captures under `%USERPROFILE%\.quen`. It avoids AppData on purpose: Windows redirects AppData for packaged apps such as Claude Desktop and everything they start, so two clients would see two different ledgers and two locks. `quen_setup` finds the game (Steam's library folders and manifests, GOG's registry entry) and the optional tools, shows what it found with where each value came from, and writes only what the user confirms. `quen_doctor` is read-only: it lists every dependency as found, missing or the wrong version, what each one enables, and where to get it. A session needs the game at a known build, the Witcher Native Bridge and quen's package; PresentMon, the profilers, ReShade, RenoDX and its devkit each enable their own tools.
+quen keeps its config, ledger, logs and captures under `%USERPROFILE%\.quen`. It avoids AppData on purpose: Windows redirects AppData for packaged apps such as Claude Desktop and everything they start, so two clients would see two different ledgers and two locks. `quen_setup` finds the game (Steam's library folders and manifests, GOG's registry entry) and the optional tools, shows what it found with where each value came from, and writes only what the user confirms. `quen_doctor` is read-only: it lists every dependency as found, missing or the wrong version, what each one enables, and where to get it. A session needs the game at a known build, the Witcher Native Bridge and quen's package; PresentMon, the profilers, ReShade, RenoDX and its devkit, and REDkit each enable their own tools.
 
 ### Core and adapters
 

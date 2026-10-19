@@ -7,6 +7,7 @@ pub mod build; // the build pin: PE stamp, exe sha256, known builds, the gate, t
 pub mod cvar; // config vars found by name in a memory image, read, and their writes planned (cvar_poke's port)
 pub mod detect; // the game found in Steam's libraries and GOG's registry entries, as candidates
 pub mod disk; // the capture root on disk: usage by boot, kind and age, and a cleanup's plan
+pub mod gamedata; // the game's bundles and CR2W files (and REDkit's depot), read-only, and the data tools' questions
 pub mod hdr; // half float -> scRGB -> BT.2020 PQ, 16-bit PNG with cICP, EXR, .npy
 pub mod input; // w3ctl key tokens and input plans, console_type lines and its prompt check
 pub mod journal; // append-only session journal and replay
@@ -21,3 +22,4 @@ pub mod seeds; // names.tsv -> REA seed file
 pub mod settings; // dx12user.settings overrides (W3_SETTINGS / W3_SECTION_SETTINGS semantics)
 pub mod stats; // PresentMon command line, CSV stats and the A/B verdict
 pub mod sweep; // camera sweeps: data model, the reference interpolation the cam.path verb ports, frame schedules
+pub mod wcc; // REDkit's wcc_lite compilescripts: its log's script messages, import stubs, the settings it rewrites

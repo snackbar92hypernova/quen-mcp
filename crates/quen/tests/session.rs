@@ -659,7 +659,10 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
     let copy = logs.unwrap().join(r"game-logs\W3Test.log");
     assert_eq!(fs::read_to_string(copy).unwrap(), "the staged mod's log");
     let undone = ended["replay"]["undone"].to_string();
-    assert!(undone.contains("W3Test.log, a staged mod's log"), "{ended}");
+    assert!(
+        undone.contains("W3Test.log, new since the journal began"),
+        "{ended}"
+    );
     fx.assert_restored();
     for gone in ["W3Test.asi", "W3Test.log", "W3Fake.log"] {
         assert!(!bin.join(gone).exists(), "{gone}");
