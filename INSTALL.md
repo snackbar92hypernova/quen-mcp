@@ -216,7 +216,7 @@ Nothing to set for time: its tool timeout is about 28 hours.
 2. Open Codex. Its `quen mcp` connects to that `quen serve`.
 3. When you're done, press Ctrl+C in that terminal: a live session ends the normal way, then `quen serve` exits. Don't close the terminal window during a session: Windows gives a closing console only 5 s.
 
-The terminal must run the same `quen.exe` as Codex's `command` (both ends check). Tested against a simulated Codex job, and with real Codex CLI for read-only calls; a launch through Codex is untested. Details: [docs/clients.md](docs/clients.md#clients-that-hold-servers-in-a-job-object). Codex's entry, in `%USERPROFILE%\.codex\config.toml`:
+The terminal must run the same `quen.exe` as Codex's `command` (both ends check). Tested with Codex CLI 0.163.0-alpha.10.2: a launch, in-game calls, `session_end`, and closing Codex mid-session. Details: [docs/clients.md](docs/clients.md#clients-that-hold-servers-in-a-job-object). Codex's entry, in `%USERPROFILE%\.codex\config.toml`:
 
 ```toml
 [mcp_servers.quen]
@@ -224,9 +224,14 @@ command = "quen"
 args = ["mcp"]
 startup_timeout_sec = 30
 tool_timeout_sec = 120
+default_tools_approval_mode = "approve"
+
+[mcp_servers.quen.tools.session_launch]
+approval_mode = "prompt"
 ```
 
 - `tool_timeout_sec`: quen answers within about 20 s (then `job_status`), so 120 leaves room. Codex's default is 60 or 300 s depending on the version.
+- **Approvals.** Without `default_tools_approval_mode`, Codex asks before every quen tool (quen marks none of its tools read-only), so during a launch you would switch from the game to Codex for each call. With the entry above, only `session_launch` asks: Codex shows an approval card each time. Use a Codex permission mode that asks, not Full access: there Codex refuses every tool that needs approval, including the launch.
 - Codex passes only a short list of environment variables to servers. If you set `QUEN_CONFIG`, add `env_vars = ["QUEN_CONFIG"]`, or `env = { QUEN_CONFIG = '<path>' }`, and set the same `QUEN_CONFIG` in the terminal that runs `quen serve --stay`: with another config, Codex's `quen mcp` looks for another `quen serve`.
 
 **VS Code (Copilot agent mode).** In your user `mcp.json` (Command Palette: *MCP: Open User Configuration*) or a workspace's `.vscode\mcp.json`:

@@ -70,6 +70,10 @@ quen's daemon (`quen serve`) must outlive the client process, so a closed client
    args = ["mcp"]
    startup_timeout_sec = 30
    tool_timeout_sec = 120
+   default_tools_approval_mode = "approve"
+
+   [mcp_servers.quen.tools.session_launch]
+   approval_mode = "prompt"
    ```
 3. When you're done, press Ctrl+C in that terminal: a live session ends the normal way (saves first, the game closed, everything put back), then the daemon exits. Closing the terminal window instead gives it only 5 s (Windows' limit for a closing console, [HandlerRoutine][handler]); a session end that takes longer is cut off, and the game closes with the daemon, as when any `quen serve` exits (the next `quen serve` replays the journal it left).
 
@@ -77,7 +81,11 @@ quen's daemon (`quen serve`) must outlive the client process, so a closed client
 - Its log goes to that terminal, not to `logs\serve.log` under the data root.
 - A second `quen serve --stay` for the same config refuses and changes nothing. So does one started while a daemon another client started is still running: it exits 5 s after its last client.
 - Tested against a simulated Codex job (kill on close, no breakaway; test `a_relay_in_a_no_breakaway_job_uses_a_stay_daemon`).
-- With real Codex CLI 0.163.0-alpha.10.2 (2026-10-19): its `quen mcp` ran under `codex.exe`, connected to a running `quen serve`, and answered `session_status` and `quen_guide`. That `quen serve` was one another client had started, not a `--stay`. Not yet tried with real Codex: a `--stay` daemon on its own, a launch, a call long enough to answer with a job. Not tried with the Python SDK.
+- With real Codex CLI 0.163.0-alpha.10.2 (2026-10-19), on a `quen serve --stay` started in PowerShell:
+  - `session_plan`, then `session_launch`: it answered `{job}` after 20 s, and `job_status` returned the launch's result about 46 s after the call; then `world_get`, `game_screenshot`, `focus` both ways and `session_end`, which restored every file it had changed.
+  - Closing Codex during a live session: quen ended it the normal way (the boot's outcome `ok`, every patched file back to its sha256 from before the launch), and the `--stay` daemon kept running.
+  - Not tried with the Python SDK.
+- **Codex's approvals.** Codex decides per tool call from the server's tool annotations ([mcp_tool_call.rs][codex-approval], `requires_mcp_tool_approval`): a tool needs approval unless it is marked read-only, or marked both not destructive and not open-world. quen marks none of its tools, so by default Codex asks before every quen call, and during a launch the user switches from the game to Codex for each one (quen can't see a client's prompt, so `focus` can't bring it up). Under the approval policy `never` (Codex's Full access), a call that needs approval is refused ("MCP tool call requires approval, but approval policy is never"): checked 2026-10-19, `game_screenshot` and `focus` were refused. With `default_tools_approval_mode = "approve"` and `session_launch` on `"prompt"` (the entry above), only the launch asked: Codex showed its approval card, and every other call ran without one (2026-10-19).
 
 ## Conformance (2026-10-18, no game)
 
@@ -102,6 +110,7 @@ They can't start a local stdio server: they need a public HTTPS endpoint (stream
 [codex-compact]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/tools/src/json_schema/compaction.rs
 [codex-launch]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/rmcp-client/src/stdio_server_launcher.rs
 [codex-job]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/utils/pty/src/win/job.rs
+[codex-approval]: https://github.com/openai/codex/blob/18d09e1eda6811effcb4acc110795eec7e970135/codex-rs/core/src/mcp_tool_call.rs
 [handler]: https://learn.microsoft.com/en-us/windows/console/handlerroutine
 [agents-py]: https://github.com/openai/openai-agents-python/blob/v0.24.0/src/agents/agent.py
 [py-job]: https://github.com/modelcontextprotocol/python-sdk/blob/v2.3.0/src/mcp/os/win32/utilities.py
