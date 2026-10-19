@@ -2,7 +2,8 @@
 //! and `mem_unpatch`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
 //! access only, on the pid from the session's job (never "the first witcher3.exe"). [`Ctx::write`] journals a planned
 //! write, then makes it with a handle open for that write only. game_cvar and measure_ab's cvar actions (game.rs) go
-//! through the same two.
+//! through the same two. Every result ends in [`result`]: where its addresses lie, its provenance, and a big one in a
+//! captures file.
 
 use std::cmp::Reverse;
 use std::ffi::c_void;
@@ -12,11 +13,13 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use quen_core::journal::sha256_hex;
+use quen_core::ledger::Capture;
 use quen_core::mem::{
-    self, Field, Filter, Image, Kind, Memory, Op, Pattern, Region, Scope, Section, Type, Walk,
-    Which, Write,
+    self, Elements, Field, Filter, Find, Image, Kind, Memory, Module, Op, Pattern, Region, Scope,
+    Section, Type, Walk, Which, Write,
 };
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -34,7 +37,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::doctor;
 use crate::game::{self, Ctx, Fields, ctx, flag, text};
 use crate::ledger::{self, INLINE_BYTES};
-use crate::session::{Call, Done, Session};
+use crate::session::{self, Call, Done, Session};
 
 /// A scan or find page's hits when the call gives no `limit`.
 const LIMIT: usize = 100;
@@ -72,6 +75,23 @@ pub fn tools() -> Vec<Value> {
         no-cache (0x200) regions. Default false. Measured on one PC on 2026-10-19: 13.42 of the game's 21.06 GB \
         readable was private 0x404, read at 107 MB/s against 2,390 MB/s for private 0x4, and frame times rose while it \
         was read"});
+    let fields = json!({"type": "array", "minItems": 1, "description": "what to read from each struct", "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "its key in each row"},
+            "offset": {"type": "string", "description": "from the struct's start (mem_find: the hit), before it when \
+                negative: a number or (-)0x hex"},
+            "type": ty,
+            "len": len,
+        },
+        "required": ["name", "offset", "type"],
+        "additionalProperties": false,
+    }});
+    let filter = json!({"type": "object", "description": "keep only the rows that match", "properties": {
+        "field": {"type": "string", "description": "a field's name"},
+        "eq": {"type": "string", "description": "the field holds this: a number, 0x hex, a float, or hex bytes"},
+        "ne": {"type": "string", "description": "the field doesn't hold this (0: nonzero)"},
+    }, "required": ["field"], "additionalProperties": false});
     let name = json!({"type": "string", "description": "a patch's name in the KB's patches.tsv"});
     let patch = |verb: &str, does: &str| {
         json!({
@@ -81,7 +101,8 @@ pub fn tools() -> Vec<Value> {
                 aligned qword, old and new the same length), or live bytes other than expected (another build or \
                 another writer); with needs: no KB in the local config or no patches.tsv in it, or a GOG install \
                 (the KB is Steam 5.01's). \
-                The write is journaled first and taints saves the game writes after it."),
+                The write is journaled first and taints saves the game writes after it. Numbers and provenance as \
+                mem_read's."),
             "inputSchema": schema(json!({"name": name}), &["name"]),
         })
     };
@@ -90,7 +111,11 @@ pub fn tools() -> Vec<Value> {
             "name": "mem_read",
             "description": "Read the running game's memory: one little-endian number, or 1 to 4096 raw bytes as hex. \
                 The game is the one in the session's job, with read access only. Give address, or rva (from the \
-                game's image base, as the KB writes them).",
+                game's image base, as the KB writes them). Every mem_* result gives addresses, ptr and u64 values as \
+                0x hex and an i64 as a decimal string; beside an address in the game's image its rva (rva, or \
+                <key>_rva), beside one in another module that module and the offset (module, or <key>_module: \
+                name+0xoffset); image_base, build (the PE stamp) and read_at (UTC); state.world. mem_read, mem_walk \
+                and mem_find give bytes_sha256: the sha256 of the bytes read, in address order.",
             "inputSchema": schema(json!({
                 "address": number("where"),
                 "rva": number("where, from the game's image base"),
@@ -105,11 +130,11 @@ pub fn tools() -> Vec<Value> {
                 sections of the game's image (.text, .rdata, .data), region bases (mem_regions lists them), kinds \
                 (image, mapped, private); by default every readable region. The scope leaves out the regions whose \
                 protect has 0x400 (write-combined) or 0x200 (no-cache) unless uncached: true; a region named in \
-                regions is searched whatever its protect. left_out counts the regions and bytes left out, which may \
-                hold hits. Don't search during a PresentMon window. One page of hits (default 100, at most 1000); \
-                pass next as from for the page after. deadline_s (default 60, at most 600) ends a page early: stopped \
-                says why, next where to go on. A region that can't be read whole is read page by page: skipped lists \
-                the pages that couldn't be read, so may hold hits nobody saw. A match never spans two regions.",
+                regions is searched whatever its protect. left_out counts the regions and bytes left out, which may hold hits. Don't \
+                search during a PresentMon window. One page of hits (default 100, at most 1000); pass next as from \
+                for the page after. deadline_s (default 60, at most 600) ends a page early: stopped says why, next where to go on. \
+                skipped lists the pages that couldn't be read. A match never spans two regions. Numbers and \
+                provenance as mem_read's; over 16 KB, as mem_find's.",
             "inputSchema": schema(json!({
                 "pattern": {"type": "string", "description": "bytes in hex, ?? or 4? for any byte or nibble"},
                 "mask": {"type": "string", "description": "hex, one byte per pattern byte"},
@@ -126,18 +151,22 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "mem_find",
-            "description": "Search the running game's memory for a 64-bit value at 8-byte-aligned addresses, each hit \
-                with up to context bytes before and after it (default 16, at most 256), cut at the edges of its \
-                region. The game is the one in the session's job, with read access only. Scope as mem_scan's, one of \
-                sections, regions and kinds; by default the image and private regions. As mem_scan, it leaves out \
-                write-combined and no-cache regions unless uncached: true or named in regions, and left_out counts \
-                them. One page of hits (default 100, at most 1000); pass next as from for the page after. deadline_s \
-                (default 60, at most 600) ends a page early: stopped says why, next where to go on. skipped lists the \
-                pages that couldn't be read, so may hold hits nobody saw. A result over 16 KB comes back as its first \
-                hits and the path of a JSON file holding all of it.",
+            "description": "Search the running game's memory for 64-bit values at 8-byte-aligned addresses: value, or \
+                values (up to 64) in one pass. Each hit gives value (the one it matched) and up to context bytes \
+                before and after it (default 16, at most 256), cut at its region's edges; fields are read at each \
+                hit, at offsets from it, as mem_walk reads them; filter drops hits as mem_walk's drops rows. Scope \
+                as mem_scan's, one of sections, regions and kinds; by default the image and private regions; \
+                write-combined and no-cache regions left out as by mem_scan. One page of hits (default 100, at most \
+                1000, counted before filter); pass next as from for the page after. deadline_s (default 60, at most \
+                600) ends a page early: stopped says why, next where to go on. skipped lists the pages that couldn't be read. Numbers and \
+                provenance as mem_read's. A result over 16 KB comes back as its first hits and the path of a JSON \
+                file holding all of it, a captures row (ledger.captures).",
             "inputSchema": schema(json!({
                 "value": number("the qword to find"),
+                "values": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64, "description": "qwords to find in one pass: numbers or 0x hex"},
                 "context": {"type": "integer", "minimum": 0, "maximum": 256, "description": "bytes before and after each hit, default 16"},
+                "fields": fields,
+                "filter": filter,
                 "sections": sections,
                 "regions": regions,
                 "kinds": kinds,
@@ -145,13 +174,14 @@ pub fn tools() -> Vec<Value> {
                 "from": number("search from"),
                 "limit": limit,
                 "deadline_s": deadline,
-            }), &["value"]),
+            }), &[]),
         }),
         json!({
             "name": "mem_follow",
             "description": "Follow a 64-bit pointer chain in the running game: each hop adds its offset to the pointer \
                 so far and reads the qword there. offsets [a, b] from base give [[base + a] + b]. Returns every hop \
-                read, then end (the last value) or where and why it broke. Give base, or rva (from the image base).",
+                read, then end (the last value) or where and why it broke. Give base, or rva (from the image base). \
+                Numbers and provenance as mem_read's.",
             "inputSchema": schema(json!({
                 "base": number("where the chain starts"),
                 "rva": number("where it starts, from the game's image base"),
@@ -160,39 +190,25 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "mem_walk",
-            "description": "Read an array of structs in the running game, with read access only: count elements stride \
-                bytes apart from address, or rva (from the image base), or the end of the pointer chain offsets from \
-                there (as mem_follow). fields are read from each element or, with deref, from the struct at the end of \
-                that pointer chain from it. One row per element: index, address, target (deref's struct), each field \
-                (ptr as 0x hex, bytes as hex), or why it couldn't be read. filter keeps the rows where one field holds \
-                (eq) or doesn't hold (ne) a value, compared as the field's bytes; rows with why stay. Refused, nothing \
-                read: count over 100000, stride over 65536, a field past the stride (with deref: past 65536 bytes), \
-                over 16 MiB to read in all (per element: its fields' span, 8 bytes per deref hop), a broken offsets \
-                chain. A result over 16 KB comes back as its first rows and the path of a JSON file holding all of it.",
+            "description": "Read structs in the running game, with read access only: count elements stride bytes apart \
+                from address, or rva (from the image base), or the end of the pointer chain offsets from there (as \
+                mem_follow); or the places in addresses, in their order. fields are read from each element or, with \
+                deref, from the struct at the end of that pointer chain from it. One row per element: index (its \
+                position), address, target (deref's struct), each field, or why it couldn't be read. filter keeps the \
+                rows where one field holds (eq) or doesn't hold (ne) a value, compared as the field's bytes; rows \
+                with why stay. Refused, nothing read: past the limits quen_guide lists. Numbers and provenance as \
+                mem_read's; over 16 KB, as mem_find's.",
             "inputSchema": schema(json!({
                 "address": number("the first element"),
                 "rva": number("the first element, from the game's image base"),
                 "offsets": chain("a pointer chain from address or rva, followed first: the array starts at its end"),
                 "stride": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "bytes from one element to the next"},
                 "count": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "how many elements"},
+                "addresses": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100000, "description": "the elements, instead of address or rva, offsets, stride and count: numbers or 0x hex"},
                 "deref": chain("a pointer chain from each element to the struct its fields are in, as mem_follow's offsets"),
-                "fields": {"type": "array", "minItems": 1, "description": "what to read from each struct", "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "its key in each row"},
-                        "offset": number("from the struct's start"),
-                        "type": ty,
-                        "len": len,
-                    },
-                    "required": ["name", "offset", "type"],
-                    "additionalProperties": false,
-                }},
-                "filter": {"type": "object", "description": "keep only the rows that match", "properties": {
-                    "field": {"type": "string", "description": "a field's name"},
-                    "eq": {"type": "string", "description": "the field holds this: a number, 0x hex, a float, or hex bytes"},
-                    "ne": {"type": "string", "description": "the field doesn't hold this (0: nonzero)"},
-                }, "required": ["field"], "additionalProperties": false},
-            }), &["stride", "count", "fields"]),
+                "fields": fields,
+                "filter": filter,
+            }), &["fields"]),
         }),
         json!({
             "name": "mem_regions",
@@ -201,8 +217,8 @@ pub fn tools() -> Vec<Value> {
                 (image, mapped, private), protection and image section, most bytes first; largest, the 16 biggest \
                 regions. protect is Windows' PAGE_* value as 0x hex; mem_scan and mem_find leave out by default the \
                 regions whose protect has 0x400 (write-combined) or 0x200 (no-cache). list: true adds every region in \
-                address order (base, size, kind, protect, section). A result over 16 KB comes back as its first regions and the \
-                path of a JSON file holding all of it.",
+                address order (base, size, kind, protect, section). Numbers and provenance as mem_read's; over \
+                16 KB, as mem_find's.",
             "inputSchema": schema(json!({
                 "list": {"type": "boolean", "description": "true: every region too. Default false"},
             }), &[]),
@@ -240,14 +256,20 @@ pub(crate) struct Process {
     handle: OwnedHandle,
     /// The game's image: its build stamp, and the sections its regions are named by.
     pub(crate) image: Image,
+    /// Its modules as the call began, in address order: where a result's addresses lie ([`mem::place`]).
+    modules: Vec<Module>,
 }
 
 impl Process {
     /// Opens `pid` for reading, and reads the headers of its image `exe`.
     pub(crate) fn open(pid: u32, exe: &str) -> Result<Process, String> {
-        let base = game::module_base(pid, exe)
-            .map_err(|e| format!("modules of pid {pid}: {e}"))?
-            .ok_or(format!("{exe} is not loaded in pid {pid}"))? as u64;
+        let mut modules = game::modules(pid).map_err(|e| format!("modules of pid {pid}: {e}"))?;
+        modules.sort_by_key(|m| m.base);
+        let base = modules
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(exe))
+            .ok_or(format!("{exe} is not loaded in pid {pid}"))?
+            .base;
         let handle = open(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
             .map_err(|e| format!("open pid {pid} for reading: {e}"))?;
         let image = Image {
@@ -255,7 +277,12 @@ impl Process {
             stamp: String::new(),
             sections: Vec::new(),
         };
-        let mut process = Process { pid, handle, image };
+        let mut process = Process {
+            pid,
+            handle,
+            image,
+            modules,
+        };
         process.image = mem::image(&process, base).map_err(|e| format!("{exe}'s headers: {e}"))?;
         Ok(process)
     }
@@ -597,9 +624,10 @@ fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let ty = ty(args)?;
     let game = cx.game()?;
     let address = address(&game, args, "address")?;
-    let value = mem::read(&game, address, ty).map_err(|e| format!("{address:#x}: {e}"))?;
+    let (value, bytes) = mem::read(&game, address, ty).map_err(|e| format!("{address:#x}: {e}"))?;
     call.lap("read");
-    Ok(fields(json!({"address": address, "value": value})))
+    let out = json!({"address": format!("{address:#x}"), "value": value, "bytes_sha256": sha256_hex(&bytes)});
+    result(&cx, call, &game, "mem_read", args, out, None)
 }
 
 fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -648,7 +676,14 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     )
     .map_err(|e| format!("the game's regions: {e}"))?;
     call.lap("scan");
-    Ok(fields(json!(page)))
+    let hits: Vec<Value> = page
+        .hits
+        .iter()
+        .map(|a| json!({"address": format!("{a:#x}")}))
+        .collect();
+    let mut out = json!(page);
+    out["hits"] = json!(hits);
+    result(&cx, call, &game, "mem_scan", args, out, Some("hits"))
 }
 
 fn follow(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -658,13 +693,16 @@ fn follow(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Do
     let base = address(&game, args, "base")?;
     let chain = mem::follow(&game, base, &offsets);
     call.lap("follow");
-    Ok(fields(json!(chain)))
+    result(&cx, call, &game, "mem_follow", args, json!(chain), None)
 }
 
 fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let known = [
         "value",
+        "values",
         "context",
+        "fields",
+        "filter",
         "sections",
         "regions",
         "kinds",
@@ -674,49 +712,68 @@ fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         "deadline_s",
     ];
     let cx = checked(session, args, &known)?;
-    let value = args.get("value").and_then(unsigned);
-    let value = value.ok_or_else(|| String::from("value must be a number or 0x hex of 64 bits"))?;
+    let values = match (args.get("value"), args.get("values")) {
+        (Some(v), None) => vec![
+            unsigned(v)
+                .ok_or_else(|| String::from("value must be a number or 0x hex of 64 bits"))?,
+        ],
+        (None, Some(v)) => v
+            .as_array()
+            .and_then(|a| a.iter().map(unsigned).collect())
+            .ok_or_else(|| {
+                String::from("values must be an array of numbers or 0x hex of 64 bits")
+            })?,
+        _ => return Err("give value or values, one of them".to_string().into()),
+    };
     let context = match args.get("context") {
         Some(v) => v
             .as_u64()
             .ok_or_else(|| String::from("context must be a whole number"))?,
         None => CONTEXT,
     };
+    let (fields, filter) = layout(args)?;
+    let f = Find {
+        values,
+        context,
+        fields,
+        filter,
+    };
     let scope = scope(args, Which::Kinds(vec![Kind::Image, Kind::Private]))?;
     let (from, limit) = paging(args)?;
     let budget = deadline(args)?;
     let game = cx.game()?;
     let mut tick = ticker(call, budget);
-    let page = mem::find(&game, value, &scope, from, limit, context, &mut tick);
+    let found = mem::find(&game, &f, &scope, from, limit, &mut tick);
     drop(tick);
-    let page = page.map_err(|e| format!("the game's regions: {e}"))?;
+    let (page, sha) = found?;
     call.lap("find");
-    inline(&cx, call, fields(json!(page)), "hits")
+    let mut out = json!(page);
+    out["bytes_sha256"] = json!(sha);
+    result(&cx, call, &game, "mem_find", args, out, Some("hits"))
 }
 
-fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let known = [
-        "address", "rva", "offsets", "stride", "count", "deref", "fields", "filter",
-    ];
-    let cx = checked(session, args, &known)?;
-    let whole = |key: &str| {
-        let n = args.get(key).and_then(Value::as_u64);
-        n.ok_or(format!("{key} must be a whole number"))
+/// The `fields` and `filter` in `args`, for mem_walk and mem_find: none without them.
+fn layout(args: &Value) -> Result<(Vec<Field>, Option<Filter>), String> {
+    let wanted = match args.get("fields") {
+        None => &[][..],
+        Some(v) => v
+            .as_array()
+            .ok_or("fields must be an array of {name, offset, type}")?
+            .as_slice(),
     };
-    let (stride, count) = (whole("stride")?, whole("count")?);
-    let wanted = args.get("fields").and_then(Value::as_array);
-    let wanted =
-        wanted.ok_or_else(|| String::from("fields must be an array of {name, offset, type}"))?;
-    let mut columns = Vec::new();
+    let mut fields = Vec::new();
     for f in wanted {
         ledger::object(f, &["name", "offset", "type", "len"])
             .map_err(|e| format!("fields: {e}"))?;
         let name = text(f, "name").map_err(|e| format!("fields: {e}"))?;
-        let offset = f.get("offset").and_then(unsigned);
-        let offset = offset.ok_or(format!("field {name}: offset must be a number or 0x hex"))?;
+        let offset = f.get("offset").and_then(signed);
+        let offset = offset.and_then(|o| i64::try_from(o).ok());
+        let offset = offset.ok_or(format!(
+            "field {name}: offset must be a number or (-)0x hex"
+        ))?;
         let ty = ty(f).map_err(|e| format!("field {name}: {e}"))?;
         let name = name.into();
-        columns.push(Field { name, offset, ty });
+        fields.push(Field { name, offset, ty });
     }
     let filter = match args.get("filter") {
         None => None,
@@ -726,7 +783,7 @@ fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             let (eq, value) = match (f.get("eq"), f.get("ne")) {
                 (Some(v), None) => (true, v),
                 (None, Some(v)) => (false, v),
-                _ => return Err("filter: give eq or ne, one of them".to_string().into()),
+                _ => return Err("filter: give eq or ne, one of them".into()),
             };
             let value = value
                 .as_str()
@@ -734,34 +791,85 @@ fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             Some(Filter { field, eq, value })
         }
     };
+    Ok((fields, filter))
+}
+
+fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let known = [
+        "address",
+        "rva",
+        "offsets",
+        "stride",
+        "count",
+        "addresses",
+        "deref",
+        "fields",
+        "filter",
+    ];
+    let cx = checked(session, args, &known)?;
+    let (fields, filter) = layout(args)?;
     let deref = match args.get("deref") {
         Some(_) => offsets(args, "deref")?,
         None => Vec::new(),
     };
-    let chain = match args.get("offsets") {
-        Some(_) => offsets(args, "offsets")?,
-        None => Vec::new(),
+    let listed = match args.get("addresses") {
+        None => None,
+        Some(_)
+            if ["address", "rva", "offsets", "stride", "count"]
+                .iter()
+                .any(|k| args.get(k).is_some()) =>
+        {
+            let why = "addresses instead of address or rva, offsets, stride and count";
+            return Err(why.to_string().into());
+        }
+        Some(v) => Some(
+            v.as_array()
+                .and_then(|a| a.iter().map(unsigned).collect::<Option<Vec<u64>>>())
+                .ok_or_else(|| String::from("addresses must be an array of numbers or 0x hex"))?,
+        ),
+    };
+    let whole = |key: &str| {
+        let n = args.get(key).and_then(Value::as_u64);
+        n.ok_or(format!("{key} must be a whole number"))
     };
     let game = cx.game()?;
-    let start = address(&game, args, "address")?;
-    let followed = mem::follow(&game, start, &chain);
-    let base = followed.end.ok_or_else(|| {
-        let why = followed.broken.map(|b| b.why).unwrap_or_default();
-        format!("offsets: {why}")
-    })?;
+    let mut out = json!({});
+    let elements = match listed {
+        Some(list) => Elements::List(list),
+        None => {
+            let (stride, count) = (whole("stride")?, whole("count")?);
+            let chain = match args.get("offsets") {
+                Some(_) => offsets(args, "offsets")?,
+                None => Vec::new(),
+            };
+            let start = address(&game, args, "address")?;
+            let followed = mem::follow(&game, start, &chain);
+            let base = followed.end.ok_or_else(|| {
+                let why = followed.broken.map(|b| b.why).unwrap_or_default();
+                format!("offsets: {why}")
+            })?;
+            out["base"] = json!(format!("{base:#x}"));
+            Elements::Array {
+                base,
+                stride,
+                count,
+            }
+        }
+    };
     let w = Walk {
-        base,
-        stride,
-        count,
+        elements,
         deref,
-        fields: columns,
+        fields,
         filter,
     };
-    let rows = mem::walk(&game, &w)?;
+    let (rows, sha) = mem::walk(&game, &w)?;
     call.lap("walk");
     let errors = rows.iter().filter(|r| r.contains_key("why")).count();
-    let out = json!({"base": base, "row_count": rows.len(), "errors": errors, "rows": rows});
-    inline(&cx, call, fields(out), "rows")
+    out["row_count"] = json!(rows.len());
+    out["errors"] = json!(errors);
+    out["rows"] = json!(rows);
+    out["bytes_sha256"] = json!(sha);
+    result(&cx, call, &game, "mem_walk", args, out, Some("rows"))
 }
 
 fn regions(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -785,21 +893,49 @@ fn regions(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, D
     if list {
         out["list"] = json!(all);
     }
-    inline(&cx, call, fields(out), "list")
+    result(&cx, call, &game, "mem_regions", args, out, Some("list"))
 }
 
-/// `out` as it is or, over [`INLINE_BYTES`], all of it in a file (`file`, in the call's artifacts) and inline only the
-/// first of its `list` that fit (`truncated`), as ledger_query does.
-fn inline(cx: &Ctx, call: &mut Call, out: Fields, list: &str) -> Result<Fields, Done> {
-    let data = Value::Object(out);
-    if data.to_string().len() <= INLINE_BYTES {
-        return Ok(fields(data));
+/// A mem tool's result: `out` with where each of its addresses lies ([`mem::place`]), its provenance (`image_base`,
+/// `build`, `read_at`) and the world in its `state` (`measurements.world`'s words). With `list`, a result over
+/// [`INLINE_BYTES`] goes whole to `<tool>-<secs>-<random>.json` in the session's capture folder, under a `header` (the
+/// tool, the call's arguments less its token, the boot, the build, the image base, `read_at`), with a captures row
+/// (`ledger.captures`); inline only the first of its `list` that fit (`truncated`, `file`).
+fn result(
+    cx: &Ctx,
+    call: &mut Call,
+    game: &Process,
+    tool: &str,
+    args: &Value,
+    mut out: Value,
+    list: Option<&str>,
+) -> Result<Fields, Done> {
+    mem::place(&mut out, game.image.base, &game.modules);
+    let now = SystemTime::now();
+    out["image_base"] = json!(format!("{:#x}", game.image.base));
+    out["build"] = json!(game.image.stamp);
+    out["read_at"] = json!(session::utc_ms(now));
+    out["state"] = json!({"world": crate::measure::world(cx)});
+    let Some(list) = list.filter(|_| out.to_string().len() > INLINE_BYTES) else {
+        return Ok(fields(out));
+    };
+    let mut args = args.clone();
+    if let Some(args) = args.as_object_mut() {
+        args.remove("token");
     }
-    // spill lists the file in a list of its own; the call's artifacts are Call::artifact's, which hashes it again.
+    let header = json!({
+        "tool": tool, "args": args, "boot": cx.live.boot, "build": out["build"], "image_base": out["image_base"],
+        "read_at": out["read_at"],
+    });
+    let mut data = out.clone();
+    data["header"] = header;
     let dir = cx.config.capture_root().join(&cx.live.id);
-    let file = ledger::spill(&dir, &data, &mut Vec::new())?;
+    // spill lists the file with its sha256 in a list of its own; the call's artifacts are Call::artifact's, which hashes
+    // it again.
+    let mut listed = Vec::new();
+    let file = ledger::spill(&dir, &format!("{tool}-"), &data, &mut listed)?;
     call.artifact(&file);
-    let mut out = fields(data);
+    let mut out = fields(out);
     if let Some(Value::Array(items)) = out.get_mut(list) {
         let mut size = 0;
         let fit = items.iter().take_while(|item| {
@@ -811,7 +947,32 @@ fn inline(cx: &Ctx, call: &mut Call, out: Fields, list: &str) -> Result<Fields, 
     }
     out.insert("truncated".into(), json!(true));
     out.insert("file".into(), json!(file));
-    Ok(out)
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    let row = Capture {
+        boot_id: Some(cx.live.boot),
+        path: format!("{}/{name}", cx.live.id),
+        sha256: listed[0]["sha256"].as_str().unwrap_or_default().into(),
+        bytes: fs::metadata(&file).map_or(0, |m| m.len() as i64),
+        kind: "json".into(),
+        method: Some(tool.into()),
+        t: session::utc(now),
+        ..Capture::default()
+    };
+    let added = session::open_ledger(cx.config)
+        .and_then(|mut l| l.add_capture(&row).map_err(session::ledger_error));
+    match added {
+        Ok(id) => {
+            call.row("captures", id);
+            Ok(out)
+        }
+        Err(why) => {
+            let why = format!(
+                "{}: written, but no captures row was added: {why}",
+                file.display()
+            );
+            Err(Done::Failed(why, out))
+        }
+    }
 }
 
 fn patch(session: &Session, call: &mut Call, args: &Value, op: Op) -> Result<Fields, Done> {
@@ -824,20 +985,23 @@ fn patch(session: &Session, call: &mut Call, args: &Value, op: Op) -> Result<Fie
     let w = mem::plan(&patches, name, op, &image.stamp, image.base, &game)
         .map_err(|r| format!("{name}: {r}"))?;
     call.lap("plan");
-    let what = match op {
-        Op::Patch => format!("mem_patch {name}"),
-        Op::Unpatch => format!("mem_unpatch {name}"),
+    let tool = match op {
+        Op::Patch => "mem_patch",
+        Op::Unpatch => "mem_unpatch",
     };
+    let what = format!("{tool} {name}");
     let mut fields = Map::new();
-    fields.insert("build".into(), json!(image.stamp));
     cx.write(&game, &what, &w, &mut fields)?;
+    // Its address as mem results write addresses. ponytail: the journal's patch list and a failed write's fields keep
+    // the number (hands.rs and game_cvar read it back).
+    fields["write"]["address"] = json!(format!("{:#x}", w.address));
     call.lap("write");
     let mut now = vec![0; w.new.len()];
     match game.read(w.address, &mut now) {
         Ok(()) => fields.insert("now".into(), json!(mem::Value::Bytes(now))),
         Err(e) => fields.insert("now".into(), json!(format!("can't read it back: {e}"))),
     };
-    Ok(fields)
+    result(&cx, call, &game, tool, args, Value::Object(fields), None)
 }
 
 #[cfg(test)]
@@ -1001,6 +1165,25 @@ pub(crate) mod tests {
         cell_address - this_exe().1.base
     }
 
+    /// A 0x string's number.
+    fn hex(v: &Value) -> u64 {
+        let text = v.as_str().unwrap_or_else(|| panic!("not a string: {v}"));
+        mem::number(text).unwrap() as u64
+    }
+
+    /// `n` as a result writes it.
+    fn x(n: u64) -> Value {
+        json!(format!("{n:#x}"))
+    }
+
+    /// What every mem result carries: the image base, the build, when it was read, the world.
+    fn provenance(out: &Value, image: &Image) {
+        assert_eq!(out["image_base"], x(image.base), "{out}");
+        assert_eq!(out["build"], image.stamp, "{out}");
+        assert!(out["read_at"].as_str().unwrap().ends_with('Z'), "{out}");
+        assert_eq!(out["state"]["world"], "live", "{out}");
+    }
+
     #[test]
     fn reads_scans_and_follows_in_the_dummy_game() {
         let fx = Fake::new("memread");
@@ -1009,6 +1192,7 @@ pub(crate) mod tests {
         let game = cx.game().unwrap();
         assert_ne!(game.pid, std::process::id());
         assert_eq!(game.image.stamp, mine.stamp);
+        let image = &game.image;
         let buf = game.image.base + rva(BUF.address());
         let regions = game.regions().unwrap();
         let at = regions
@@ -1021,6 +1205,7 @@ pub(crate) mod tests {
             "{at:?}"
         );
 
+        // Addresses as 0x hex, with the RVA beside one in the game's image; the bytes' sha256.
         let out = fx.run(
             "mem_read",
             json!({"token": "tok", "rva": rva(BUF.address()), "type": "bytes", "len": 16}),
@@ -1029,33 +1214,65 @@ pub(crate) mod tests {
             out["value"], "71 75 65 6e 2d 64 75 6d 6d 79 2d 62 75 66 01 02",
             "{out}"
         );
+        assert_eq!(
+            (&out["address"], &out["rva"]),
+            (&x(buf), &x(rva(BUF.address())))
+        );
+        assert_eq!(out["bytes_sha256"], sha256_hex(&BUF.initial().0));
+        provenance(&out, image);
         let out = fx.run(
             "mem_read",
             json!({"token": "tok", "address": format!("{:#x}", buf + 14), "type": "u16"}),
         );
         assert_eq!(out["value"], 0x0201, "{out}");
+        // In another module: its name and the offset.
+        let ntdll = game::module_base(game.pid, "ntdll.dll").unwrap().unwrap() as u64;
+        let out = fx.run(
+            "mem_read",
+            json!({"token": "tok", "address": ntdll + 2, "type": "u8"}),
+        );
+        assert_eq!(
+            (&out["module"], out.get("rva")),
+            (&json!("ntdll.dll+0x2"), None),
+            "{out}"
+        );
         let scan = fx.run(
             "mem_scan",
             json!({"token": "tok", "ascii": "quen-dummy-buf", "sections": [".data"]}),
         );
-        assert_eq!(scan["hits"], json!([buf]), "{scan}");
+        assert_eq!(
+            scan["hits"],
+            json!([{"address": x(buf), "rva": x(rva(BUF.address()))}]),
+            "{scan}"
+        );
+        provenance(&scan, image);
         let page = fx.run(
             "mem_scan",
             json!({"token": "tok", "pattern": "71 75 65 6e 2d ?? 75", "limit": 1}),
         );
         assert_eq!(page["hits"].as_array().unwrap().len(), 1, "{page}");
-        assert!(page["next"].is_u64(), "a full page names the next: {page}");
+        assert!(
+            page["next"].is_string(),
+            "a full page names the next: {page}"
+        );
         let hop = rva(HOP.address());
         let chain = fx.run(
             "mem_follow",
             json!({"token": "tok", "rva": format!("{hop:#x}"), "offsets": [0, "0x8"]}),
         );
         let second = u64::from_le_bytes(BUF.initial().0[8..].try_into().unwrap());
+        let first = &chain["hops"][0];
         assert_eq!(
-            (chain["end"].as_u64(), chain["hops"][0]["value"].as_u64()),
-            (Some(second), Some(buf)),
+            (
+                &chain["end"],
+                &first["value"],
+                &first["value_rva"],
+                &first["at_rva"]
+            ),
+            (&x(second), &x(buf), &x(rva(BUF.address())), &x(hop)),
             "{chain}"
         );
+        provenance(&chain, image);
 
         // BUF as two 8-byte elements, at the end of a chain from HOP.
         let walked = fx.run(
@@ -1065,14 +1282,17 @@ pub(crate) mod tests {
                 {"name": "last", "offset": "0x7", "type": "u8"},
             ]}),
         );
-        assert_eq!(walked["base"], buf, "{walked}");
+        assert_eq!(walked["base"], x(buf), "{walked}");
+        let r = rva(BUF.address());
         assert_eq!(
             walked["rows"],
             json!([
-                {"index": 0, "address": buf, "head": "71 75 65 6e", "last": 0x6d},
-                {"index": 1, "address": buf + 8, "head": "6d 79 2d 62", "last": 0x02},
+                {"index": 0, "address": x(buf), "rva": x(r), "head": "71 75 65 6e", "last": 0x6d},
+                {"index": 1, "address": x(buf + 8), "rva": x(r + 8), "head": "6d 79 2d 62", "last": 0x02},
             ])
         );
+        assert_eq!(walked["bytes_sha256"], sha256_hex(&BUF.initial().0));
+        provenance(&walked, image);
         // HOP's two pointers, as they are, filtered, and followed to their structs.
         let hops = game.image.base + hop;
         let ptr = json!([{"name": "p", "offset": 0, "type": "ptr"}]);
@@ -1084,8 +1304,9 @@ pub(crate) mod tests {
             fx.run("mem_walk", args)
         };
         let pointers = on_hop(json!({"fields": ptr}));
-        let p = |row: usize| pointers["rows"][row]["p"].clone();
-        assert_eq!((p(0), p(1)), (json!(format!("{buf:#x}")), json!("0x0")));
+        let p = |row: usize, key: &str| pointers["rows"][row][key].clone();
+        assert_eq!((p(0, "p"), p(1, "p")), (x(buf), json!("0x0")));
+        assert_eq!((p(0, "p_rva"), p(1, "p_rva")), (x(r), Value::Null));
         let nonzero = on_hop(json!({"fields": ptr, "filter": {"field": "p", "ne": 0}}));
         assert_eq!(nonzero["row_count"], 1, "{nonzero}");
         let head = json!([{"name": "head", "offset": 0, "type": "bytes", "len": 4}]);
@@ -1093,31 +1314,62 @@ pub(crate) mod tests {
         let rows = &derefs["rows"];
         assert_eq!(
             (&rows[0]["target"], &rows[0]["head"]),
-            (&json!(buf), &json!("71 75 65 6e"))
+            (&x(buf), &json!("71 75 65 6e"))
         );
         assert_eq!(
             (&rows[1]["target"], &derefs["errors"]),
-            (&json!(0), &json!(1))
+            (&json!("0x0"), &json!(1))
         );
         assert!(
             rows[1]["why"].as_str().unwrap().contains("at 0x0"),
             "{derefs}"
         );
-        // Over 16 KB: all rows in a file, the first inline.
+        // Over 16 KB: all rows in a file with a header, a captures row for it, the first rows inline.
         let q = json!([{"name": "q", "offset": 0, "type": "u64"}]);
-        let image = json!({"token": "tok", "address": game.image.base, "stride": 8, "count": 2000, "fields": q});
-        let big = fx.run("mem_walk", image);
+        let image_args = json!({"token": "tok", "address": game.image.base, "stride": 8, "count": 2000, "fields": q});
+        let big = fx.run("mem_walk", image_args);
         assert_eq!(big["truncated"], true, "{}", big["reason"]);
         let file = big["file"].as_str().unwrap();
         let text = fs::read_to_string(file).unwrap();
-        assert_eq!(
-            big["artifacts"],
-            json!([{"path": file, "sha256": quen_core::journal::sha256_hex(text.as_bytes())}])
-        );
+        let sha = sha256_hex(text.as_bytes());
+        assert_eq!(big["artifacts"], json!([{"path": file, "sha256": sha}]));
         let all: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             (all["rows"].as_array().unwrap().len(), &big["row_count"]),
             (2000, &json!(2000))
+        );
+        let header = &all["header"];
+        assert_eq!(
+            (&header["tool"], &header["boot"], &header["image_base"]),
+            (&json!("mem_walk"), &json!(1), &x(image.base)),
+            "{header}"
+        );
+        assert_eq!(header["args"]["count"], 2000, "{header}");
+        assert!(header["args"].get("token").is_none(), "{header}");
+        assert_eq!(
+            (&header["build"], &header["read_at"]),
+            (&big["build"], &big["read_at"])
+        );
+        let name = Path::new(file).file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("mem_walk-"), "{name}");
+        let id = &big["ledger"]["captures"][0];
+        let ledger =
+            quen_core::ledger::Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
+        let sql = "SELECT path, sha256, bytes, kind, method, boot_id FROM captures WHERE id = ?1";
+        let row = ledger
+            .query(sql, std::slice::from_ref(id), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            row.rows,
+            [[
+                json!(format!("s1/{name}")),
+                json!(sha),
+                json!(text.len()),
+                json!("json"),
+                json!("mem_walk"),
+                json!(1)
+            ]],
+            "{big}"
         );
         let inline = big["rows"].as_array().unwrap().len();
         assert!(0 < inline && inline < 2000, "{inline}");
@@ -1128,11 +1380,13 @@ pub(crate) mod tests {
         );
         let hit = &found["hits"][0];
         assert_eq!(
-            (&hit["address"], &hit["after"]),
-            (&json!(hops), &json!("00 00 00 00 00 00 00 00")),
+            (&hit["address"], &hit["rva"], &hit["after"]),
+            (&x(hops), &x(hop), &json!("00 00 00 00 00 00 00 00")),
             "{found}"
         );
-        assert_eq!(found["next"], hops + 1);
+        assert_eq!((&hit["value"], &hit["value_rva"]), (&x(buf), &x(r)));
+        assert_eq!(found["next"], x(hops + 1));
+        provenance(&found, image);
 
         for args in [
             json!({"count": 0, "fields": ptr}),
@@ -1140,6 +1394,7 @@ pub(crate) mod tests {
             json!({"fields": [{"name": "p", "type": "ptr"}]}),
             json!({"fields": ptr, "filter": {"field": "p", "eq": 0, "ne": 0}}),
             json!({"fields": ptr, "deref": "0"}),
+            json!({"fields": ptr, "addresses": [hops]}),
         ] {
             assert_eq!(on_hop(args.clone())["refused"], true, "{args}");
         }
@@ -1155,6 +1410,9 @@ pub(crate) mod tests {
             json!({"token": "tok"}),
             json!({"token": "tok", "value": "x"}),
             json!({"token": "tok", "value": 1, "context": -1}),
+            json!({"token": "tok", "value": 1, "values": [2]}),
+            json!({"token": "tok", "values": []}),
+            json!({"token": "tok", "values": ["x"]}),
         ] {
             assert_eq!(fx.run("mem_find", args.clone())["refused"], true, "{args}");
         }
@@ -1191,6 +1449,77 @@ pub(crate) mod tests {
         );
     }
 
+    /// mem_find with values: each hit says which it matched, its fields read before and after it, a filter that
+    /// drops hits; mem_walk with addresses: the places in their order.
+    #[test]
+    fn finds_values_and_walks_lists_in_the_dummy_game() {
+        let fx = Fake::new("memvalues");
+        let session = fx.session();
+        let game = ctx(&session, &json!({"token": "tok"}), &[])
+            .unwrap()
+            .game()
+            .unwrap();
+        let live = |cell: u64| game.image.base + rva(cell);
+        // HOP[0] holds BUF's address; VAR.group holds GROUP's, between VAR.name (before) and VAR.default (after).
+        let (buf, group) = (live(BUF.address()), live(GROUP.as_ptr() as u64));
+        let (hop, var) = (live(HOP.address()), live(VAR.address()));
+        let at_group = var + offset_of!(DummyVar, group) as u64;
+        let name = live(NAME.as_ptr() as u64) + 1;
+        let find = |more: Value| {
+            let mut args = json!({"token": "tok", "values": [x(buf), x(group)], "sections": [".data"], "context": 0,
+            "fields": [
+                {"name": "name", "offset": "-0x8", "type": "ptr"},
+                {"name": "default", "offset": "0x8", "type": "f32"},
+            ]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(more.as_object().unwrap().clone());
+            let out = fx.run("mem_find", args);
+            assert_eq!(out["ok"], true, "{out}");
+            out
+        };
+        let out = find(json!({}));
+        let hit = |at: u64| {
+            let hits = out["hits"].as_array().unwrap();
+            hits.iter().find(|h| hex(&h["address"]) == at).cloned()
+        };
+        let (on_hop, on_var) = (hit(hop).unwrap(), hit(at_group).unwrap());
+        assert_eq!(
+            (&on_hop["value"], &on_hop["default"]),
+            (&x(buf), &json!(0.0)),
+            "{out}"
+        );
+        assert_eq!(
+            (&on_var["value"], &on_var["name"], &on_var["default"]),
+            (&x(group), &x(name), &json!(20.0)),
+            "{out}"
+        );
+        assert_eq!(on_var["name_rva"], x(rva(NAME.as_ptr() as u64) + 1));
+        assert!(out["bytes_sha256"].as_str().unwrap().len() == 64, "{out}");
+        let kept = find(json!({"filter": {"field": "default", "eq": "20"}}));
+        let hits = kept["hits"].as_array().unwrap();
+        assert!(
+            hits.iter().any(|h| hex(&h["address"]) == at_group)
+                && hits
+                    .iter()
+                    .all(|h| h["default"] == 20.0 || h.get("why").is_some()),
+            "{kept}"
+        );
+
+        let walked = fx.run(
+            "mem_walk",
+            json!({"token": "tok", "addresses": [x(var), buf, x(hop)], "fields": [{"name": "q", "offset": 0, "type": "u64"}]}),
+        );
+        let rows = walked["rows"].as_array().unwrap();
+        let places: Vec<(u64, u64)> = rows
+            .iter()
+            .map(|r| (r["index"].as_u64().unwrap(), hex(&r["address"])))
+            .collect();
+        assert_eq!(places, [(0, var), (1, buf), (2, hop)], "{walked}");
+        assert_eq!(rows[2]["q"], x(buf), "{walked}");
+        assert!(walked.get("base").is_none(), "{walked}");
+    }
+
     #[test]
     fn patches_write_only_over_their_bytes_and_are_journaled() {
         let fx = Fake::new("mempatch");
@@ -1213,6 +1542,12 @@ pub(crate) mod tests {
         };
         let on = fx.run("mem_patch", json!({"token": "tok", "name": "dummy"}));
         assert_eq!(on["ok"], true, "{on}");
+        assert_eq!(on["write"]["rva"], x(at), "{on}");
+        assert_eq!(hex(&on["write"]["address"]) - hex(&on["image_base"]), at);
+        assert_eq!(
+            (&on["build"], &on["state"]["world"]),
+            (&json!(mine.stamp), &json!("live"))
+        );
         assert_eq!(
             (on["now"].clone(), on["write"]["old"].clone()),
             (json!("51 55 45 4e"), json!("71 75 65 6e"))
@@ -1343,7 +1678,7 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .find(|r| {
-                let base = r["base"].as_u64().unwrap();
+                let base = hex(&r["base"]);
                 base <= buf && buf < base + r["size"].as_u64().unwrap()
             })
             .unwrap();
@@ -1364,12 +1699,12 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|h| h["address"].as_u64().unwrap())
+            .map(|h| hex(&h["address"]))
             .collect();
         assert!(hits.contains(&hop), "{found}");
         let (lo, hi) = (
-            data["base"].as_u64().unwrap(),
-            data["base"].as_u64().unwrap() + data["size"].as_u64().unwrap(),
+            hex(&data["base"]),
+            hex(&data["base"]) + data["size"].as_u64().unwrap(),
         );
         assert!(hits.iter().all(|h| (lo..hi).contains(h)), "{found}");
         let mapped = fx.run(
@@ -1382,17 +1717,15 @@ pub(crate) mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|h| h["address"] == hop),
+                .any(|h| hex(&h["address"]) == hop),
             "{mapped}"
         );
         let image = fx.run(
             "mem_scan",
             tok(json!({"ascii": "quen-dummy-buf", "kinds": ["image"]})),
         );
-        assert!(
-            image["hits"].as_array().unwrap().contains(&json!(buf)),
-            "{image}"
-        );
+        let hits = image["hits"].as_array().unwrap();
+        assert!(hits.iter().any(|h| hex(&h["address"]) == buf), "{image}");
         for (tool, args) in [
             (
                 "mem_find",
@@ -1443,7 +1776,7 @@ pub(crate) mod tests {
             args_map.extend(more.as_object().unwrap().clone());
             let out = fx.run("mem_find", args);
             let hits = out["hits"].as_array().unwrap().iter();
-            let hits: Vec<u64> = hits.map(|h| h["address"].as_u64().unwrap()).collect();
+            let hits: Vec<u64> = hits.map(|h| hex(&h["address"])).collect();
             (hits, out)
         };
         let none = json!({"regions": 0, "bytes": 0});
@@ -1464,7 +1797,7 @@ pub(crate) mod tests {
         );
         let hits = scan["hits"].as_array().unwrap();
         assert!(
-            !hits.iter().any(|h| bases.contains(&h.as_u64().unwrap())),
+            !hits.iter().any(|h| bases.contains(&hex(&h["address"]))),
             "{scan}"
         );
         assert!(left(&scan, "regions") >= 2, "{scan}");

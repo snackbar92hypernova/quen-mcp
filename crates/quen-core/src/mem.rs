@@ -2,6 +2,9 @@
 //! `mem.patch` / `mem.unpatch`), against a [`Memory`] trait the Windows layer implements with VirtualQueryEx and
 //! ReadProcessMemory.
 //!
+//! Results give addresses, pointers and u64 values as 0x hex strings and i64 values as decimal strings (a JSON number
+//! loses precision past 2^53 in a JavaScript client); [`place`] then names where each address lies.
+//!
 //! Nothing here writes. A patch [`plan`] checks the KB definition (`patches.tsv`) and the live bytes, and returns the one
 //! [`Write`] allowed, or a [`Refusal`]. The platform layer journals it as an
 //! [`Action::GameMemory`](crate::journal::Action::GameMemory) record (its time taints later saves), then makes it with a
@@ -15,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::build::Stamp;
+use crate::journal::sha256_hex;
 use crate::seeds::{rva, tsv_rows};
 
 /// A process's memory, read only: the game quen's job started, or a fake in tests.
@@ -28,6 +32,7 @@ pub trait Memory {
 /// One readable region, as VirtualQueryEx reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Region {
+    #[serde(serialize_with = "hex::number")]
     pub base: u64,
     pub size: u64,
     pub kind: Kind,
@@ -175,25 +180,25 @@ impl Type {
     }
 }
 
-/// A value read. It serializes as a JSON number (serde_json writes a NaN or an infinity as `null`), a pointer as 0x
-/// hex, or raw bytes as spaced hex.
+/// A value read. It serializes as a JSON number (serde_json writes a NaN or an infinity as `null`), a pointer or a u64
+/// as 0x hex, an i64 as a decimal string, or raw bytes as spaced hex.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Value {
     U8(u8),
     U16(u16),
     U32(u32),
-    U64(u64),
+    U64(#[serde(serialize_with = "hex::number")] u64),
     I32(i32),
-    I64(i64),
+    I64(#[serde(serialize_with = "hex::decimal")] i64),
     F32(f32),
     F64(f64),
     Ptr(#[serde(serialize_with = "hex::number")] u64),
     Bytes(#[serde(with = "hex")] Vec<u8>),
 }
 
-/// Reads one value of type `ty` at `address`.
-pub fn read(mem: &dyn Memory, address: u64, ty: Type) -> io::Result<Value> {
+/// Reads one value of type `ty` at `address`: the value, and the bytes it was read from.
+pub fn read(mem: &dyn Memory, address: u64, ty: Type) -> io::Result<(Value, Vec<u8>)> {
     if let Type::Bytes(len) = ty
         && !(1..=MAX_BYTES).contains(&len)
     {
@@ -202,7 +207,7 @@ pub fn read(mem: &dyn Memory, address: u64, ty: Type) -> io::Result<Value> {
     }
     let mut b = vec![0; ty.size()];
     mem.read(address, &mut b)?;
-    Ok(ty.decode(&b))
+    Ok((ty.decode(&b), b))
 }
 
 /// A whole number in text: decimal, or `0x` hex, either with a `-` before it.
@@ -222,12 +227,14 @@ fn sized<const N: usize>(b: &[u8]) -> [u8; N] {
 }
 
 /// A byte pattern: memory matches at `i` where `(byte ^ bytes[i]) & mask[i] == 0`, at addresses that are a multiple
-/// of `align`. It always has a fixed bit.
+/// of `align`; or, built by [`Pattern::qwords`], where the qword is one of `qwords`. It always has a fixed bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     bytes: Vec<u8>,
     mask: Vec<u8>,
     align: u64,
+    /// The values a qword pattern matches, sorted; empty for any other pattern.
+    qwords: Vec<u64>,
 }
 
 impl Pattern {
@@ -281,13 +288,17 @@ impl Pattern {
         Self::new(bytes, mask)
     }
 
-    /// A qword's little-endian bytes, at 8-byte-aligned addresses only.
-    pub fn qword(value: u64) -> Self {
-        let (bytes, mask) = (value.to_le_bytes().into(), vec![0xff; 8]);
+    /// Any of `values` (one or more) as a little-endian qword, at 8-byte-aligned addresses only.
+    pub fn qwords(values: &[u64]) -> Self {
+        let mut qwords = values.to_vec();
+        qwords.sort_unstable();
+        qwords.dedup();
+        let bytes = qwords.first().copied().unwrap_or(0).to_le_bytes().into();
         Self {
             bytes,
-            mask,
+            mask: vec![0xff; 8],
             align: 8,
+            qwords,
         }
     }
 
@@ -301,10 +312,17 @@ impl Pattern {
             bytes,
             mask,
             align: 1,
+            qwords: Vec::new(),
         })
     }
 
     fn matches(&self, at: &[u8]) -> bool {
+        if !self.qwords.is_empty() {
+            return self
+                .qwords
+                .binary_search(&u64::from_le_bytes(sized(at)))
+                .is_ok();
+        }
         at.iter()
             .zip(&self.bytes)
             .zip(&self.mask)
@@ -312,8 +330,8 @@ impl Pattern {
     }
 
     /// Calls `each` with the address of every match that starts in `b` (read at `at`) and lies wholly in it, ascending,
-    /// until `each` breaks. Only aligned starts are tried; a whole qword at 8-byte alignment is one u64 compare, any
-    /// other pattern first checks its most-fixed byte.
+    /// until `each` breaks. Only aligned starts are tried; a qword pattern is one u64 compare against the range of its
+    /// values, then a search of them, any other pattern first checks its most-fixed byte.
     fn hits(
         &self,
         at: u64,
@@ -326,10 +344,10 @@ impl Pattern {
         };
         let first = (at.next_multiple_of(self.align) - at) as usize;
         let starts = (first..=last).step_by(self.align as usize);
-        if self.align == 8 && n == 8 && self.mask.iter().all(|&m| m == 0xff) {
-            let want = u64::from_le_bytes(sized(&self.bytes));
+        if let (Some(&lo), Some(&hi)) = (self.qwords.first(), self.qwords.last()) {
             for i in starts {
-                if u64::from_le_bytes(sized(&b[i..i + 8])) == want {
+                let q = u64::from_le_bytes(sized(&b[i..i + 8]));
+                if (lo..=hi).contains(&q) && self.qwords.binary_search(&q).is_ok() {
                     each(at + i as u64)?;
                 }
             }
@@ -394,9 +412,10 @@ pub const PAGE: u64 = 0x1000;
 /// One page of scan hits, and what the page covered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ScanPage<H = u64> {
-    /// Where the pattern matches, ascending ([`find`]'s: with their context).
+    /// Where the pattern matches, ascending ([`find`]'s: rows, with their context).
     pub hits: Vec<H>,
     /// The `from` of the next page when this one is full or stopped; `None` when the scope is done.
+    #[serde(serialize_with = "hex::option")]
     pub next: Option<u64>,
     /// Why the page stopped before its scope was done, when its tick said so (`deadline`, `cancelled`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -423,6 +442,7 @@ pub struct LeftOut {
 /// A part of the scope that wasn't read, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Skipped {
+    #[serde(serialize_with = "hex::number")]
     pub base: u64,
     /// 0 when the region wasn't listed at all.
     pub size: u64,
@@ -512,66 +532,78 @@ pub fn scan(
     Ok(page)
 }
 
-/// The most context bytes a [`find`] hit has on each side.
+/// The most context bytes a [`find`] hit has on each side, and the most values one find looks for.
 pub const MAX_CONTEXT: u64 = 256;
+pub const MAX_VALUES: usize = 64;
 
-/// A [`find`] hit, and the bytes before and after its qword.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Found {
-    pub address: u64,
-    #[serde(with = "hex")]
-    pub before: Vec<u8>,
-    #[serde(with = "hex")]
-    pub after: Vec<u8>,
-    /// Why the context couldn't be read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub why: Option<String>,
+/// What [`find`] looks for, and what it reads at each hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Find {
+    /// The qwords to find: 1 to [`MAX_VALUES`].
+    pub values: Vec<u64>,
+    /// Bytes on each side of a hit's qword (clamped to [`MAX_CONTEXT`]), cut at the edges of its region.
+    pub context: u64,
+    /// Read at each hit, at offsets from its address; none, or as [`walk`] reads them.
+    pub fields: Vec<Field>,
+    pub filter: Option<Filter>,
 }
 
-/// [`scan`]'s page for the qword `value` at 8-byte-aligned addresses in `scope`, each hit with up to `context` bytes
-/// (clamped to [`MAX_CONTEXT`]) on each side, cut at the edges of its region.
+/// [`scan`]'s page for `f`'s values at 8-byte-aligned addresses in `scope`. Each hit is a row: `{address, value,
+/// before, after, <field>: value, ...}` (`value`: the one it matched, the qword there), or `{address, why}` when its
+/// bytes can't be read; the filter drops rows, never a `why` one. With the page, the sha256 of the bytes its rows were
+/// read from ([`digest`]). Err: refused, nothing read; or the regions couldn't be listed.
 pub fn find(
     mem: &dyn Memory,
-    value: u64,
+    f: &Find,
     scope: &Scope,
     from: u64,
     limit: usize,
-    context: u64,
     tick: &mut dyn FnMut(u64, u64) -> ControlFlow<&'static str>,
-) -> io::Result<ScanPage<Found>> {
-    let page = scan(mem, &Pattern::qword(value), scope, from, limit, tick)?;
-    let regions = mem.regions()?;
-    let n = context.min(MAX_CONTEXT);
-    let hits = page
-        .hits
-        .iter()
-        .map(|&address| {
-            let region = regions
-                .iter()
-                .find(|r| r.base <= address && address < r.base + r.size);
-            let (lo, hi) = region.map_or((address, address + 8), |r| {
-                let hi = address.saturating_add(8 + n).min(r.base + r.size);
-                (address.saturating_sub(n).max(r.base), hi)
-            });
-            let mut b = vec![0; (hi - lo) as usize];
-            let at = (address - lo) as usize;
-            match mem.read(lo, &mut b) {
-                Ok(()) => Found {
-                    address,
-                    before: b[..at].to_vec(),
-                    after: b[at + 8..].to_vec(),
-                    why: None,
-                },
-                Err(e) => Found {
-                    address,
-                    before: Vec::new(),
-                    after: Vec::new(),
-                    why: Some(e.to_string()),
-                },
+) -> Result<(ScanPage<Row>, String), String> {
+    let n = f.values.len();
+    if !(1..=MAX_VALUES).contains(&n) {
+        return Err(format!("{n} values: a find takes 1 to {MAX_VALUES}"));
+    }
+    let keys = [
+        "address", "value", "before", "after", "why", "rva", "module",
+    ];
+    let room = "0x10000 from the hit";
+    let layout = Layout::new(&f.fields, f.filter.as_ref(), MAX_STRIDE, room, &keys)?;
+    let listed = |e: io::Error| format!("the regions: {e}");
+    let pattern = Pattern::qwords(&f.values);
+    let page = scan(mem, &pattern, scope, from, limit, tick).map_err(listed)?;
+    let regions = mem.regions().map_err(listed)?;
+    let n = f.context.min(MAX_CONTEXT);
+    let (mut hits, mut reads) = (Vec::new(), Vec::new());
+    for &address in &page.hits {
+        let region = regions
+            .iter()
+            .find(|r| r.base <= address && address < r.base + r.size);
+        let (lo, hi) = region.map_or((address, address + 8), |r| {
+            let hi = address.saturating_add(8 + n).min(r.base + r.size);
+            (address.saturating_sub(n).max(r.base), hi)
+        });
+        let mut b = vec![0; (hi - lo) as usize];
+        let at = (address - lo) as usize;
+        let mut row = Row::from_iter([("address".into(), json!(format!("{address:#x}")))]);
+        match mem.read(lo, &mut b) {
+            Ok(()) => {
+                let value = u64::from_le_bytes(sized(&b[at..at + 8]));
+                row.insert("value".into(), json!(format!("{value:#x}")));
+                row.insert("before".into(), json!(to_hex(&b[..at])));
+                row.insert("after".into(), json!(to_hex(&b[at + 8..])));
+                if !f.fields.is_empty() && !layout.read(mem, address, &mut row, &mut reads) {
+                    continue;
+                }
+                reads.push((lo, b));
             }
-        })
-        .collect();
-    Ok(ScanPage {
+            Err(e) => {
+                row.insert("why".into(), json!(e.to_string()));
+            }
+        }
+        hits.push(row);
+    }
+    let page = ScanPage {
         hits,
         next: page.next,
         stopped: page.stopped,
@@ -579,13 +611,16 @@ pub fn find(
         bytes: page.bytes,
         skipped: page.skipped,
         left_out: page.left_out,
-    })
+    };
+    Ok((page, digest(reads)))
 }
 
 /// One hop of a pointer chain: the qword read at `at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Hop {
+    #[serde(serialize_with = "hex::number")]
     pub at: u64,
+    #[serde(serialize_with = "hex::number")]
     pub value: u64,
 }
 
@@ -594,6 +629,7 @@ pub struct Hop {
 pub struct Chain {
     pub hops: Vec<Hop>,
     /// The last value read (the base, with no offsets), when every hop was read.
+    #[serde(serialize_with = "hex::option")]
     pub end: Option<u64>,
     pub broken: Option<Broken>,
 }
@@ -648,23 +684,30 @@ pub const MAX_COUNT: u64 = 100_000;
 pub const MAX_STRIDE: u64 = 64 * 1024;
 pub const MAX_WALK: u64 = 16 << 20;
 
-/// An array of structs to read: `count` elements `stride` bytes apart from `base`. Each element is the struct its
-/// fields are read from or, with `deref`, the start of a pointer chain to it ([`follow`]'s offsets).
+/// Structs to read: per element, the struct its fields are read from or, with `deref`, the start of a pointer chain to
+/// it ([`follow`]'s offsets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
-    pub base: u64,
-    pub stride: u64,
-    pub count: u64,
+    pub elements: Elements,
     pub deref: Vec<i64>,
     pub fields: Vec<Field>,
     pub filter: Option<Filter>,
 }
 
-/// A field of a walked struct: a value of `ty` at `offset` from the struct's start.
+/// Where a [`Walk`]'s elements are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elements {
+    /// `count` elements `stride` bytes apart from `base`.
+    Array { base: u64, stride: u64, count: u64 },
+    /// These addresses, in this order.
+    List(Vec<u64>),
+}
+
+/// A field of a walked struct: a value of `ty` at `offset` from the struct's start, before it when negative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
-    pub offset: u64,
+    pub offset: i64,
     pub ty: Type,
 }
 
@@ -677,77 +720,165 @@ pub struct Filter {
     pub value: String,
 }
 
-/// A walk's row, as JSON.
+/// A walk's or a find's row, as JSON.
 pub type Row = serde_json::Map<String, serde_json::Value>;
 
+/// Fields checked for reading: the span of bytes they cover, from `lo` bytes past a struct's start, and the filter as
+/// its offset in that span, eq, and the bytes it compares.
+struct Layout<'a> {
+    fields: &'a [Field],
+    lo: i64,
+    len: usize,
+    filter: Option<(usize, bool, Vec<u8>)>,
+}
+
+impl<'a> Layout<'a> {
+    /// Checks `fields` and `filter`: names that aren't one of the row's own `keys`, each named once, each field
+    /// starting at most [`MAX_STRIDE`] bytes before a struct's start and ending at most `room` bytes after it (`what`
+    /// says what bounds it).
+    fn new(
+        fields: &'a [Field],
+        filter: Option<&Filter>,
+        room: u64,
+        what: &str,
+        keys: &[&str],
+    ) -> Result<Self, String> {
+        for (i, f) in fields.iter().enumerate() {
+            let name = &f.name;
+            if name.is_empty() || keys.contains(&name.as_str()) {
+                let keys = keys.join(", ");
+                return Err(format!("field name {name:?}: blank, or one of {keys}"));
+            }
+            if fields[..i].iter().any(|g| g.name == *name) {
+                return Err(format!("field {name} is named twice"));
+            }
+            if let Type::Bytes(len) = f.ty
+                && !(1..=MAX_BYTES).contains(&len)
+            {
+                return Err(format!(
+                    "field {name}: {len} bytes, a field is 1 to {MAX_BYTES}"
+                ));
+            }
+            if f.offset < -(MAX_STRIDE as i64) {
+                return Err(format!(
+                    "field {name} starts over {MAX_STRIDE:#x} bytes before the struct"
+                ));
+            }
+            if f.offset.saturating_add(f.ty.size() as i64) > room as i64 {
+                return Err(format!("field {name} ends past {room:#x}: {what}"));
+            }
+        }
+        let lo = fields.iter().map(|f| f.offset).min().unwrap_or(0);
+        let hi = fields.iter().map(|f| f.offset + f.ty.size() as i64);
+        let len = (hi.max().unwrap_or(0) - lo) as usize;
+        let filter = match filter {
+            None => None,
+            Some(Filter { field, eq, value }) => {
+                let f = fields.iter().find(|f| f.name == *field);
+                let f = f.ok_or(format!("filter: no field {field}"))?;
+                let want = f.ty.encode(value).map_err(|e| format!("filter: {e}"))?;
+                Some(((f.offset - lo) as usize, *eq, want))
+            }
+        };
+        Ok(Layout {
+            fields,
+            lo,
+            len,
+            filter,
+        })
+    }
+
+    /// Reads the fields of the struct at `at` into `row`, or `why` they couldn't be read, and the bytes into `reads`:
+    /// false when the filter drops the row.
+    fn read(
+        &self,
+        mem: &dyn Memory,
+        at: u64,
+        row: &mut Row,
+        reads: &mut Vec<(u64, Vec<u8>)>,
+    ) -> bool {
+        let (mut b, len) = (vec![0; self.len], self.len);
+        let start = at.checked_add_signed(self.lo);
+        let read = start
+            .ok_or("past the top of memory".to_string())
+            .and_then(|s| {
+                mem.read(s, &mut b)
+                    .map(|()| s)
+                    .map_err(|e| format!("can't read {len} bytes at {s:#x}: {e}"))
+            });
+        let start = match read {
+            Ok(start) => start,
+            Err(why) => {
+                row.insert("why".into(), json!(why));
+                return true;
+            }
+        };
+        if let Some((at, eq, want)) = &self.filter
+            && (b[*at..*at + want.len()] == want[..]) != *eq
+        {
+            return false;
+        }
+        for f in self.fields {
+            let at = (f.offset - self.lo) as usize;
+            let value = f.ty.decode(&b[at..at + f.ty.size()]);
+            row.insert(f.name.clone(), json!(value));
+        }
+        reads.push((start, b));
+        true
+    }
+}
+
 /// Reads `w`: per element, `{index, address, <field>: value, ...}`, with `target` (the struct's address) when it has a
-/// deref, or `{index, address, why}` when it can't be read. The filter drops rows, never a `why` one. Err: refused,
-/// nothing read.
-pub fn walk(mem: &dyn Memory, w: &Walk) -> Result<Vec<Row>, String> {
-    if !(1..=MAX_COUNT).contains(&w.count) {
-        return Err(format!("count {}: a walk is 1 to {MAX_COUNT}", w.count));
-    }
-    if !(1..=MAX_STRIDE).contains(&w.stride) {
-        return Err(format!("stride {}: 1 to {MAX_STRIDE}", w.stride));
-    }
+/// deref, or `{index, address, why}` when it can't be read; `index` is the element's position. The filter drops rows,
+/// never a `why` one. With the rows, the sha256 of the bytes they were read from ([`digest`]). Err: refused, nothing
+/// read.
+pub fn walk(mem: &dyn Memory, w: &Walk) -> Result<(Vec<Row>, String), String> {
+    let (count, room) = match &w.elements {
+        Elements::Array { stride, count, .. } => {
+            if !(1..=MAX_COUNT).contains(count) {
+                return Err(format!("count {count}: a walk is 1 to {MAX_COUNT}"));
+            }
+            if !(1..=MAX_STRIDE).contains(stride) {
+                return Err(format!("stride {stride}: 1 to {MAX_STRIDE}"));
+            }
+            // Without a deref the struct is the element; past one, it is read up to MAX_STRIDE bytes from its start.
+            let room = if w.deref.is_empty() {
+                *stride
+            } else {
+                MAX_STRIDE
+            };
+            (*count, room)
+        }
+        Elements::List(at) => {
+            let n = at.len() as u64;
+            if !(1..=MAX_COUNT).contains(&n) {
+                return Err(format!("{n} addresses: a walk is 1 to {MAX_COUNT}"));
+            }
+            (n, MAX_STRIDE)
+        }
+    };
     if w.fields.is_empty() {
         return Err("no fields".into());
     }
-    // Without a deref the struct is the element; past one, it is read up to MAX_STRIDE bytes from its start.
-    let room = if w.deref.is_empty() {
-        w.stride
-    } else {
-        MAX_STRIDE
-    };
-    for (i, f) in w.fields.iter().enumerate() {
-        let name = &f.name;
-        if name.is_empty() || ["index", "address", "target", "why"].contains(&name.as_str()) {
-            return Err(format!(
-                "field name {name:?}: blank, or index, address, target or why"
-            ));
-        }
-        if w.fields[..i].iter().any(|g| g.name == *name) {
-            return Err(format!("field {name} is named twice"));
-        }
-        if let Type::Bytes(len) = f.ty
-            && !(1..=MAX_BYTES).contains(&len)
-        {
-            return Err(format!(
-                "field {name}: {len} bytes, a field is 1 to {MAX_BYTES}"
-            ));
-        }
-        if f.offset.saturating_add(f.ty.size() as u64) > room {
-            return Err(format!(
-                "field {name} ends past {room:#x}: the stride, or {MAX_STRIDE:#x} from a deref's target"
-            ));
-        }
-    }
-    let lo = w.fields.iter().map(|f| f.offset).min().unwrap_or(0);
-    let hi = w.fields.iter().map(|f| f.offset + f.ty.size() as u64);
-    let len = hi.max().unwrap_or(0) - lo;
-    let total = w.count * (len + 8 * w.deref.len() as u64);
+    let what = format!("the stride, or {MAX_STRIDE:#x} from a deref's target or a listed address");
+    let keys = ["index", "address", "target", "why", "rva", "module"];
+    let layout = Layout::new(&w.fields, w.filter.as_ref(), room, &what, &keys)?;
+    let total = count * (layout.len as u64 + 8 * w.deref.len() as u64);
     if total > MAX_WALK {
         return Err(format!(
             "{total} bytes to read: a walk reads at most {MAX_WALK}"
         ));
     }
-    let filter = match &w.filter {
-        None => None,
-        Some(Filter { field, eq, value }) => {
-            let f = w.fields.iter().find(|f| f.name == *field);
-            let f = f.ok_or(format!("filter: no field {field}"))?;
-            let want = f.ty.encode(value).map_err(|e| format!("filter: {e}"))?;
-            Some(((f.offset - lo) as usize, *eq, want))
-        }
-    };
-    let mut rows = Vec::new();
-    let mut buf = vec![0; len as usize];
+    let (mut rows, mut reads) = (Vec::new(), Vec::new());
     // ponytail: one read per element (and per hop), ~100k syscalls at the cap; read whole arrays if that is slow.
-    for index in 0..w.count {
-        let address = w.base.checked_add(index * w.stride);
+    for index in 0..count {
+        let address = match &w.elements {
+            Elements::Array { base, stride, .. } => base.checked_add(index * stride),
+            Elements::List(at) => Some(at[index as usize]),
+        };
         let mut row = Row::from_iter([
             ("index".into(), json!(index)),
-            ("address".into(), json!(address)),
+            ("address".into(), json!(address.map(|a| format!("{a:#x}")))),
         ]);
         let target = match address {
             None => Err("past the top of memory".to_string()),
@@ -758,32 +889,73 @@ pub fn walk(mem: &dyn Memory, w: &Walk) -> Result<Vec<Row>, String> {
                 chain.end.ok_or_else(|| broken.unwrap_or_default())
             }
         };
-        let read = target.and_then(|t| {
-            if !w.deref.is_empty() {
-                row.insert("target".into(), json!(t));
+        match target {
+            Err(why) => {
+                row.insert("why".into(), json!(why));
             }
-            let at = t.checked_add(lo).ok_or("past the top of memory")?;
-            mem.read(at, &mut buf)
-                .map_err(|e| format!("can't read {len} bytes at {at:#x}: {e}"))
-        });
-        if let Err(why) = read {
-            row.insert("why".into(), json!(why));
-            rows.push(row);
-            continue;
-        }
-        if let Some((at, eq, want)) = &filter
-            && (buf[*at..*at + want.len()] == want[..]) != *eq
-        {
-            continue;
-        }
-        for f in &w.fields {
-            let at = (f.offset - lo) as usize;
-            let value = f.ty.decode(&buf[at..at + f.ty.size()]);
-            row.insert(f.name.clone(), json!(value));
+            Ok(t) => {
+                if !w.deref.is_empty() {
+                    row.insert("target".into(), json!(format!("{t:#x}")));
+                }
+                if !layout.read(mem, t, &mut row, &mut reads) {
+                    continue;
+                }
+            }
         }
         rows.push(row);
     }
-    Ok(rows)
+    Ok((rows, digest(reads)))
+}
+
+/// The sha256 (hex) of `reads`, each a range read (its address and bytes), concatenated in address order.
+/// ponytail: holds every range read until the end; a find's 1000 hits with fields 128 KiB wide is 128 MiB.
+fn digest(mut reads: Vec<(u64, Vec<u8>)>) -> String {
+    reads.sort_by_key(|(at, _)| *at);
+    let bytes: Vec<&[u8]> = reads.iter().map(|(_, b)| &b[..]).collect();
+    sha256_hex(&bytes.concat())
+}
+
+/// A module loaded in a process, as its module list gives it: its file name, base and size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Module {
+    pub name: String,
+    pub base: u64,
+    pub size: u64,
+}
+
+/// Puts, beside every 0x string in `v` (its objects and arrays walked through) that lies in one of `modules` (in
+/// address order), where it lies: in the image at `image`, its RVA (`rva` beside `address`, `<key>_rva` beside
+/// another key); in another module, `name+0xoffset` (`module`, `<key>_module`).
+pub fn place(v: &mut serde_json::Value, image: u64, modules: &[Module]) {
+    match v {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|i| place(i, image, modules)),
+        serde_json::Value::Object(map) => {
+            let mut beside = Vec::new();
+            for (key, item) in map.iter_mut() {
+                place(item, image, modules);
+                let hex = item.as_str().and_then(|s| s.strip_prefix("0x"));
+                let Some(a) = hex.and_then(|h| u64::from_str_radix(h, 16).ok()) else {
+                    continue;
+                };
+                let below = modules.partition_point(|m| m.base <= a);
+                let module = below.checked_sub(1).map(|i| &modules[i]);
+                let Some(m) = module.filter(|m| a - m.base < m.size) else {
+                    continue;
+                };
+                let (what, at) = match m.base == image {
+                    true => ("rva", format!("{:#x}", a - m.base)),
+                    false => ("module", format!("{}+{:#x}", m.name, a - m.base)),
+                };
+                let key = match key.as_str() {
+                    "address" => what.to_string(),
+                    _ => format!("{key}_{what}"),
+                };
+                beside.push((key, json!(at)));
+            }
+            map.extend(beside);
+        }
+        _ => {}
+    }
 }
 
 /// A PE image as loaded in memory, from its headers: the build stamp the KB names builds by, and its sections.
@@ -1186,10 +1358,10 @@ fn to_hex(bytes: &[u8]) -> String {
     hex.join(" ")
 }
 
-/// Serde for bytes as spaced lowercase hex, and for a number as 0x hex.
+/// Serde for bytes as spaced lowercase hex, for a number as 0x hex (or none), and for one as a decimal string.
 mod hex {
     use serde::Serializer;
-    use std::fmt::LowerHex;
+    use std::fmt::{Display, LowerHex};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&super::to_hex(bytes))
@@ -1197,6 +1369,17 @@ mod hex {
 
     pub fn number<S: Serializer, N: LowerHex>(n: &N, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&format!("{n:#x}"))
+    }
+
+    pub fn option<S: Serializer>(n: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match n {
+            Some(n) => number(n, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn decimal<S: Serializer, N: Display>(n: &N, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(n)
     }
 }
 
@@ -1260,7 +1443,8 @@ mod tests {
         bytes.extend((-2.25f64).to_le_bytes());
         bytes.extend((-7i32).to_le_bytes());
         let mem = Fake::default().with(0x1000, bytes, None);
-        let at = |offset: u64, ty| read(&mem, 0x1000 + offset, ty).unwrap();
+        let at = |offset: u64, ty| read(&mem, 0x1000 + offset, ty).unwrap().0;
+        assert_eq!(read(&mem, 0x1004, Type::U16).unwrap().1, [5, 6]);
         assert_eq!(at(0, Type::U8), Value::U8(1));
         assert_eq!(at(0, Type::U16), Value::U16(0x0201));
         assert_eq!(at(0, Type::U32), Value::U32(0x0403_0201));
@@ -1275,7 +1459,12 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(at(20, Type::I32)).unwrap(), -7);
         assert_eq!(at(12, Type::I64), Value::I64((-2.25f64).to_bits() as i64));
+        // Past 2^53 a JSON number loses digits in a JavaScript client: u64 and ptr as 0x hex, i64 in decimal.
         assert_eq!(json!(at(0, Type::Ptr)), "0x807060504030201");
+        assert_eq!(json!(at(0, Type::U64)), "0x807060504030201");
+        let i64_text = ((-2.25f64).to_bits() as i64).to_string();
+        assert_eq!(json!(at(12, Type::I64)), json!(i64_text));
+        assert!(i64_text.starts_with('-'));
         assert_eq!(Type::named("ptr", None), Ok(Type::Ptr));
         assert_eq!(Type::named("bytes", Some(3)), Ok(Type::Bytes(3)));
         for (name, len, why) in [
@@ -1381,6 +1570,22 @@ mod tests {
 
     fn image_private() -> Scope {
         Which::Kinds(vec![Kind::Image, Kind::Private]).into()
+    }
+
+    /// A find of `values` with `context` bytes and no fields.
+    fn finding(values: &[u64], context: u64) -> Find {
+        Find {
+            values: values.into(),
+            context,
+            fields: Vec::new(),
+            filter: None,
+        }
+    }
+
+    /// A find page's hit addresses.
+    fn addresses(page: &ScanPage<Row>) -> Vec<u64> {
+        let hex = |h: &Row| number(h["address"].as_str().unwrap()).unwrap() as u64;
+        page.hits.iter().map(hex).collect()
     }
 
     #[test]
@@ -1554,7 +1759,7 @@ mod tests {
 
     #[test]
     fn the_fast_paths_find_what_every_window_does() {
-        let v: u64 = 0x7ff6_1234_5678_9abc;
+        let (v, w): (u64, u64) = (0x7ff6_1234_5678_9abc, 0x7ff6_1234_5678_0010);
         let c = CHUNK as usize;
         let mut mem = Fake::default();
         // Odd-sized regions over chunk seams, the value planted aligned and not, at the seams and the ends.
@@ -1580,6 +1785,9 @@ mod tests {
                     bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
                 }
             }
+            for at in [24, 37, len - 40] {
+                bytes[at..at + 8].copy_from_slice(&w.to_le_bytes());
+            }
             mem = mem.with(base, bytes, None);
         }
         let all = |p: &Pattern| {
@@ -1600,10 +1808,14 @@ mod tests {
             .filter(|a| a.is_multiple_of(8))
             .collect();
         assert_eq!(
-            all(&Pattern::qword(v)),
+            all(&Pattern::qwords(&[v])),
             aligned,
             "the u64 compare and the byte compare"
         );
+        let mut both = [all(&Pattern::qwords(&[v])), all(&Pattern::qwords(&[w]))].concat();
+        both.sort_unstable();
+        assert!(both.len() > aligned.len());
+        assert_eq!(all(&Pattern::qwords(&[w, v, w])), both, "two in one pass");
         assert!(
             aligned.len() >= 4 && all(&exact).len() > aligned.len(),
             "{aligned:?}"
@@ -1614,7 +1826,8 @@ mod tests {
         };
         for p in [
             exact,
-            Pattern::qword(v),
+            Pattern::qwords(&[v]),
+            Pattern::qwords(&[v, w, 0]),
             wild,
             Pattern::parse("?c 9a 7? 56").unwrap(),
             Pattern::parse("4? ?2").unwrap(),
@@ -1678,8 +1891,8 @@ mod tests {
         };
         mem.regions.push((mapped, q.into()));
         let at = |scope: Scope| -> Vec<u64> {
-            let page = find(&mem, v, &scope, 0, 100, 0, &mut go).unwrap();
-            page.hits.iter().map(|h| h.address).collect()
+            let (page, _) = find(&mem, &finding(&[v], 0), &scope, 0, 100, &mut go).unwrap();
+            addresses(&page)
         };
         assert_eq!(at(Which::Sections(vec![".data".into()]).into()), [0x1000]);
         assert_eq!(at(Which::Kinds(vec![Kind::Mapped]).into()), [0x5000]);
@@ -1698,9 +1911,8 @@ mod tests {
             .with(0x3000, [q, q].concat(), None);
         (mem.regions[1].0.protect, mem.regions[2].0.protect) = (0x404, 0x204);
         let at = |scope: Scope| {
-            let page = find(&mem, v, &scope, 0, 100, 0, &mut go).unwrap();
-            let hits: Vec<u64> = page.hits.iter().map(|h| h.address).collect();
-            (hits, page.left_out)
+            let (page, _) = find(&mem, &finding(&[v], 0), &scope, 0, 100, &mut go).unwrap();
+            (addresses(&page), page.left_out)
         };
         let out = |regions, bytes| LeftOut { regions, bytes };
         assert_eq!(at(image_private()), (vec![0x1000], out(2, 24)));
@@ -1711,7 +1923,7 @@ mod tests {
             ..image_private()
         };
         assert_eq!(at(all), (vec![0x1000, 0x2000, 0x3000, 0x3008], out(0, 0)));
-        let p = Pattern::qword(v);
+        let p = Pattern::qwords(&[v]);
         let page = scan(&mem, &p, &Which::All.into(), 0, 100, &mut go).unwrap();
         assert_eq!(
             (&page.hits, page.regions, page.bytes),
@@ -1760,7 +1972,7 @@ mod tests {
         }
         let total = (4 * size) as f64 / 1e6;
         for (name, p) in [
-            ("qword (mem_find)", Pattern::qword(v)),
+            ("qword (mem_find)", Pattern::qwords(&[v])),
             ("ascii, 6 bytes", Pattern::ascii("quen-d").unwrap()),
         ] {
             let t = std::time::Instant::now();
@@ -1827,8 +2039,9 @@ mod tests {
             (&hops[..], Some(0x7700), &None)
         );
         assert_eq!(
-            serde_json::to_value(&chain).unwrap()["hops"][1],
-            json!({"at": base + 0x18, "value": 0x7700})
+            serde_json::to_value(&chain).unwrap(),
+            json!({"hops": [{"at": "0x5008", "value": "0x5020"}, {"at": "0x5018", "value": "0x7700"}],
+                   "end": "0x7700", "broken": null})
         );
         let broken = |offsets: &[i64], from| {
             let chain = follow(&mem, from, offsets);
@@ -1878,50 +2091,143 @@ mod tests {
             section: None,
         };
         mem.regions.push((mapped, v.to_le_bytes().into()));
-        let page = find(&mem, v, &image_private(), 0, 100, 4, &mut go).unwrap();
-        let found = |address, before, after| Found {
-            address,
-            before,
-            after,
-            why: None,
+        let page = |from, limit, context| {
+            find(
+                &mem,
+                &finding(&[v], context),
+                &image_private(),
+                from,
+                limit,
+                &mut go,
+            )
+            .unwrap()
         };
+        let (four, sha) = page(0, 100, 4);
         assert_eq!(
-            page.hits,
-            [
-                found(0x1008, vec![0x11; 4], vec![0x11; 4]),
-                found(0x3000, vec![], vec![0x22; 4])
-            ],
+            json!(four.hits),
+            json!([
+                {"address": "0x1008", "value": "0x7ff600001234", "before": "11 11 11 11", "after": "11 11 11 11"},
+                {"address": "0x3000", "value": "0x7ff600001234", "before": "", "after": "22 22 22 22"},
+            ]),
             "unaligned and mapped copies aren't hits; context stops at the region's edge"
         );
-        assert_eq!((page.next, page.regions), (None, 2));
+        assert_eq!((four.next, four.regions), (None, 2));
+        let read = [
+            vec![0x11; 4],
+            v.to_le_bytes().into(),
+            vec![0x11; 4],
+            v.to_le_bytes().into(),
+            vec![0x22; 4],
+        ];
         assert_eq!(
-            json!(page.hits[1]),
-            json!({"address": 0x3000, "before": "", "after": "22 22 22 22"})
+            sha,
+            sha256_hex(&read.concat()),
+            "the bytes read, in address order"
         );
-        let wide = find(&mem, v, &image_private(), 0, 100, 10_000, &mut go).unwrap();
+        let (wide, _) = page(0, 100, 10_000);
         let sides: Vec<(usize, usize)> = wide
             .hits
             .iter()
-            .map(|h| (h.before.len(), h.after.len()))
+            .map(|h| {
+                (
+                    h["before"].as_str().unwrap().len(),
+                    h["after"].as_str().unwrap().len(),
+                )
+            })
             .collect();
-        assert_eq!(sides, [(8, 16), (0, 8)], "the region's bytes, at most");
-        let first = find(&mem, v, &image_private(), 0, 1, 0, &mut go).unwrap();
-        assert_eq!(first.next, Some(0x1009));
-        let second = find(&mem, v, &image_private(), 0x1009, 1, 0, &mut go).unwrap();
+        assert_eq!(sides, [(23, 47), (0, 23)], "the region's bytes, at most");
+        let (first, _) = page(0, 1, 0);
+        assert_eq!(json!(first)["next"], "0x1009");
+        let (second, _) = page(0x1009, 1, 0);
         assert_eq!(
-            (second.hits[0].address, second.next),
-            (0x3000, Some(0x3001))
+            (addresses(&second), second.next),
+            (vec![0x3000], Some(0x3001))
         );
-        assert!(
-            find(&mem, v, &image_private(), 0x3001, 1, 0, &mut go)
-                .unwrap()
-                .hits
-                .is_empty()
+        assert!(page(0x3001, 1, 0).0.hits.is_empty());
+    }
+
+    /// values: several in one pass, each hit with the one it matched; fields read at each hit, before and after it,
+    /// and a filter that drops hits.
+    #[test]
+    fn finds_several_values_and_reads_fields_at_each_hit() {
+        let (a, b): (u64, u64) = (0x7ff6_0000_1000, 0x7ff6_0000_2000);
+        let mut bytes = vec![0; 0x60];
+        let mut put = |at: usize, v: &[u8]| bytes[at..at + v.len()].copy_from_slice(v);
+        // Two objects: a header word at -8, the vtable at 0, a float at +0x10.
+        put(0x08, &7u32.to_le_bytes());
+        put(0x10, &a.to_le_bytes());
+        put(0x20, &1.5f32.to_le_bytes());
+        put(0x38, &9u32.to_le_bytes());
+        put(0x40, &b.to_le_bytes());
+        put(0x50, &(-2.0f32).to_le_bytes());
+        let mem = Fake::default().with(0x9000, bytes, None);
+        let fields = vec![field("head", -8, Type::U32), field("x", 0x10, Type::F32)];
+        let both = Find {
+            fields,
+            ..finding(&[b, a, 0x1234], 0)
+        };
+        let run = |f: &Find| find(&mem, f, &image_private(), 0, 100, &mut go);
+        let (page, sha) = run(&both).unwrap();
+        assert_eq!(
+            json!(page.hits),
+            json!([
+                {"address": "0x9010", "value": "0x7ff600001000", "before": "", "after": "", "head": 7, "x": 1.5},
+                {"address": "0x9040", "value": "0x7ff600002000", "before": "", "after": "", "head": 9, "x": -2.0},
+            ])
         );
+        let spans = [&mem.regions[0].1[0x08..0x24], &mem.regions[0].1[0x38..0x54]];
+        let qwords = [a.to_le_bytes(), b.to_le_bytes()];
+        let read = [spans[0], &qwords[0], spans[1], &qwords[1]];
+        // Address order: each span starts before its hit's qword.
+        assert_eq!(sha, sha256_hex(&read.concat()));
+        let kept = |filter| {
+            let f = Find {
+                filter,
+                ..both.clone()
+            };
+            addresses(&run(&f).unwrap().0)
+        };
+        assert_eq!(kept(filter("x", true, "1.5")), [0x9010]);
+        assert_eq!(kept(filter("head", false, "7")), [0x9040]);
+        for (f, why) in [
+            (finding(&[], 0), "0 values"),
+            (finding(&[1; 65], 0), "65 values"),
+            (
+                Find {
+                    fields: vec![field("value", 0, Type::U8)],
+                    ..finding(&[a], 0)
+                },
+                "field name",
+            ),
+            (
+                Find {
+                    fields: vec![field("x", -0x10001, Type::U8)],
+                    ..finding(&[a], 0)
+                },
+                "starts over 0x10000 bytes before",
+            ),
+            (
+                Find {
+                    fields: vec![field("x", 0xffff, Type::U16)],
+                    ..finding(&[a], 0)
+                },
+                "ends past 0x10000",
+            ),
+            (
+                Find {
+                    filter: filter("x", true, "1"),
+                    ..finding(&[a], 0)
+                },
+                "filter: no field x",
+            ),
+        ] {
+            let err = run(&f).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
     }
 
     /// Three 16-byte elements: an id, a float and a pointer to a 32-byte struct (null for the second).
-    fn array() -> Fake {
+    fn structs() -> Fake {
         let mut elements = Vec::new();
         for (id, to) in [(7u32, 0x2000u64), (8, 0), (9, 0x2020)] {
             elements.extend(id.to_le_bytes());
@@ -1937,16 +2243,22 @@ mod tests {
             .with(0x2000, structs, None)
     }
 
-    fn field(name: &str, offset: u64, ty: Type) -> Field {
+    fn field(name: &str, offset: i64, ty: Type) -> Field {
         let name = name.into();
         Field { name, offset, ty }
     }
 
+    fn array(base: u64, stride: u64, count: u64) -> Elements {
+        Elements::Array {
+            base,
+            stride,
+            count,
+        }
+    }
+
     fn elements(fields: Vec<Field>) -> Walk {
         Walk {
-            base: 0x1000,
-            stride: 0x10,
-            count: 3,
+            elements: array(0x1000, 0x10, 3),
             deref: Vec::new(),
             fields,
             filter: None,
@@ -1960,21 +2272,22 @@ mod tests {
 
     #[test]
     fn walks_read_each_element_or_say_why_not() {
-        let mem = array();
+        let mem = structs();
         let fields = vec![
             field("id", 0, Type::U32),
             field("f", 4, Type::F32),
             field("p", 8, Type::Ptr),
         ];
-        let rows = walk(&mem, &elements(fields.clone())).unwrap();
+        let (rows, sha) = walk(&mem, &elements(fields.clone())).unwrap();
         assert_eq!(
             json!(rows),
             json!([
-                {"index": 0, "address": 0x1000, "id": 7, "f": 1.5, "p": "0x2000"},
-                {"index": 1, "address": 0x1010, "id": 8, "f": 1.5, "p": "0x0"},
-                {"index": 2, "address": 0x1020, "id": 9, "f": 1.5, "p": "0x2020"},
+                {"index": 0, "address": "0x1000", "id": 7, "f": 1.5, "p": "0x2000"},
+                {"index": 1, "address": "0x1010", "id": 8, "f": 1.5, "p": "0x0"},
+                {"index": 2, "address": "0x1020", "id": 9, "f": 1.5, "p": "0x2020"},
             ])
         );
+        assert_eq!(sha, sha256_hex(&mem.regions[0].1), "the elements' bytes");
         let derefs = Walk {
             deref: vec![8],
             ..elements(vec![
@@ -1982,13 +2295,13 @@ mod tests {
                 field("n", 0x10, Type::I64),
             ])
         };
-        let rows = walk(&mem, &derefs).unwrap();
+        let (rows, _) = walk(&mem, &derefs).unwrap();
         assert_eq!(
             json!(rows),
             json!([
-                {"index": 0, "address": 0x1000, "target": 0x2000, "name": "61 62 63 64", "n": -5},
-                {"index": 1, "address": 0x1010, "target": 0, "why": "can't read 24 bytes at 0x0: no 24 readable bytes at 0x0"},
-                {"index": 2, "address": 0x1020, "target": 0x2020, "name": "77 78 79 7a", "n": 0},
+                {"index": 0, "address": "0x1000", "target": "0x2000", "name": "61 62 63 64", "n": "-5"},
+                {"index": 1, "address": "0x1010", "target": "0x0", "why": "can't read 24 bytes at 0x0: no 24 readable bytes at 0x0"},
+                {"index": 2, "address": "0x1020", "target": "0x2020", "name": "77 78 79 7a", "n": "0"},
             ])
         );
         let two = Walk {
@@ -1996,10 +2309,11 @@ mod tests {
             ..derefs.clone()
         };
         assert_eq!(
-            walk(&mem, &two).unwrap()[1]["why"],
+            walk(&mem, &two).unwrap().0[1]["why"],
             "deref: hop 0 read a null pointer"
         );
-        let index = |rows: Vec<Row>| -> Vec<u64> {
+        let index = |w: &Walk| -> Vec<u64> {
+            let (rows, _) = walk(&mem, w).unwrap();
             rows.iter().map(|r| r["index"].as_u64().unwrap()).collect()
         };
         for (filter, kept) in [
@@ -2012,42 +2326,60 @@ mod tests {
                 filter: filter.clone(),
                 ..elements(fields.clone())
             };
-            assert_eq!(index(walk(&mem, &w).unwrap()), kept, "{filter:?}");
+            assert_eq!(index(&w), kept, "{filter:?}");
         }
         let named = Walk {
             filter: filter("name", true, "61 62 63 64"),
             ..derefs
         };
+        assert_eq!(index(&named), [0, 1], "a why row stays");
+    }
+
+    /// addresses: the places listed, in their order, the row's index its position; fields before the struct too.
+    #[test]
+    fn walks_read_the_addresses_listed_in_their_order() {
+        let mem = structs();
+        let listed = Walk {
+            elements: Elements::List(vec![0x2020, 0x1004, 0x2000, 0x9999]),
+            ..elements(vec![
+                field("before", -4, Type::U32),
+                field("at", 0, Type::U8),
+            ])
+        };
+        let (rows, sha) = walk(&mem, &listed).unwrap();
         assert_eq!(
-            index(walk(&mem, &named).unwrap()),
-            [0, 1],
-            "a why row stays"
+            json!(rows),
+            json!([
+                {"index": 0, "address": "0x2020", "before": 0, "at": 0x77},
+                {"index": 1, "address": "0x1004", "before": 7, "at": 0},
+                {"index": 2, "address": "0x2000", "why": "can't read 5 bytes at 0x1ffc: no 5 readable bytes at 0x1ffc"},
+                {"index": 3, "address": "0x9999", "why": "can't read 5 bytes at 0x9995: no 5 readable bytes at 0x9995"},
+            ])
         );
+        let (elements, structs) = (&mem.regions[0].1, &mem.regions[1].1);
+        assert_eq!(
+            sha,
+            sha256_hex(&[&elements[..5], &structs[0x1c..0x21]].concat()),
+            "the rows' bytes, in address order"
+        );
+        let index: Vec<u64> = rows.iter().map(|r| r["index"].as_u64().unwrap()).collect();
+        assert_eq!(index, [0, 1, 2, 3]);
     }
 
     #[test]
     fn walks_refuse_before_reading() {
-        let mem = array();
+        let mem = structs();
         let one = || elements(vec![field("id", 0, Type::U32)]);
+        let at = |elements| Walk { elements, ..one() };
         for (w, why) in [
-            (Walk { count: 0, ..one() }, "count 0"),
-            (
-                Walk {
-                    count: MAX_COUNT + 1,
-                    ..one()
-                },
-                "count 100001",
-            ),
-            (Walk { stride: 0, ..one() }, "stride 0"),
-            (
-                Walk {
-                    stride: MAX_STRIDE + 1,
-                    ..one()
-                },
-                "stride 65537",
-            ),
+            (at(array(0x1000, 0x10, 0)), "count 0"),
+            (at(array(0x1000, 0x10, MAX_COUNT + 1)), "count 100001"),
+            (at(array(0x1000, 0, 3)), "stride 0"),
+            (at(array(0x1000, MAX_STRIDE + 1, 3)), "stride 65537"),
+            (at(Elements::List(Vec::new())), "0 addresses"),
             (elements(vec![]), "no fields"),
             (elements(vec![field("why", 0, Type::U8)]), "field name"),
+            (elements(vec![field("rva", 0, Type::U8)]), "field name"),
             (
                 elements(vec![field("a", 0, Type::U8), field("a", 1, Type::U8)]),
                 "named twice",
@@ -2057,14 +2389,20 @@ mod tests {
             (
                 Walk {
                     deref: vec![8],
-                    ..elements(vec![field("x", MAX_STRIDE, Type::U8)])
+                    ..elements(vec![field("x", MAX_STRIDE as i64, Type::U8)])
                 },
                 "ends past 0x10000",
             ),
             (
                 Walk {
-                    count: MAX_COUNT,
-                    stride: MAX_STRIDE,
+                    elements: Elements::List(vec![0x1000]),
+                    ..elements(vec![field("x", -0x10001, Type::U8)])
+                },
+                "starts over 0x10000 bytes before",
+            ),
+            (
+                Walk {
+                    elements: array(0x1000, MAX_STRIDE, MAX_COUNT),
                     ..elements(vec![field("b", 0, Type::Bytes(MAX_BYTES))])
                 },
                 "a walk reads at most",
@@ -2112,6 +2450,43 @@ mod tests {
             assert_eq!(ty.encode(text).is_ok(), ok, "{ty:?} {text}");
         }
         assert_eq!(Type::I32.encode("-1"), Ok(vec![0xff; 4]));
+    }
+
+    /// Addresses in the image get their RVA beside them, in another module its name and offset; the rest nothing.
+    #[test]
+    fn places_name_the_module_an_address_lies_in() {
+        let module = |name: &str, base, size| Module {
+            name: name.into(),
+            base,
+            size,
+        };
+        let modules = [
+            module("game.exe", IMAGE, 0x10_0000),
+            module("Mod.asi", IMAGE + 0x20_0000, 0x2000),
+        ];
+        let mut v = json!({
+            "address": format!("{:#x}", IMAGE + 0x1234),
+            "hits": [{"address": format!("{:#x}", IMAGE + 0x20_1140), "value": "0x10"}],
+            "end": format!("{:#x}", IMAGE + 0x10_0000),
+            "vt": format!("{:#x}", IMAGE + 0x8),
+            "n": 5,
+            "before": "11 22",
+            "protect": "0x4",
+        });
+        place(&mut v, IMAGE, &modules);
+        assert_eq!(
+            v,
+            json!({
+                "address": "0x7ff600001234", "rva": "0x1234",
+                "hits": [{"address": "0x7ff600201140", "module": "Mod.asi+0x1140", "value": "0x10"}],
+                "end": "0x7ff600100000",
+                "vt": "0x7ff600000008", "vt_rva": "0x8",
+                "n": 5,
+                "before": "11 22",
+                "protect": "0x4",
+            }),
+            "the image's end is past it"
+        );
     }
 
     const HEADER: &str = "name\trva\told\tnew\tbuild\tboundaries-checked\n";
