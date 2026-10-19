@@ -296,6 +296,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 - `ReShade.ini` in `bin\x64_dx12`, with RenoDX or the devkit configured, and `ReShadePreset.ini`, with RenoDX configured;
 - `steam_appid.txt` beside `witcher3.exe`, only if it is missing: it keeps Steam from restarting the game outside quen's control;
 - parked mods: moved out of `Mods\` and `bin\x64_dx12\` into `quen-parked\Mods\` and `quen-parked\bin\` in the game folder (the journal lists them);
+- staged test files (a launch's `stage`: an ASI, its ini, a DLL from elsewhere on your PC): copied into `bin\x64_dx12` for the session, a file of the same name there parked first. At the end the copies go to the Recycle Bin, with the `<name>.log` a staged mod wrote where none was (after a copy into the session's logs), and the parked files come back;
 - `content\content0\x64.final.redscripts`, the game's compiled scripts: with a mod parked the game recompiles them at launch, so quen backs the file up first and puts it back afterwards with its old write time;
 - the running game's memory: cvar writes and ASI mode switches. These live only in the game process and are gone when it closes;
 - `gamesaves` in the documents folder, only through `game_save` (quen-w3 0.1.4 or later), which your client asks you about on every call: the game writes one new manual save, as its menu's "Empty save slot" does, and names it. It never overwrites a save. quen checks the folder before and after: anything else that changed ends the session.

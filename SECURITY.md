@@ -25,7 +25,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 - While a session is live, quen keeps the PC and its display awake (`SetThreadExecutionState` with `ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, on a thread that lives as long as the session); Windows releases it when the session ends, whichever way it ends, or when quen exits.
 
 **Files**
-- During a session quen changes files in the game folder and in the game's Documents folder: settings, the console switch, ReShade's ini files, a `steam_appid.txt`, parked mods, the compiled scripts ([INSTALL.md](INSTALL.md) §6).
+- During a session quen changes files in the game folder and in the game's Documents folder: settings, the console switch, ReShade's ini files, a `steam_appid.txt`, parked mods, test files a launch stages into `bin\x64_dx12` (listed in its plan), the compiled scripts ([INSTALL.md](INSTALL.md) §6).
 - Each change goes into a journal before it is made, and is undone when the session ends, or after a crash at quen's next start.
 - quen never deletes anything for good: what it removes goes to the Recycle Bin, or, for a capture the bin can't take whole, to `<data root>\_to_delete\` for you to empty. It never restores or deletes your saves.
 - It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back). A save you make while you have the controls is yours, and the session's end lists it.

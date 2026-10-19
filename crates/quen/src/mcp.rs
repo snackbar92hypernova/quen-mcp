@@ -736,20 +736,19 @@ fn tools() -> Value {
                 client asks the user on every call (user_ok is only your word): never route around a denial. \
                 session_plan checks the same arguments. Takes the lock, backs up gamesaves, \
                 changes the game's files, each journaled first (dx12user.settings: frame generation and camera \
-                auto-rotate off, the overrides, VSync if asked; the console on; the parking; ReShade's ini with \
-                RenoDX), starts witcher3.exe in a Job Object, waits for the Native Bridge to register quen's script \
-                functions, selects Continue, loads the asked save through modQuen if Continue loaded another (about \
-                33 s), enters photo mode. Refused, nothing changed: no user_ok, the lock or a session taken, a bad \
-                spec, the game running, harness leftovers, a game build quen doesn't know (see \
-                allow_unknown_build); with needs: the game, the Native Bridge or quen's package (W3Quen.asi + \
-                modQuen) missing or mismatched. Failed after a change: the session was ended and \
-                everything restored.",
+                auto-rotate off, the overrides, VSync if asked; the console on; parking; staged files; \
+                ReShade's ini with RenoDX), starts witcher3.exe in a Job Object, waits for the Native Bridge to \
+                register quen's script functions, selects Continue, loads the asked save through modQuen if Continue \
+                loaded another (about 33 s), enters photo mode. Refused, nothing changed: no user_ok, the lock or a \
+                session taken, a bad spec, the game running, harness leftovers, a game build quen doesn't know \
+                (allow_unknown_build); with needs: the game, the Native Bridge or quen's package (W3Quen.asi + \
+                modQuen) missing or mismatched. Failed after a change: the session ended, everything restored.",
             // Claude Code prompts for this tool on every call, in every permission mode.
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked (settings, devkit, fg false, vsync false); no park, keep, preset, profiler or extra_env; without save no key is sent (the user picks a save); photo defaults false; then the user has the controls (hands_take), and the session ends when the game exits"},
+                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked (settings, devkit, fg false, vsync false); no park, keep, preset, profiler, extra_env or stage; without save no key is sent (the user picks a save); photo defaults false; then the user has the controls (hands_take), and the session ends when the game exits"},
                     "save": {"type": "string", "description": "a save in gamesaves: its name in any case, with or without .sav (as the game's own list names it); omitted: the newest QuickSave (mode play: none)"},
                     "settings": {
                         "type": "object",
@@ -763,6 +762,7 @@ fn tools() -> Value {
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
                     "park": {"type": "string", "description": "mods to park: comma names, or ALL (the Native Bridge and quen's package never are; the W3 Game State Bridge only with both halves named: W3GameStateBridge.asi,modW3GameStateBridge)"},
                     "keep": {"type": "string", "description": "with ALL: comma names to keep"},
+                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 under their names for the session; one there of that name is parked first. The end recycles the copies and each one's new <stem>.log, after game_logs copied it"},
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
                     "fg": {"type": "boolean", "description": "keep frame generation as the user set it (default false: off)"},
                     "vsync": {"type": "boolean", "description": "default true; false turns VSync off"},
@@ -788,7 +788,8 @@ fn tools() -> Value {
         {
             "name": "session_end",
             "description": "End the session: wait until the gamesaves folder stops changing, kill the game through \
-                its job, replay the journal (restore every file it changed, unpark the mods: only what still is as \
+                its job, replay the journal (restore every file it changed, unpark the mods, recycle the staged \
+                files and their new logs once game_logs copied them: only what still is as \
                 quen left it; a file the game rewrote is kept beside as .quen-current), release the lock. saves lists what the game wrote in gamesaves since the launch: tainted ones (written after a \
                 memory patch, cvar write or teleport) first, every changed one, and the unexpected ones (not AutoSave \
                 / CheckPoint): tell the user. The boot's ledger row gets its outcome. If the replay leaves a step \

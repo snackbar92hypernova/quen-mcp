@@ -2404,9 +2404,10 @@ mod tests {
     }
 
     /// Crash injection on the real file system: the native boot (quen-core's plan: settings, general.ini, two mods
-    /// parked, steam_appid.txt placed) on a synthetic game folder through `JournalFs` (MoveFileEx without replace, file
-    /// ids, folder hashes), killed before each of its writes in turn; every replay through it gives the folders back
-    /// byte for byte, the parking folders gone and the spent backups recycled.
+    /// parked, steam_appid.txt placed; three files staged, one over a file it parks, one over a mod the plan parks) on a
+    /// synthetic game folder through `JournalFs` (MoveFileEx without replace, file ids, folder hashes), killed before
+    /// each of its writes in turn; every replay through it gives the folders back byte for byte, the staged mod's log
+    /// and the parking folders gone and the spent backups recycled.
     #[test]
     fn a_native_boot_killed_before_any_write_replays_back_on_disk() {
         use quen_core::boot::{self, Inputs};
@@ -2417,7 +2418,7 @@ mod tests {
             is_link: false,
         };
         let mods = [entry("modAlpha", true)];
-        let bin = [entry("Tweaks.asi", false)];
+        let bin = [entry("Tweaks.asi", false), entry("Tweaks.ini", false)];
         let mut limit = 0;
         loop {
             let dir = root.join(limit.to_string());
@@ -2438,6 +2439,16 @@ mod tests {
             fs::write(game.join("bin/config/base/general.ini"), "[General]\r\n").unwrap();
             fs::write(game.join("Mods/modAlpha/content/blob0.bundle"), "alpha").unwrap();
             fs::write(bin_dir.join("Tweaks.asi"), "tweaks").unwrap();
+            fs::write(bin_dir.join("Tweaks.ini"), "the user's ini").unwrap();
+            let pc = dir.join("pc");
+            fs::create_dir_all(&pc).unwrap();
+            let staged: Vec<PathBuf> = ["W3Test.asi", "Tweaks.asi", "Tweaks.ini"]
+                .iter()
+                .map(|name| {
+                    fs::write(pc.join(name), format!("a test {name}")).unwrap();
+                    pc.join(name)
+                })
+                .collect();
             let compiled = quen_core::boot::compiled_scripts(&game);
             fs::create_dir_all(compiled.parent().unwrap()).unwrap();
             fs::write(&compiled, "compiled").unwrap();
@@ -2468,8 +2479,11 @@ mod tests {
                 load_from_dll_main: None,
                 play: false,
             };
-            let changes = boot::plan(&JournalFs, &inputs).unwrap();
-            assert_eq!(changes.len(), 2 + 1 + 2 + 1, "{changes:?}");
+            let mut changes = boot::plan(&JournalFs, &inputs).unwrap();
+            let never = w3::never_park(false);
+            let stage = boot::stage(&JournalFs, &game, &staged, &never, &bin, &changes);
+            changes.extend(stage.unwrap());
+            assert_eq!(changes.len(), 2 + 1 + 2 + 1 + 4 + 2, "{changes:?}");
             w3::make_parking(&changes).unwrap();
             let trash = quen.join("trash");
             let dying = Dying {
@@ -2482,6 +2496,7 @@ mod tests {
                 .and_then(|mut journal| boot::apply(&dying, &mut journal, &changes, &|| false));
             if applied.is_ok() {
                 fs::write(&compiled, "recompiled by the game").unwrap(); // a new write time too
+                fs::write(bin_dir.join("W3Test.log"), "the staged mod's log").unwrap();
             }
             let journal = fs::read(&path).unwrap_or_default();
             let alive = Dying {
@@ -2508,7 +2523,7 @@ mod tests {
             );
             if applied.is_ok() {
                 assert!(limit > 15, "{limit} writes");
-                assert_eq!(report.undone.len(), 6, "{report:#?}");
+                assert_eq!(report.undone.len(), 6 + 4 + 1, "{report:#?}");
                 break;
             }
             limit += 1;
