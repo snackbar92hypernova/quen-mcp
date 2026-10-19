@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.8 adds the notice verb (hands_give's notice, hands.rs) to both files.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.8",
+        sha256: "f5939b857a2f04f83783d91f05f367563c205296bbc1482e4fe772695b2a4aca",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.8",
+        sha256: "b254797300c39f78fe5b1ca1a14559d7988f77121232d99d118ddce6f599af39",
+        exact: true,
+    },
     // 0.1.7 is 0.1.6 with reworded comments and two reworded reply texts (cam.set and cam.path outside photo mode).
     Pin {
         file: PACKAGE_ASI,
@@ -184,6 +197,17 @@ pub(crate) const BEFORE_MENU: &[&str] = &[
     "quen-w3 0.1.5",
 ];
 
+/// The package releases from before the notice verb (quen-w3 0.1.8): hands_give shows no notice in the game.
+pub(crate) const BEFORE_NOTICE: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+];
+
 /// Refused with needs, nothing sent, while quen's package in the game is one of `before`: releases without what
 /// `tool` needs, which came in quen-w3 `since`. An unpinned package (a dev build) goes on: its ASI refuses a verb it
 /// doesn't know.
@@ -284,7 +308,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         by it, game_console and game_keys focus check it), and its command channel: game_load and a launch of a save \
         that isn't the newest, game_listsaves, game_pause, game_settime, game_weather, game_teleport, game_camera \
         and (from quen-w3 0.1.2) sweep_play; from quen-w3 0.1.3, session_launch profiler tracy:NAME; from quen-w3 \
-        0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes",
+        0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
+        quen-w3 0.1.8, hands_give's notice in the game",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

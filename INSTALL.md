@@ -34,7 +34,7 @@ What it does, with every check before the first change:
 Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 
 - It refuses, and changes nothing, while a quen session is live or its journal is left: end the session, or run `quen recover`.
-- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live.
+- **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live. Then restart your client's sessions (or reconnect quen with `/mcp` in Claude Code): a session keeps the tool list it got when it connected.
 - **`-Uninstall`** sends `.quen\bin` and the package to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
 - **`-WhatIf`** prints every step and changes nothing. It still downloads and checks the release, in a temp folder that then goes to the Recycle Bin.
 
@@ -294,8 +294,12 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 - the running game's memory: cvar writes and ASI mode switches. These live only in the game process and are gone when it closes;
 - `gamesaves` in the documents folder, only through `game_save` (quen-w3 0.1.4 or later), which your client asks you about on every call: the game writes one new manual save, as its menu's "Empty save slot" does, and names it. It never overwrites a save. quen checks the folder before and after: anything else that changed ends the session.
 
+**While a session is live,** quen keeps the PC and its display from sleeping. That ends with the session, however it ends.
+
+**In a test session the agent can hand you the controls** (`hands_give`), to set something up in the game, and takes them back after you agree (`hands_take`, Claude Code asks you each time). While you have them quen sends no key and writes nothing to the game, and a save you make is yours: the end lists it.
+
 **A play session** (you play, and hand the agent the controls when you want it to look at something): quen changes only `general.ini`'s console line, and places `steam_appid.txt` if it is missing. Your `dx12user.settings`, `input.settings` and ReShade's ini stay as they are, unless you ask the agent for a settings override, the devkit, or frame generation or VSync off. It parks nothing.
-- The agent sends no key and writes nothing to the game until you ask it in the chat and approve the hand-over (Claude Code asks you each time); you get the controls back with `play_return`. With your OK it may take screenshots, record frame times or read the game's memory while you play.
+- The agent sends no key and writes nothing to the game until you ask it in the chat and approve the hand-over (Claude Code asks you each time); you get the controls back with `hands_give`. With your OK it may take screenshots, record frame times or read the game's memory while you play.
 - Your saves stay yours; the end lists them. A save written while the agent has the controls gives them back to you.
 - After a memory write, cvar write, teleport, time or weather change, every save the game writes in that session is marked tainted in quen's ledger.
 - The session ends when you quit the game: quen then puts the console line and `steam_appid.txt` back by itself. Closing the agent's chat leaves the game running. If `quen serve` itself exits (a crash, an update that stops it), the game closes with it.

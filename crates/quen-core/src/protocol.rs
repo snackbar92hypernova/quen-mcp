@@ -82,7 +82,14 @@ pub enum Verb {
     /// Read the player's position and heading, the game time (day and hour) and the weather's name; changes nothing.
     #[serde(rename = "world.get")]
     WorldGet {},
+    /// Show `text` on screen for a few seconds (the game's notification); changes nothing in the game. 1 to
+    /// [`MAX_NOTICE_BYTES`] bytes, no control character.
+    #[serde(rename = "notice")]
+    Notice { text: String },
 }
+
+/// The longest notice text, in bytes.
+pub const MAX_NOTICE_BYTES: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +143,15 @@ impl Verb {
             }
             Verb::Load { save: name } | Verb::Weather { name } if name.is_empty() => {
                 Err(Error::Invalid("an empty name".into()))
+            }
+            Verb::Notice { text }
+                if text.is_empty()
+                    || text.len() > MAX_NOTICE_BYTES
+                    || text.bytes().any(|b| b < 0x20) =>
+            {
+                Err(Error::Invalid(format!(
+                    "a notice is 1 to {MAX_NOTICE_BYTES} bytes, no control character"
+                )))
             }
             Verb::CamPath {
                 mode,
@@ -268,6 +284,9 @@ mod tests {
             Verb::CamStop {},
             Verb::Save {},
             Verb::WorldGet {},
+            Verb::Notice {
+                text: "quen: you have the controls".into(),
+            },
         ]
     }
 
@@ -529,6 +548,19 @@ mod tests {
             })),
             Err(Error::Invalid(_))
         ));
+        let notice = |text: String| encode_request(&request(Verb::Notice { text }));
+        assert!(notice("é".repeat(MAX_NOTICE_BYTES / 2)).is_ok());
+        for text in [
+            String::new(),
+            "x".repeat(MAX_NOTICE_BYTES + 1),
+            "a\nb".into(),
+            "\t".into(),
+        ] {
+            assert!(
+                matches!(notice(text.clone()), Err(Error::Invalid(_))),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

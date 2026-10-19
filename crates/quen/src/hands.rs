@@ -1,10 +1,11 @@
-//! Play sessions: quen launches the user's game with almost nothing changed (session_launch mode play),
-//! the user plays, and when they ask, hands the controls to the agent to look into something at that spot. quen keeps
-//! who has them (`hands`, in every envelope's state). While the user has them, it refuses every call that sends input,
-//! writes to the game or moves the focus, and lets reads run. `play_take` (the client asks the user on every call)
-//! gives the agent the controls, `play_return` gives them back. quen sorts gamesaves at each hand-over: what changed
-//! while the user had the controls is theirs (allowed, listed at the end); a save while the agent had them fails that
-//! call and gives the controls back.
+//! Who has the controls of the game, and the hand-overs between the user and the agent. In a play session (session_launch
+//! mode play) the user has them from the launch and hands them to the agent to look into something at that spot; in a
+//! test session the agent has them and may hand them to the user to set something up. quen keeps who has them (`hands`,
+//! in every envelope's state). While the user has them, it refuses every call that sends input, writes to the game or
+//! moves the focus, and lets reads run. `hands_take` (the client asks the user on every call) gives the agent the
+//! controls, `hands_give` gives them to the user. quen sorts gamesaves at each hand-over: what changed while the user had
+//! the controls is theirs (allowed, listed at the end); a save while the agent had them fails that call, and gives the
+//! controls back to the user in a play session or ends a test session.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -15,10 +16,15 @@ use quen_core::saves::{self, Snapshot};
 use serde_json::{Map, Value, json};
 
 use crate::channel::{self, REPLY_MAX};
+use crate::doctor;
 use crate::game::{self, Fields, flag, schema};
 use crate::session::{Call, Done, Live, Session};
 
-/// Who has the controls in a play session.
+/// What the game shows on screen when the user gets the controls (quen-w3 0.1.8's notice verb).
+const NOTICE: &str =
+    "quen: you have the controls. To hand them back, tell the agent in the chat (Alt+Tab).";
+
+/// Who has the controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Hands {
     User,
@@ -34,23 +40,23 @@ impl Hands {
     }
 }
 
-/// A play session's hand-overs and saves, on its [`Live`].
-pub(crate) struct Play {
-    /// play_take calls so far: quen's run ids in the boot are `<session>-h<n>-<tag>`.
+/// A session's hand-overs and the saves sorted at each, on its [`Live`].
+pub(crate) struct Handovers {
+    /// hands_take calls so far: quen's run ids in a play boot are `<session>-h<n>-<tag>`.
     pub(crate) takes: Cell<u32>,
     /// gamesaves as quen last sorted it (the launch, a hand-over, a save the guard found): what changed beyond it is the
     /// user's while they have the controls, unexpected while the agent has them.
     pub(crate) baseline: RefCell<Snapshot>,
-    /// The saves sorted so far: the user's, and the ones written during a hand-over.
+    /// The saves sorted so far: the user's, and the ones written while the agent had the controls.
     pub(crate) user: RefCell<BTreeSet<String>>,
     pub(crate) unexpected: RefCell<BTreeSet<String>>,
-    /// The session's patch list's length at the last play_take: the writes after it are this hand-over's.
+    /// The session's patch list's length at the last hands_take: the writes after it are this hand-over's.
     pub(crate) since: Cell<usize>,
 }
 
-impl Play {
-    pub(crate) fn new(saves: Snapshot) -> Play {
-        Play {
+impl Handovers {
+    pub(crate) fn new(saves: Snapshot) -> Handovers {
+        Handovers {
             takes: Cell::new(0),
             baseline: RefCell::new(saves),
             user: RefCell::default(),
@@ -63,16 +69,17 @@ impl Play {
 pub(crate) fn tools() -> Vec<Value> {
     vec![
         json!({
-            "name": "play_take",
-            "description": "Take the controls in a play session (session_launch mode play) once the user asked for \
-                it here. The client asks the user on every call (user_ok is only your word): never route around a \
-                denial. While the user has the controls, quen refuses what sends input, writes to the game or moves \
-                the focus (game_keys, game_console, game_load, game_pause, game_settime, game_weather, game_teleport, \
-                game_save, game_camera with a pose, game_cvar set or restore, mem_patch, mem_unpatch, measure_ab, \
-                sweep_play, focus) and runs reads. Answers hand_over (n: quen's run ids are <session>-h<n>-<tag>) and \
-                user_saves (the saves the user made since the last hand-over). Refused, nothing changed: no user_ok, \
-                not a play session, the agent has them already, the game not running, a wrong token, another \
-                connection's session.",
+            "name": "hands_take",
+            "description": "Take the controls of the game from the user, once the user asked for it here: in a play \
+                session (session_launch mode play), where the user has them from the launch, or in a test session \
+                after hands_give. The client asks the user on every call (user_ok is only your word): never route \
+                around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
+                moves the focus (game_keys, game_console, game_load, game_pause, game_settime, game_weather, \
+                game_teleport, game_save, game_camera with a pose, game_cvar set or restore, mem_patch, mem_unpatch, \
+                measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
+                are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
+                Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
+                another connection's session.",
             // Claude Code prompts for this tool on every call, in every permission mode, as for session_launch.
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": schema(json!({
@@ -80,17 +87,20 @@ pub(crate) fn tools() -> Vec<Value> {
             }), &["user_ok"]),
         }),
         json!({
-            "name": "play_return",
-            "description": "Give the controls back to the user in a play session. No prompt; the focus stays where it \
-                is. Refused while a memory patch or cvar write of this hand-over is still applied (applied names \
-                them): undo each (mem_unpatch, game_cvar restore), or pass keep_writes with the user's OK. Then, with \
-                a game loaded, quen's pause goes off and a camera path stops (pause, path: the game's replies), and the \
-                controls go back. kept: this hand-over's teleports, settime and weather, which stay in the user's \
-                game; unexpected_saves: saves written during the hand-over (the end lists them too). Refused: not a \
-                play session, the user has the controls, a wrong token. Failed: the pause or the path wasn't undone \
-                (left); the controls went back.",
+            "name": "hands_give",
+            "description": "Give the controls of the game to the user: back in a play session, or in a test session \
+                for the user to do something in the game. No prompt; the focus stays where it is. applied: memory \
+                patches and cvar writes still applied (in a play session, this hand-over's). A play session refuses \
+                while there is one, unless keep_writes with the user's OK; a \
+                test session gives the controls with them applied. Then quen's pause goes off and a camera path stops \
+                (pause, path: the game's replies), the game shows for 8 s that the user has the controls and hands \
+                them back in the chat (notice: its reply, or why not; quen-w3 0.1.8+), and the controls go to the \
+                user. kept: this hand-over's teleports, settime and weather; unexpected_saves: saves written while \
+                the agent had the controls. A save the user makes while holding them is theirs (hands_take's \
+                user_saves, the end's saves.user). Refused: the user has them already, a wrong token. Failed: the \
+                pause or the path wasn't undone (left); the controls went to the user.",
             "inputSchema": schema(json!({
-                "keep_writes": {"type": "boolean", "description": "give the controls back with this hand-over's memory patches and cvar writes still applied, the user having agreed. Default false: refused while any is"},
+                "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches and cvar writes still applied, the user having agreed. Default false: refused while any is"},
             }), &[]),
         }),
     ]
@@ -105,50 +115,41 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_screenshot" | "game_listsaves" | "world_get" | "measure_presentmon" | "mem_read"
         | "mem_scan" | "mem_follow" | "sweep_save" | "capture_clean" => true,
-        tool => tool.starts_with("session_") || tool.starts_with("play_"),
+        tool => tool.starts_with("session_") || tool.starts_with("hands_"),
     }
 }
 
 /// Why `tool` is refused while the user has the controls.
 pub(crate) fn user_has(tool: &str) -> String {
     format!(
-        "the user has the controls (a play session): {tool} sends input, writes to the game or moves the focus. \
-         Nothing done. Ask the user in the chat; with their OK, play_take"
+        "the user has the controls: {tool} sends input, writes to the game or moves the focus. Nothing done. Ask the \
+         user in the chat; with their OK, hands_take"
     )
 }
 
 /// Sorts what changed in gamesaves since the last sort, beyond the game's own saves and quen's, as the user's saves
-/// (`user`) or as a hand-over's, and sorts from now on next time. The names it sorted.
+/// (`user`) or as unexpected ones, and sorts from now on next time. The names it sorted.
 pub(crate) fn sort(live: &Live, user: bool) -> Vec<String> {
-    let Some(play) = &live.play else {
-        return Vec::new();
-    };
+    let h = &live.handovers;
     let now = saves::snapshot(&live.saves);
     let (_, found) = live.sorted(&now);
-    let to = if user { &play.user } else { &play.unexpected };
+    let to = if user { &h.user } else { &h.unexpected };
     to.borrow_mut().extend(found.iter().cloned());
-    *play.baseline.borrow_mut() = now;
+    *h.baseline.borrow_mut() = now;
     found
 }
 
-/// The play session of the call's live session, or why there is none.
-fn playing<'c>(cx: &game::Ctx<'c>) -> Result<&'c Play, String> {
-    cx.live.play.as_ref().ok_or_else(|| {
-        "not a play session: the controls are the agent's for the whole of a test session".into()
-    })
-}
-
-/// `play_take`.
+/// `hands_take`.
 pub(crate) fn take(session: &Session, call: &mut Call, args: &Value) -> Done {
     taken(session, call, args).map_or_else(|done| done, Done::Ok)
 }
 
 fn taken(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = game::ctx(session, args, &["user_ok"])?;
-    let play = playing(&cx)?;
-    if cx.hands == Some(Hands::Agent) {
+    let h = &cx.live.handovers;
+    if cx.hands != Some(Hands::User) {
         return Err(
-            "the agent has the controls already (play_return gives them back)"
+            "the agent has the controls already (hands_give gives them to the user)"
                 .to_string()
                 .into(),
         );
@@ -158,46 +159,51 @@ fn taken(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         return Err(why.to_string().into());
     }
     if cx.live.job.pids().unwrap_or_default().is_empty() {
-        let why = "the game isn't running: the session ends by itself";
+        let why = match cx.live.play {
+            true => "the game isn't running: the session ends by itself",
+            false => "the game isn't running: session_end",
+        };
         return Err(why.to_string().into());
     }
     let user_saves = sort(cx.live, true);
-    play.takes.set(play.takes.get() + 1);
-    play.since.set(cx.live.patches.borrow().len());
+    h.takes.set(h.takes.get() + 1);
+    h.since.set(cx.live.patches.borrow().len());
     session.shared.set_hands(Some(Hands::Agent));
     call.lap("take");
     Ok(Map::from_iter([
-        ("hand_over".into(), json!(play.takes.get())),
+        ("hand_over".into(), json!(h.takes.get())),
         ("user_saves".into(), json!(user_saves)),
     ]))
 }
 
-/// `play_return`.
-pub(crate) fn give_back(session: &Session, call: &mut Call, args: &Value) -> Done {
+/// `hands_give`.
+pub(crate) fn give(session: &Session, call: &mut Call, args: &Value) -> Done {
     given(session, call, args).map_or_else(|done| done, Done::Ok)
 }
 
 fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = game::ctx(session, args, &["keep_writes"])?;
-    let play = playing(&cx)?;
-    if cx.hands != Some(Hands::Agent) {
+    let h = &cx.live.handovers;
+    if cx.hands == Some(Hands::User) {
         return Err("the user has the controls already".to_string().into());
     }
     let keep = flag(args, "keep_writes")?;
     let (applied, kept) = {
         let patches = cx.live.patches.borrow();
-        let mine = patches.get(play.since.get()..).unwrap_or_default();
+        let mine = patches.get(h.since.get()..).unwrap_or_default();
         let kept: Vec<Value> = mine
             .iter()
             .filter(|(_, p)| p["write"].is_null() && p["taints"] == true)
             .map(|(_, p)| p["what"].clone())
             .collect();
-        (applied(mine), kept)
+        // A test session's writes stay applied across its hand-overs: all of them count.
+        let writes = if cx.live.play { mine } else { &patches[..] };
+        (applied(writes), kept)
     };
     let mut fields = Map::new();
     if !applied.is_empty() {
         fields.insert("applied".into(), json!(applied));
-        if !keep {
+        if cx.live.play && !keep {
             let why = "a memory patch or cvar write of this hand-over is still applied (applied): undo each \
                        (mem_unpatch, game_cvar restore), or pass keep_writes: true with the user's OK. Nothing done";
             return Err(Done::RefusedWith(why.into(), fields));
@@ -226,11 +232,27 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         }
         call.lap(what);
     }
+    // The user may be in the game when the controls go to them: it says so, and where to hand them back.
+    let shown =
+        match doctor::package_version(cx.config).filter(|v| doctor::BEFORE_NOTICE.contains(v)) {
+            Some(old) => Err(format!(
+                "not shown: {old} has no notice (quen-w3 0.1.8 or later)"
+            )),
+            None => cx.channel().and_then(|c| {
+                let verb = Verb::Notice {
+                    text: NOTICE.into(),
+                };
+                c.call(verb, REPLY_MAX).map_err(|e| e.why().to_string())
+            }),
+        };
+    let notice = shown.map_or_else(|why| why, |reply| reply.text);
+    fields.insert("notice".into(), json!(notice));
+    call.lap("notice");
     fields.insert("unexpected_saves".into(), json!(sort(cx.live, false)));
     session.shared.set_hands(Some(Hands::User));
     if !left.is_empty() {
         fields.insert("left".into(), json!(left));
-        let why = "the controls went back to the user, but quen's pause or the camera path wasn't undone (left)";
+        let why = "the controls went to the user, but quen's pause or the camera path wasn't undone (left)";
         return Err(Done::Failed(why.into(), fields));
     }
     Ok(fields)
@@ -308,19 +330,19 @@ mod tests {
             "mem_follow",
             "sweep_save",
             "session_end",
-            "play_take",
-            "play_return",
+            "hands_take",
+            "hands_give",
         ] {
             assert!(user_may(tool, &none), "{tool}");
         }
     }
 
-    /// The Fake's session as a play session, the agent holding the controls since its first hand-over.
-    fn handed_over(fx: &Fake) -> Session<'_> {
+    /// The Fake's session, a play session or a test one, the agent holding the controls since its first hand-over.
+    fn handed_over(fx: &Fake, play: bool) -> Session<'_> {
         let mut session = fx.session();
         let live = session.live.as_mut().unwrap();
-        live.play = Some(Play::new(Snapshot::new()));
-        live.play.as_ref().unwrap().takes.set(1);
+        live.play = play;
+        live.handovers.takes.set(1);
         fx.shared.set_hands(Some(Hands::Agent));
         session
     }
@@ -328,8 +350,8 @@ mod tests {
     fn run(session: &Session, tool: &str, args: Value) -> Value {
         let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
         let done = match tool {
-            "play_take" => take(session, &mut call, &args),
-            _ => give_back(session, &mut call, &args),
+            "hands_take" => take(session, &mut call, &args),
+            _ => give(session, &mut call, &args),
         };
         session.envelope(tool, call, done)
     }
@@ -341,27 +363,19 @@ mod tests {
         live.patches.borrow_mut().push((SystemTime::now(), p));
     }
 
-    /// play_return refuses while a memory patch or cvar write of this hand-over is applied, unless
+    /// In a play session hands_give refuses while a memory patch or cvar write of this hand-over is applied, unless
     /// keep_writes; an undone one doesn't count, an earlier hand-over's isn't its own, and a teleport is listed as kept.
     #[test]
-    fn play_return_refuses_while_a_write_of_the_hand_over_is_applied() {
+    fn hands_give_in_a_play_session_refuses_while_a_write_of_the_hand_over_is_applied() {
         let fx = Fake::new("play-return");
-        let session = handed_over(&fx);
+        let session = handed_over(&fx, true);
         let tok = json!({"token": "tok"});
         patch(
             &session,
             "an earlier hand-over's",
             json!({"address": 7, "old": "00", "new": "01"}),
         );
-        session
-            .live
-            .as_ref()
-            .unwrap()
-            .play
-            .as_ref()
-            .unwrap()
-            .since
-            .set(1);
+        session.live.as_ref().unwrap().handovers.since.set(1);
         patch(
             &session,
             "cvar X set 1 at 0x10",
@@ -378,13 +392,13 @@ mod tests {
             "mem_unpatch cull at 0x20",
             json!({"address": 32, "old": "bb", "new": "aa"}),
         );
-        let out = run(&session, "play_return", tok.clone());
+        let out = run(&session, "hands_give", tok.clone());
         assert_eq!(out["refused"], true, "{out}");
         assert_eq!(out["applied"], json!(["cvar X set 1 at 0x10"]), "{out}");
         assert_eq!(fx.shared.hands(), Some(Hands::Agent), "nothing changed");
         let bad = run(
             &session,
-            "play_return",
+            "hands_give",
             json!({"token": "tok", "keep_writes": "yes"}),
         );
         assert_eq!(bad["refused"], true, "{bad}");
@@ -394,7 +408,7 @@ mod tests {
             "cvar X back to its value before quen's first write at 0x10",
             json!({"address": 16, "old": "01", "new": "00"}),
         );
-        let out = run(&session, "play_return", tok.clone());
+        let out = run(&session, "hands_give", tok.clone());
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(
             out["kept"],
@@ -402,7 +416,12 @@ mod tests {
             "{out}"
         );
         assert_eq!(out["state"]["hands"], "user", "{out}");
-        let again = run(&session, "play_return", tok.clone());
+        // The Fake's game serves no channel: the notice says why it isn't shown, and the controls went anyway.
+        assert!(
+            out["notice"].as_str().unwrap().contains("isn't up"),
+            "{out}"
+        );
+        let again = run(&session, "hands_give", tok.clone());
         assert_eq!(again["refused"], true, "{again}");
         // keep_writes: the controls go back with the write still applied, named.
         fx.shared.set_hands(Some(Hands::Agent));
@@ -413,59 +432,74 @@ mod tests {
         );
         let out = run(
             &session,
-            "play_return",
+            "hands_give",
             json!({"token": "tok", "keep_writes": true}),
         );
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["applied"][0], "cvar Y set 2 at 0x30", "{out}");
     }
 
-    /// play_take: refused without user_ok, outside a play session and while the agent has the controls; then it sorts
-    /// the user's saves since the last hand-over and counts the hand-overs.
+    /// A test session gives the controls with its writes applied, all of the session's named.
     #[test]
-    fn play_take_takes_the_controls_with_the_users_ok() {
-        let fx = Fake::new("play-take");
-        let test = fx.session();
-        let out = run(&test, "play_take", json!({"token": "tok", "user_ok": true}));
-        assert!(
-            out["reason"]
-                .as_str()
-                .unwrap()
-                .contains("not a play session"),
-            "{out}"
+    fn hands_give_in_a_test_session_keeps_the_agents_writes() {
+        let fx = Fake::new("test-give");
+        let session = handed_over(&fx, false);
+        patch(
+            &session,
+            "mem_patch cull at 0x20",
+            json!({"address": 32, "old": "aa", "new": "bb"}),
         );
-        let session = handed_over(&fx);
+        session.live.as_ref().unwrap().handovers.since.set(1);
+        let out = run(&session, "hands_give", json!({"token": "tok"}));
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["applied"], json!(["mem_patch cull at 0x20"]), "{out}");
+        assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// hands_take: refused without user_ok and while the agent has the controls; then it sorts the user's saves since
+    /// the last hand-over and counts the hand-overs, in a play session and in a test one.
+    #[test]
+    fn hands_take_takes_the_controls_with_the_users_ok() {
+        let fx = Fake::new("play-take");
         let dir = fx.dir.join("gamesaves");
         std::fs::create_dir_all(&dir).unwrap();
-        let held = run(
-            &session,
-            "play_take",
-            json!({"token": "tok", "user_ok": true}),
-        );
-        assert!(
-            held["reason"].as_str().unwrap().contains("already"),
-            "{held}"
-        );
-        fx.shared.set_hands(Some(Hands::User));
-        for args in [
-            json!({"token": "tok"}),
-            json!({"token": "tok", "user_ok": false}),
-            json!({"token": "x", "user_ok": true}),
-        ] {
-            let out = run(&session, "play_take", args.clone());
-            assert_eq!(out["refused"], true, "{args}: {out}");
+        for play in [true, false] {
+            let session = handed_over(&fx, play);
+            let held = run(
+                &session,
+                "hands_take",
+                json!({"token": "tok", "user_ok": true}),
+            );
+            assert!(
+                held["reason"].as_str().unwrap().contains("already"),
+                "{held}"
+            );
+            fx.shared.set_hands(Some(Hands::User));
+            for args in [
+                json!({"token": "tok"}),
+                json!({"token": "tok", "user_ok": false}),
+                json!({"token": "x", "user_ok": true}),
+            ] {
+                let out = run(&session, "hands_take", args.clone());
+                assert_eq!(out["refused"], true, "{args}: {out}");
+            }
+            assert_eq!(fx.shared.hands(), Some(Hands::User));
+            let user = format!("ManualSave_user_{play}.sav");
+            std::fs::write(dir.join(&user), "the user's").unwrap();
+            std::fs::write(dir.join("AutoSave_1.sav"), format!("the game's {play}")).unwrap();
+            let out = run(
+                &session,
+                "hands_take",
+                json!({"token": "tok", "user_ok": true}),
+            );
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(out["hand_over"], 2, "{out}");
+            // The session's baseline is the launch's (empty): every manual save so far is the user's.
+            assert!(
+                out["user_saves"].as_array().unwrap().contains(&json!(user)),
+                "{out}"
+            );
+            assert_eq!(out["state"]["hands"], "agent", "{out}");
         }
-        assert_eq!(fx.shared.hands(), Some(Hands::User));
-        std::fs::write(dir.join("ManualSave_user.sav"), "the user's").unwrap();
-        std::fs::write(dir.join("AutoSave_1.sav"), "the game's").unwrap();
-        let out = run(
-            &session,
-            "play_take",
-            json!({"token": "tok", "user_ok": true}),
-        );
-        assert_eq!(out["ok"], true, "{out}");
-        assert_eq!(out["hand_over"], 2, "{out}");
-        assert_eq!(out["user_saves"], json!(["ManualSave_user.sav"]), "{out}");
-        assert_eq!(out["state"]["hands"], "agent", "{out}");
     }
 }

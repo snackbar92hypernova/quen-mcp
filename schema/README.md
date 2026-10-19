@@ -183,7 +183,7 @@ removal.
 One number. `id`; `boot_id` → boots (NULL for a static fact); `capture_id` → captures (the file it was read from);
 `metric` (e.g. `frame_ms_mean`, `gpu_busy_ms_p95`); `value`; `unit`; `state_label` (the A/B state it was measured in,
 e.g. `A`); `method_family` (the tool, see above); `tag` (M, O, I, U, static_re); `run_id` (groups the rows of one run:
-measure_ab's is `<session>-<tag>`, in a play session `<session>-h<n>-<tag>` with n the hand-overs (play_take) before
+measure_ab's is `<session>-<tag>`, in a play session `<session>-h<n>-<tag>` with n the hand-overs (hands_take) before
 it, and each of its windows is one row per metric); `world` (what the world did during the window, as quen saw it:
 `user`, the user had the controls; `live`, the agent had them and the world ran; `paused`, quen's pause was on;
 `photo`, photo mode; NULL: not recorded, every row before schema 0011); `note`. quen's presentmon rows' note

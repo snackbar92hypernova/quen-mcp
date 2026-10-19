@@ -423,7 +423,7 @@ fn only_the_launching_connection_writes_about_its_boot() {
         ("game_console", json!({"token": token, "line": "x"})),
         ("focus", json!({"token": token, "to": "client"})),
         ("game_save", json!({"token": token, "user_ok": true})),
-        ("play_take", json!({"token": token, "user_ok": true})),
+        ("hands_take", json!({"token": token, "user_ok": true})),
         ("world_get", json!({"token": token})),
         ("capture_clean", json!({"boots": [boot], "user_ok": true})),
         ("session_end", json!({"token": token})),

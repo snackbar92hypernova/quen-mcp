@@ -25,8 +25,8 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::boot::{self, Spec};
 use crate::config::{self, Config};
+use crate::hands::{self, Hands};
 use crate::mcp::{self, Conn, Msg};
-use crate::play::{self, Hands};
 use crate::w3;
 use crate::win::{self, Child, Job, try_lock};
 use crate::{camera, disk, doctor, focus, game, measure, mem, profile, save};
@@ -70,7 +70,7 @@ pub struct Shared {
     /// The lock file while this process holds it. Taking it and reading it for status both lock this mutex, so
     /// status never sees the file held while this quen is still taking it.
     lock: Mutex<Option<File>>,
-    /// Who has the controls in a play session (play.rs); None outside one.
+    /// Who has the controls of the live session's game (hands.rs); None without one.
     hands: Mutex<Option<Hands>>,
     /// What the replay at start did ("running" until it is done), if there was one: status reports it.
     startup: Mutex<Option<Value>>,
@@ -189,7 +189,7 @@ impl Shared {
         locked(&self.job).is_some()
     }
 
-    /// Who has the controls in a play session; None outside one.
+    /// Who has the controls of the live session's game; None without one.
     pub(crate) fn hands(&self) -> Option<Hands> {
         *locked(&self.hands)
     }
@@ -331,12 +331,17 @@ pub(crate) struct Live {
     pub(crate) tracy_connected: Cell<bool>,
     /// The game's build as the launch's gate read it: the KB's build line is checked against it.
     pub(crate) build: Build,
-    /// A play session's hand-overs and saves; None for a test session.
-    pub(crate) play: Option<play::Play>,
-    /// quen's pause, as the game's last pause reply said it (game_pause, sweep_play, play_return), and whether a
-    /// sweep's camera path may still be loaded (its stop failed): what play_return undoes.
+    /// A play session (session_launch mode play): the user has the controls from the launch, and plays on when the
+    /// connection that launched closes.
+    pub(crate) play: bool,
+    /// The session's hand-overs of the controls, and the saves sorted at each (hands.rs).
+    pub(crate) handovers: hands::Handovers,
+    /// quen's pause, as the game's last pause reply said it (game_pause, sweep_play, hands_give), and whether a
+    /// sweep's camera path may still be loaded (its stop failed): what hands_give undoes.
     pub(crate) paused: Cell<bool>,
     pub(crate) path: Cell<bool>,
+    /// Keeps the PC and its display awake for exactly as long as the session lives.
+    pub(crate) _awake: crate::win::Awake,
 }
 
 impl Live {
@@ -346,14 +351,11 @@ impl Live {
         self.sorted(&saves::snapshot(&self.saves))
     }
 
-    /// [`Live::unexpected`] for gamesaves as `now` holds it. A play session sorts gamesaves at every hand-over, so its
-    /// guard's part is only what changed since the last sort (play.rs).
+    /// [`Live::unexpected`] for gamesaves as `now` holds it. Gamesaves is sorted at every hand-over, so the guard's part
+    /// is only what changed since the last sort (hands.rs).
     pub(crate) fn sorted(&self, now: &Snapshot) -> (Vec<String>, Vec<String>) {
         let changed = saves::changed(&self.saves_before, now);
-        let since = match &self.play {
-            Some(play) => saves::changed(&play.baseline.borrow(), now),
-            None => changed.clone(),
-        };
+        let since = saves::changed(&self.handovers.baseline.borrow(), now);
         let ours = self.quen_saves.borrow();
         let bad = saves::unexpected(&since, saves::W3_AUTO_SAVES)
             .into_iter()
@@ -412,11 +414,10 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                 job.start();
                 let mut call = session.call(conn.clone(), id.clone(), progress);
                 call.job = Some(job.clone());
-                // Only the connection that launched the session drives and ends it, and in a play session only while
-                // the user lets it.
+                // Only the connection that launched the session drives and ends it, and only while the user lets it.
                 let refused = shared.refusal(conn.id, &name).or_else(|| {
                     let user = shared.hands() == Some(Hands::User);
-                    (user && !play::user_may(&name, &args)).then(|| play::user_has(&name))
+                    (user && !hands::user_may(&name, &args)).then(|| hands::user_has(&name))
                 });
                 let done = match name.as_str() {
                     _ if refused.is_some() => Done::Refused(refused.unwrap_or_default()),
@@ -425,8 +426,8 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                     "session_end" => session.end(&mut call, &args),
                     "capture_clean" => disk::clean(&mut session, &mut call, &args),
                     "focus" => focus::call(&session, &mut call, &args),
-                    "play_take" => play::take(&session, &mut call, &args),
-                    "play_return" => play::give_back(&session, &mut call, &args),
+                    "hands_take" => hands::take(&session, &mut call, &args),
+                    "hands_give" => hands::give(&session, &mut call, &args),
                     "world_get" => game::call(&mut session, &mut call, "world_get", &args),
                     n @ ("game_keys" | "game_console" | "game_load") => {
                         let done = game::call(&mut session, &mut call, n, &args);
@@ -456,7 +457,7 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
             }
             Msg::Dropped(conn) => match &session.live {
                 // The user plays on; the session ends when the game exits.
-                Some(live) if live.owner == conn && live.play.is_some() => {
+                Some(live) if live.owner == conn && live.play => {
                     shared.set_hands(Some(Hands::User));
                     eprintln!(
                         "quen: the connection that launched the play session closed: the user has the controls, \
@@ -814,7 +815,7 @@ impl<'a> Session<'a> {
     /// A play session ends by itself once its game has exited (the user quit it, or it crashed), its files given
     /// back at once.
     fn end_if_gone(&mut self) {
-        let Some(live) = self.live.as_ref().filter(|l| l.play.is_some()) else {
+        let Some(live) = self.live.as_ref().filter(|l| l.play) else {
             return;
         };
         let exited = locked(&self.shared.game).as_ref().and_then(Child::exited);
@@ -1200,9 +1201,11 @@ impl<'a> Session<'a> {
             profiler: spec.profiler.clone(),
             tracy_connected: Cell::new(false),
             build: exe.build,
-            play: spec.play.then(|| play::Play::new(saves_before)),
+            play: spec.play,
+            handovers: hands::Handovers::new(saves_before),
             paused: Cell::new(false),
             path: Cell::new(false),
+            _awake: crate::win::Awake::hold(),
         });
         fields.insert("session".into(), json!(id));
         fields.insert("game_build".into(), game_build);
@@ -1328,10 +1331,9 @@ impl<'a> Session<'a> {
             cx.game_pid().ok()
         });
         *locked(&self.shared.game) = pid.and_then(|pid| Child::open(pid).ok());
-        // The controls go to the user once the game runs.
-        if spec.play {
-            self.shared.set_hands(Some(Hands::User));
-        }
+        // In a play session the controls go to the user once the game runs; in a test session they are the agent's.
+        let hands = if spec.play { Hands::User } else { Hands::Agent };
+        self.shared.set_hands(Some(hands));
         fields.insert("token".into(), json!(token));
         fields.insert("pids".into(), json!(job.pids().unwrap_or_default()));
         if !warnings.is_empty() {
@@ -1365,10 +1367,10 @@ impl<'a> Session<'a> {
             return Ok(());
         }
         let then = match live.play {
-            Some(_) => {
-                "the controls went back to the user (play_take takes them again); the end lists them"
+            true => {
+                "the controls went back to the user (hands_take takes them again); the end lists them"
             }
-            None => "the session was ended",
+            false => "the session was ended",
         };
         Err(format!(
             "gamesaves changed beyond the game's own AutoSave / CheckPoint saves: {bad:?}: {then}"
@@ -1387,8 +1389,8 @@ impl<'a> Session<'a> {
             Done::Refused(_) | Done::Needs(..) => Map::new(),
             Done::RefusedWith(_, fields) => fields,
         };
-        if let Some(live) = self.live.as_ref().filter(|l| l.play.is_some()) {
-            play::sort(live, false);
+        if let Some(live) = self.live.as_ref().filter(|l| l.play) {
+            hands::sort(live, false);
             self.shared.set_hands(Some(Hands::User));
             return Done::Failed(why, fields);
         }
@@ -1434,7 +1436,7 @@ impl<'a> Session<'a> {
             );
         }
         // A play session's game holds the user's progress; the session ends by itself when the user quits it.
-        if live.play.is_some() && !close && live.job.pids().is_ok_and(|p| !p.is_empty()) {
+        if live.play && !close && live.job.pids().is_ok_and(|p| !p.is_empty()) {
             return Done::Refused(
                 "the play session's game runs, holding the user's progress: the session ends by itself when the user \
                  quits the game. To close the game now, the user saves first and agrees, then close_game: true"
@@ -1479,21 +1481,18 @@ impl<'a> Session<'a> {
         {
             fields.insert("tracy".into(), tracy);
         }
-        // The game is gone, so gamesaves is final: what it wrote since the launch, tainted saves first. A play
-        // session's last changes are the user's or a hand-over's, as the controls were at the end.
-        let (changed, mut unexpected) = live.unexpected();
-        let hands = self.shared.hands();
+        // The game is gone, so gamesaves is final: what it wrote since the launch, tainted saves first. The last
+        // changes are the user's or unexpected, as the controls were at the end.
+        let (changed, last) = live.unexpected();
+        let h = &live.handovers;
+        let to = match self.shared.hands() {
+            Some(Hands::User) => &h.user,
+            _ => &h.unexpected,
+        };
+        to.borrow_mut().extend(last);
         self.shared.set_hands(None);
-        let user = live.play.as_ref().map(|play| {
-            let last = std::mem::take(&mut unexpected);
-            let to = match hands {
-                Some(Hands::Agent) => &play.unexpected,
-                _ => &play.user,
-            };
-            to.borrow_mut().extend(last);
-            unexpected = play.unexpected.borrow().iter().cloned().collect();
-            play.user.borrow().iter().cloned().collect::<Vec<_>>()
-        });
+        let unexpected: Vec<String> = h.unexpected.borrow().iter().cloned().collect();
+        let user: Vec<String> = h.user.borrow().iter().cloned().collect();
         let since = live
             .patches
             .borrow()
@@ -1509,11 +1508,8 @@ impl<'a> Session<'a> {
             })
             .collect();
         let quen: Vec<String> = live.quen_saves.borrow().keys().cloned().collect();
-        let mut saves =
-            json!({"tainted": tainted, "changed": changed, "unexpected": unexpected, "quen": quen});
-        if let Some(user) = user {
-            saves["user"] = json!(user);
-        }
+        let saves = json!({"tainted": tainted, "changed": changed, "unexpected": unexpected, "quen": quen,
+            "user": user});
         fields.insert("saves".into(), saves);
         // What the session left in the capture root, against the budget.
         if let Ok(config) = self.config() {
@@ -2213,12 +2209,13 @@ mod tests {
         let mut session = fx.session();
         let dir = fx.dir.join("gamesaves");
         fs::create_dir_all(&dir).unwrap();
-        session.live.as_mut().unwrap().play = Some(play::Play::new(saves::snapshot(&dir)));
+        let live = session.live.as_mut().unwrap();
+        (live.play, live.handovers) = (true, hands::Handovers::new(saves::snapshot(&dir)));
         fx.shared.set_hands(Some(Hands::User));
         fs::write(dir.join("ManualSave_user.sav"), "the user's").unwrap();
         assert_eq!(session.guard_saves(), Ok(()));
         let live = session.live.as_ref().unwrap();
-        assert_eq!(play::sort(live, true), ["ManualSave_user.sav"]);
+        assert_eq!(hands::sort(live, true), ["ManualSave_user.sav"]);
         fx.shared.set_hands(Some(Hands::Agent));
         assert_eq!(session.guard_saves(), Ok(()));
         fs::write(dir.join("ManualSave_menu.sav"), "a key saved").unwrap();
@@ -2258,6 +2255,39 @@ mod tests {
             "{out}"
         );
         assert!(out["state"].get("hands").is_none(), "{out}");
+    }
+
+    /// A test session handed to the user: their save is theirs, listed at the end as saves.user, not an end of the
+    /// session; once the agent has the controls back, a save ends it.
+    #[test]
+    fn a_test_sessions_hand_over_lists_the_users_saves() {
+        let fx = crate::game::tests::Fake::new("test-saves");
+        let mut session = fx.session();
+        let dir = fx.dir.join("gamesaves");
+        fs::create_dir_all(&dir).unwrap();
+        session.live.as_mut().unwrap().handovers = hands::Handovers::new(saves::snapshot(&dir));
+        fx.shared.set_hands(Some(Hands::User));
+        fs::write(dir.join("ManualSave_user.sav"), "the user's").unwrap();
+        assert_eq!(session.guard_saves(), Ok(()));
+        let live = session.live.as_ref().unwrap();
+        assert_eq!(hands::sort(live, true), ["ManualSave_user.sav"]);
+        fx.shared.set_hands(Some(Hands::Agent));
+        assert_eq!(session.guard_saves(), Ok(()));
+        fs::write(dir.join("ManualSave_menu.sav"), "a key saved").unwrap();
+        let mut call = session.call(Conn::nobody(), Value::Null, None);
+        let done = session.guard_after(&mut call, Done::Ok(Map::new()));
+        let out = session.envelope("game_keys", call, done);
+        assert!(
+            out["reason"]
+                .as_str()
+                .unwrap()
+                .contains("the session was ended"),
+            "{out}"
+        );
+        assert!(session.live.is_none(), "{out}");
+        let saves = &out["end"]["fields"]["saves"];
+        assert_eq!(saves["user"], json!(["ManualSave_user.sav"]), "{out}");
+        assert_eq!(saves["unexpected"], json!(["ManualSave_menu.sav"]), "{out}");
     }
 
     /// Live boot 1: the job empties at once on the kill, but tasklist (which the replay asks) lists the dying game for

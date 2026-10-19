@@ -213,7 +213,9 @@ mod tests {
         touch(&dir.join("QuickSave.sav"), "quick", 100);
         touch(&dir.join("AutoSave_1.sav"), "auto", 100);
         let mut session = fx.session();
-        session.live.as_mut().unwrap().saves_before = saves::snapshot(&dir);
+        let live = session.live.as_mut().unwrap();
+        live.saves_before = saves::snapshot(&dir);
+        live.handovers = crate::hands::Handovers::new(live.saves_before.clone());
         (session, dir)
     }
 

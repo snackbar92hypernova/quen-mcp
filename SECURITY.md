@@ -22,12 +22,13 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 - Each of them gets a short, fixed list of environment variables (Windows' own, and quen's), never your whole environment. An API key or token in your agent's environment doesn't reach the game, its mods, a profiler or PresentMon.
 - quen needs no admin rights. PresentMon needs your account in the Windows *Performance Log Users* group ([INSTALL.md](INSTALL.md) §1).
 - quen downloads and installs nothing.
+- While a session is live, quen keeps the PC and its display awake (`SetThreadExecutionState` with `ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`, on a thread that lives as long as the session); Windows releases it when the session ends, whichever way it ends, or when quen exits.
 
 **Files**
 - During a session quen changes files in the game folder and in the game's Documents folder: settings, the console switch, ReShade's ini files, a `steam_appid.txt`, parked mods, the compiled scripts ([INSTALL.md](INSTALL.md) §6).
 - Each change goes into a journal before it is made, and is undone when the session ends, or after a crash at quen's next start.
 - quen never deletes anything for good: what it removes goes to the Recycle Bin, or, for a capture the bin can't take whole, to `<data root>\_to_delete\` for you to empty. It never restores or deletes your saves.
-- It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back).
+- It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back). A save you make while you have the controls is yours, and the session's end lists it.
 - It removes captures only through `capture_clean`, which your client asks you about on every call, as for a launch.
 - Its own data (the ledger, logs, captures, the journal) stays under its data root, `%USERPROFILE%\.quen\` by default.
 
@@ -44,7 +45,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 **Keyboard and the foreground**
 - quen sends keystrokes to the game's window, and only while that window is in front.
 - During a session, the agent can bring two windows to the front (`focus`): the game's, and its own client's (the first window of a process above `quen mcp`, found when the client connected). quen moves no other window. Bringing the game back, quen sends it one Escape when its state shows a menu outside photo mode: the pause menu the game opened when it lost the front.
-- In a play session (you play the game quen launched), quen refuses keystrokes, writes to the game and `focus` while you have the controls. The agent gets them with `play_take`, which your client asks you about on every call, as for a launch, and gives them back with `play_return`. During a hand-over quen can't tell your input from its own.
+- In a play session (you play the game quen launched), and in a test session after the agent handed you the controls (`hands_give`), quen refuses keystrokes, writes to the game and `focus` while you have them. The agent gets them with `hands_take`, which your client asks you about on every call, as for a launch, and gives them to you with `hands_give`. During a hand-over quen can't tell your input from its own.
 
 **Screenshots**
 - quen captures the game's window. Your agent can't ask for the screen.

@@ -212,7 +212,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "game_settime",
             "description": format!("Set the game's clock to day and hour, as the vanilla console's settime does. \
-                Photo mode's time slider overrides it while photo mode is open. {taints}. {needs}, or {game}."),
+                In photo mode it moved the sun at once (observed 2026-10-19). {taints}. {needs}, or {game}."),
             "inputSchema": schema(json!({
                 "day": {"type": "integer", "minimum": 0, "description": "the game's day count (settime's first argument)"},
                 "hour": {"type": "integer", "minimum": 0, "maximum": 23, "description": "0 to 23"},
@@ -667,7 +667,7 @@ pub(crate) mod tests {
                 vec![reply(r.id, true, "the world", Some(data.clone()))]
             }),
         );
-        fx.shared.set_hands(Some(crate::play::Hands::User));
+        fx.shared.set_hands(Some(crate::hands::Hands::User));
         let mut session = fx.session();
         let out = run(&mut session, "world_get", json!({"token": "tok"}));
         assert_eq!(out["ok"], true, "{out}");
