@@ -8,7 +8,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quen_core::journal::sha256_hex;
@@ -343,7 +343,7 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
         }
         let data =
             json!({"sql": sql, "params": params, "columns": rows.columns, "rows": rows.rows});
-        let file = spill(config, &data, artifacts)?;
+        let file = spill(&queries(config), &data, artifacts)?;
         let mut size = 0;
         let head: Vec<&Vec<Value>> = rows
             .rows
@@ -364,13 +364,13 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
     }
 }
 
-/// `data` written to a new JSON file under `<data root>\logs\queries`, listed in `artifacts`: its path.
+/// `data` written to a new JSON file in `dir`, listed in `artifacts`: its path. ledger_query's go under
+/// `<data root>\logs\queries` ([`queries`]), the mem tools' into the session's capture folder.
 pub(crate) fn spill(
-    config: &Config,
+    dir: &Path,
     data: &Value,
     artifacts: &mut Vec<Value>,
 ) -> Result<PathBuf, String> {
-    let dir = config.data_root.join("logs").join("queries");
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -384,6 +384,11 @@ pub(crate) fn spill(
         .map_err(|e| format!("{}: {e}", file.display()))?;
     artifacts.push(json!({"path": file, "sha256": sha256_hex(data.as_bytes())}));
     Ok(file)
+}
+
+/// Where ledger_query and ledger_about put a result too big to answer inline.
+fn queries(config: &Config) -> PathBuf {
+    config.data_root.join("logs").join("queries")
 }
 
 fn done(fields: Result<Map<String, Value>, String>) -> Done {
@@ -479,7 +484,7 @@ fn about(
         "addresses": len(&answer["addresses"]), "claims": len(&answer["claims"]), "links": len(&answer["links"]),
         "sections": len(&answer["sections"]), "exact": len(&x["exact"]), "near": len(&x["near"]), "gone": len(&x["gone"]),
     });
-    let file = spill(config, &answer, artifacts)?;
+    let file = spill(&queries(config), &answer, artifacts)?;
     Ok(Map::from_iter([
         ("entity".into(), answer["entity"].clone()),
         ("extracted".into(), answer["extracted"].clone()),

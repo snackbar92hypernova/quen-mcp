@@ -653,7 +653,8 @@ fn inline(cx: &Ctx, call: &mut Call, out: Fields, list: &str) -> Result<Fields, 
         return Ok(fields(data));
     }
     // spill lists the file in a list of its own; the call's artifacts are Call::artifact's, which hashes it again.
-    let file = ledger::spill(cx.config, &data, &mut Vec::new())?;
+    let dir = cx.config.capture_root().join(&cx.live.id);
+    let file = ledger::spill(&dir, &data, &mut Vec::new())?;
     call.artifact(&file);
     let mut out = fields(data);
     if let Some(Value::Array(items)) = out.get_mut(list) {

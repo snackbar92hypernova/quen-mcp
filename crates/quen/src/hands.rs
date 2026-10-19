@@ -114,7 +114,9 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_screenshot" | "game_listsaves" | "world_get" | "measure_presentmon" | "mem_read"
-        | "mem_scan" | "mem_follow" | "sweep_save" | "capture_clean" => true,
+        | "mem_scan" | "mem_follow" | "mem_walk" | "mem_find" | "sweep_save" | "capture_clean" => {
+            true
+        }
         tool => tool.starts_with("session_") || tool.starts_with("hands_"),
     }
 }
@@ -328,6 +330,8 @@ mod tests {
             "mem_read",
             "mem_scan",
             "mem_follow",
+            "mem_walk",
+            "mem_find",
             "sweep_save",
             "session_end",
             "hands_take",
