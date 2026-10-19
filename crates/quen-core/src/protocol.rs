@@ -86,10 +86,85 @@ pub enum Verb {
     /// [`MAX_NOTICE_BYTES`] bytes, no control character.
     #[serde(rename = "notice")]
     Notice { text: String },
+    /// Open (`on`) or close photo mode by the game's own functions, never by keys; closing skips its exit dialog.
+    #[serde(rename = "photo.mode")]
+    PhotoMode { on: bool },
+    /// Read photo mode's own state (the reply's data, as after every photo set below); changes nothing.
+    #[serde(rename = "photo.get")]
+    PhotoGet {},
+    /// Photo mode's own weather: a name of the area's list.
+    #[serde(rename = "photo.weather")]
+    PhotoWeather { name: String },
+    /// Photo mode's environment definition, by a path the game lists (`photo.list` envs).
+    #[serde(rename = "photo.env")]
+    PhotoEnv { path: String },
+    /// Photo mode's time of day, `minute` as its menu's slider passes it: minutes of the day, 0 to below 1440.
+    #[serde(rename = "photo.time")]
+    PhotoTime { minute: f32 },
+    /// Photo mode's grading sliders: the ones given, at least one.
+    #[serde(rename = "photo.grade")]
+    PhotoGrade {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exposure: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contrast: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highlights: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saturation: Option<f32>,
+        /// Kelvin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vignette: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grain: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chromatic_aberration: Option<f32>,
+    },
+    /// Photo mode's weather (the world's back), env (none) or grading (the sliders as photo mode opened).
+    #[serde(rename = "photo.reset")]
+    PhotoReset { part: PhotoPart },
+    /// Photo mode's one-off world tick and cloth simulation, in seconds, 0 to [`MAX_TICK_S`]: at least one.
+    #[serde(rename = "photo.tick")]
+    PhotoTick {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick_s: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cloth_s: Option<f32>,
+    },
+    /// The area's weather names or every environment definition's path, those holding `filter` (any case) if given.
+    #[serde(rename = "photo.list")]
+    PhotoList {
+        what: PhotoListed,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
+}
+
+/// What `photo.reset` puts back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoPart {
+    Weather,
+    Env,
+    Grading,
+}
+
+/// What `photo.list` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoListed {
+    Weathers,
+    Envs,
 }
 
 /// The longest notice text, in bytes.
 pub const MAX_NOTICE_BYTES: usize = 160;
+/// The longest `photo.list` filter, in bytes.
+pub const MAX_FILTER_BYTES: usize = 200;
+/// The longest `photo.tick` time, in seconds (photo mode's menu itself passes 0.00001 s and 1 s).
+pub const MAX_TICK_S: f32 = 10.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,10 +201,75 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// photo.grade's sliders, in the order the game reads them back (the photo read-back's `grading`).
+pub const GRADING: [&str; 8] = [
+    "exposure",
+    "contrast",
+    "highlights",
+    "saturation",
+    "temperature",
+    "vignette",
+    "grain",
+    "chromatic_aberration",
+];
+
 impl Verb {
+    /// photo.grade's values in [`GRADING`]'s order, or photo.tick's tick_s and cloth_s; none for another verb.
+    pub fn photo_values(&self) -> Vec<Option<f32>> {
+        match *self {
+            Verb::PhotoGrade {
+                exposure,
+                contrast,
+                highlights,
+                saturation,
+                temperature,
+                vignette,
+                grain,
+                chromatic_aberration,
+            } => vec![
+                exposure,
+                contrast,
+                highlights,
+                saturation,
+                temperature,
+                vignette,
+                grain,
+                chromatic_aberration,
+            ],
+            Verb::PhotoTick { tick_s, cloth_s } => vec![tick_s, cloth_s],
+            _ => Vec::new(),
+        }
+    }
+
     fn check(&self) -> Result<(), Error> {
         let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+        let name = |s: &str| !s.is_empty() && !s.bytes().any(|b| b < 0x20);
         match self {
+            Verb::PhotoWeather { name: s } | Verb::PhotoEnv { path: s } if !name(s) => Err(
+                Error::Invalid("an empty name, or one with a control character".into()),
+            ),
+            Verb::PhotoList {
+                filter: Some(filter),
+                ..
+            } if !name(filter) || filter.len() > MAX_FILTER_BYTES => Err(Error::Invalid(format!(
+                "a filter is 1 to {MAX_FILTER_BYTES} bytes, no control character"
+            ))),
+            Verb::PhotoTime { minute } if !(0.0..1440.0).contains(minute) => Err(Error::Invalid(
+                format!("photo.time minute {minute}: 0 to below 1440"),
+            )),
+            Verb::PhotoGrade { .. } | Verb::PhotoTick { .. } => {
+                let given: Vec<f32> = self.photo_values().into_iter().flatten().collect();
+                let tick = matches!(self, Verb::PhotoTick { .. });
+                if given.is_empty() || !finite(&given) {
+                    Err(Error::Invalid("no value given, or one not finite".into()))
+                } else if tick && !given.iter().all(|s| (0.0..=MAX_TICK_S).contains(s)) {
+                    Err(Error::Invalid(format!(
+                        "photo.tick seconds 0 to {MAX_TICK_S}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
             Verb::CamSet { pos, rot, fov }
                 if !finite(pos) || !finite(rot) || fov.is_some_and(|f| !f.is_finite()) =>
             {
@@ -287,7 +427,128 @@ mod tests {
             Verb::Notice {
                 text: "quen: you have the controls".into(),
             },
+            Verb::PhotoMode { on: true },
+            Verb::PhotoGet {},
+            Verb::PhotoWeather {
+                name: "WT_Clear".into(),
+            },
+            Verb::PhotoEnv {
+                path: r"environment\definitions\synthetic test.env".into(),
+            },
+            Verb::PhotoTime { minute: 1439.5 },
+            photo_grade(Some(0.5), Some(6550.0)),
+            Verb::PhotoReset {
+                part: PhotoPart::Grading,
+            },
+            Verb::PhotoTick {
+                tick_s: Some(0.00001),
+                cloth_s: None,
+            },
+            Verb::PhotoList {
+                what: PhotoListed::Envs,
+                filter: Some("novigrad".into()),
+            },
+            Verb::PhotoList {
+                what: PhotoListed::Weathers,
+                filter: None,
+            },
         ]
+    }
+
+    /// A photo.grade of exposure and temperature only.
+    fn photo_grade(exposure: Option<f32>, temperature: Option<f32>) -> Verb {
+        Verb::PhotoGrade {
+            exposure,
+            contrast: None,
+            highlights: None,
+            saturation: None,
+            temperature,
+            vignette: None,
+            grain: None,
+            chromatic_aberration: None,
+        }
+    }
+
+    /// The photo verbs' wire shapes, as W3Quen.asi's test sends them; the values photo.grade and photo.tick give.
+    #[test]
+    fn photo_verbs_are_flat_and_leave_out_what_is_not_given() {
+        let line = |verb| encode_request(&request(verb)).unwrap();
+        assert_eq!(
+            line(photo_grade(Some(0.5), Some(6550.0))),
+            "{\"id\":7,\"ttl_ms\":2000,\"verb\":\"photo.grade\",\"exposure\":0.5,\"temperature\":6550.0}\n"
+        );
+        assert_eq!(
+            line(Verb::PhotoReset {
+                part: PhotoPart::Weather
+            }),
+            "{\"id\":7,\"ttl_ms\":2000,\"verb\":\"photo.reset\",\"part\":\"weather\"}\n"
+        );
+        assert_eq!(
+            line(Verb::PhotoList {
+                what: PhotoListed::Weathers,
+                filter: None
+            }),
+            "{\"id\":7,\"ttl_ms\":2000,\"verb\":\"photo.list\",\"what\":\"weathers\"}\n"
+        );
+        let mut want = vec![None; 8];
+        want[0] = Some(0.5);
+        want[4] = Some(6550.0);
+        assert_eq!(photo_grade(Some(0.5), Some(6550.0)).photo_values(), want);
+        assert_eq!(GRADING[4], "temperature");
+        assert!(Verb::PhotoGet {}.photo_values().is_empty());
+    }
+
+    #[test]
+    fn photo_verbs_refuse_what_the_game_must_not_get() {
+        let invalid = |verb: Verb| {
+            let req = request(verb);
+            assert!(
+                matches!(encode_request(&req), Err(Error::Invalid(_))),
+                "{req:?}"
+            );
+            // serde_json writes a non-finite number as null, which doesn't decode at all.
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(decode_request(&line).is_err(), "{line}");
+        };
+        invalid(Verb::PhotoWeather {
+            name: String::new(),
+        });
+        invalid(Verb::PhotoEnv {
+            path: "a\tb".into(),
+        });
+        for minute in [-0.5, 1440.0, f32::NAN, f32::INFINITY] {
+            invalid(Verb::PhotoTime { minute });
+        }
+        invalid(photo_grade(None, None));
+        invalid(photo_grade(Some(f32::NAN), None));
+        for (tick_s, cloth_s) in [(None, None), (Some(-1.0), None), (None, Some(10.5))] {
+            invalid(Verb::PhotoTick { tick_s, cloth_s });
+        }
+        for filter in [
+            String::new(),
+            "a\nb".into(),
+            "x".repeat(MAX_FILTER_BYTES + 1),
+        ] {
+            invalid(Verb::PhotoList {
+                what: PhotoListed::Envs,
+                filter: Some(filter),
+            });
+        }
+        for line in [
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.mode"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.mode","on":1}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.get","x":0}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.grade","dof":1}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.reset","part":"camera"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.reset"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.list","what":"props"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"photo.time","minute":"noon"}"#,
+        ] {
+            assert!(
+                matches!(decode_request(line), Err(Error::Malformed(_))),
+                "{line}"
+            );
+        }
     }
 
     /// Two canonical keyframes.

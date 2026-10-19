@@ -148,6 +148,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "game_keys" => keys(session, call, args),
         "game_screenshot" => capture::screenshot(session, call, args),
         "game_camera" => crate::camera::camera(session, call, args),
+        "game_photo" => crate::photo::call(session, call, args),
         _ => channel::call(session, call, name, args),
     };
     out.map_or_else(|done| done, Done::Ok)

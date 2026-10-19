@@ -343,6 +343,83 @@ static void Paths(HANDLE h) {
   CHECK(Next().empty());  // none reached the script
 }
 
+// The photo verbs (from 0.1.9): protocol.rs's wire shapes to the script line, the read-back to JSON, the refusals.
+static void Photo(HANDLE h) {
+  // QUENRPC_PhotoState: time, 8 grading, 8 grading as photo mode opened, rain, snow, sky flag | weather | env | world's.
+  const char* state = "720.0000 0.5000 1.0000 1.0000 1.0000 6550.0000 0.0000 0.0010 0.0000 0.0000 1.0000 1.0000 1.0000 "
+                      "6550.0000 0.0000 0.0000 0.0000 0.0000 0.0000 1|WT_Clear|environment\\definitions\\x y.env|WT_Snow";
+  const std::string json =
+      R"({"weather":"WT_Clear","minute":720,"env":"environment\\definitions\\x y.env",)"
+      R"("grading":{"exposure":0.5,"contrast":1,"highlights":1,"saturation":1,"temperature":6550,"vignette":0,"grain":0.001,"chromatic_aberration":0},)"
+      R"("grading_at_open":{"exposure":0,"contrast":1,"highlights":1,"saturation":1,"temperature":6550,"vignette":0,"grain":0,"chromatic_aberration":0},)"
+      R"("rain":0,"snow":0,"sky_clear":true,"world_weather":"WT_Snow"})";
+  const auto with = [&](const char* id, const char* text) {
+    return std::string(R"({"id":)") + id + R"(,"ok":true,"text":")" + text + R"(","data":)" + json + "}";
+  };
+  RoundTrip(h, R"({"id":60,"ttl_ms":5000,"verb":"photo.mode","on":true})", L"photo.mode 1", true, "on", "",
+            R"({"id":60,"ok":true,"text":"on"})");
+  RoundTrip(h, R"({"id":61,"ttl_ms":5000,"verb":"photo.mode","on":false})", L"photo.mode 0", true, "off", "",
+            R"({"id":61,"ok":true,"text":"off"})");
+  RoundTrip(h, R"({"id":62,"ttl_ms":5000,"verb":"photo.get"})", L"photo.get", true, "got", state, with("62", "got"));
+  RoundTrip(h, R"({"id":63,"ttl_ms":5000,"verb":"photo.weather","name":"WT_Clear"})", L"photo.weather WT_Clear", true,
+            "set", state, with("63", "set"));
+  RoundTrip(h, R"({"id":64,"ttl_ms":5000,"verb":"photo.env","path":"environment\\definitions\\x y.env"})",
+            L"photo.env environment\\definitions\\x y.env", true, "set", state, with("64", "set"));
+  RoundTrip(h, R"({"id":65,"ttl_ms":5000,"verb":"photo.time","minute":1439.5})", L"photo.time 1439.500000", true, "set",
+            state, with("65", "set"));
+  RoundTrip(h, R"({"id":66,"ttl_ms":5000,"verb":"photo.grade","exposure":0.5,"temperature":6550.0})",
+            L"photo.grade 1 0.500000 0 0 0 0 0 0 1 6550.000000 0 0 0 0 0 0", true, "set", state, with("66", "set"));
+  RoundTrip(h, R"({"id":67,"ttl_ms":5000,"verb":"photo.grade","chromatic_aberration":2,"grain":-1e-3})",
+            L"photo.grade 0 0 0 0 0 0 0 0 0 0 0 0 1 -0.001000 1 2.000000", true, "set", state, with("67", "set"));
+  RoundTrip(h, R"({"id":68,"ttl_ms":5000,"verb":"photo.reset","part":"grading"})", L"photo.reset grading", true,
+            "reset", state, with("68", "reset"));
+  RoundTrip(h, R"({"id":69,"ttl_ms":5000,"verb":"photo.tick","tick_s":1e-5})", L"photo.tick 1 0.000010 0 0", true,
+            "called", "", R"({"id":69,"ok":true,"text":"called"})");
+  RoundTrip(h, R"({"id":70,"ttl_ms":5000,"verb":"photo.tick","cloth_s":10})", L"photo.tick 0 0 1 10.000000", true,
+            "called", "", R"({"id":70,"ok":true,"text":"called"})");
+  RoundTrip(h, R"({"id":71,"ttl_ms":5000,"verb":"photo.list","what":"envs","filter":"x y"})", L"photo.list envs x y",
+            true, "2 of 9 envs", "a\\x y.env|b\\X Y.env",
+            R"({"id":71,"ok":true,"text":"2 of 9 envs","data":["a\\x y.env","b\\X Y.env"]})");
+  RoundTrip(h, R"({"id":72,"ttl_ms":5000,"verb":"photo.list","what":"weathers"})", L"photo.list weathers", true,
+            "0 of 0 weathers", "", R"({"id":72,"ok":true,"text":"0 of 0 weathers","data":[]})");
+  // The script's refusal carries no data.
+  RoundTrip(h, R"({"id":73,"ttl_ms":5000,"verb":"photo.get"})", L"photo.get", false, "photo.get needs photo mode", "",
+            R"({"id":73,"ok":false,"text":"photo.get needs photo mode"})");
+
+  const char* refused = R"({"id":74,"ok":false,"text":"refused: )";
+  const std::pair<const char*, const char*> bad[] = {
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.mode"})", "invalid photo.mode"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.mode","on":1})", "invalid photo.mode"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.get","x":0})", "unknown field \\\"x\\\" for photo.get"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.weather","name":""})", "invalid photo.weather"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.env","path":"a\u0001b"})", "invalid photo.env"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.env","name":"x"})", "invalid photo.env"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.time","minute":1440})", "invalid photo.time"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.time","minute":-0.5})", "invalid photo.time"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.time","minute":"noon"})", "invalid photo.time"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.grade"})", "invalid photo.grade"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.grade","exposure":1e39})", "invalid photo.grade"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.grade","exposure":null})", "invalid photo.grade"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.grade","exposure":1,"dof":1})", "unknown field \\\"dof\\\" for photo.grade"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.reset"})", "invalid photo.reset"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.reset","part":"camera"})", "invalid photo.reset"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.tick"})", "invalid photo.tick"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.tick","tick_s":-1})", "invalid photo.tick"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.tick","cloth_s":10.5})", "invalid photo.tick"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.list"})", "invalid photo.list"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.list","what":"props"})", "invalid photo.list"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.list","what":"envs","filter":""})", "invalid photo.list"},
+      {R"({"id":74,"ttl_ms":1,"verb":"photo.list","what":"envs","filter":"a\nb"})", "invalid photo.list"},
+  };
+  for (const auto& [line, why] : bad) Refused(h, line, refused, why);
+  Refused(h, R"({"id":74,"ttl_ms":1,"verb":"photo.list","what":"envs","filter":")" + std::string(201, 'x') + "\"}",
+          refused, "invalid photo.list");
+  RoundTrip(h, R"({"id":75,"ttl_ms":5000,"verb":"photo.list","what":"envs","filter":")" + std::string(200, 'x') + "\"}",
+            L"photo.list envs " + std::wstring(200, L'x'), true, "0 of 9 envs", "",
+            R"({"id":75,"ok":true,"text":"0 of 9 envs","data":[]})");
+  CHECK(Next().empty());  // none of the refused reached the script
+}
+
 static void Channel() {
   Load();
   CHECK(Next().empty());
@@ -373,9 +450,9 @@ static void Channel() {
   RoundTrip(h, R"({"id":50,"ttl_ms":5000,"verb":"save"})", L"save", true, "save requested", "",
             R"({"id":50,"ok":true,"text":"save requested"})");
   RoundTrip(h, R"({"id":51,"ttl_ms":5000,"verb":"world.get"})", L"world.get", true, "the player's position",
-            "-101.5 200.25 3 90.5 3 22 WT_Clear",
+            "-101.5 200.25 3 90.5 3 22 0.2500 0.0000 0 WT_Clear",
             R"({"id":51,"ok":true,"text":"the player's position","data":{"player":{"pos":[-101.5,200.25,3],"heading":90.5},)"
-            R"("time":{"day":3,"hour":22},"weather":"WT_Clear"}})");
+            R"("time":{"day":3,"hour":22},"rain":0.25,"snow":0,"sky_clear":false,"weather":"WT_Clear"}})");
   RoundTrip(h, R"({"id":52,"ttl_ms":5000,"verb":"world.get"})", L"world.get", false, "no player (not in a game session)",
             "", R"x({"id":52,"ok":false,"text":"no player (not in a game session)"})x");
   RoundTrip(h, R"x({"id":53,"ttl_ms":5000,"verb":"notice","text":"quen: you have the controls (Alt+Tab)"})x",
@@ -412,6 +489,7 @@ static void Channel() {
             L"load caf\u00e9 \U0001F600 /x", true, "loading caf\xc3\xa9\n\t", "",
             R"({"id":18,"ok":true,"text":"loading caf)" "\xc3\xa9" R"(\u000a\u0009"})");
   Paths(h);
+  Photo(h);
 
   // Refusals (protocol.rs refuses_unknown_verbs_fields_and_shapes, refuses_non_finite_and_out_of_range_values, more).
   const char* refused1 = R"({"id":1,"ok":false,"text":"refused: )";
@@ -491,12 +569,20 @@ static void Channel() {
   Send(h, R"({"id":24,"ttl_ms":5000,"verb":"cam.get"})" "\n");
   CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", "photomode 1 2 3 4 5 6 nan") == 0);
   CHECK(ReadLine(h).starts_with(R"({"id":24,"ok":false,"text":"modQuen's read-back did not parse)"));
-  Send(h, R"({"id":27,"ttl_ms":5000,"verb":"world.get"})" "\n");
-  CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", "1 2 3 4 5 6") == 0);
-  CHECK(ReadLine(h) == R"({"id":27,"ok":false,"text":"modQuen's read-back did not parse: 1 2 3 4 5 6"})");
-  Send(h, R"({"id":28,"ttl_ms":5000,"verb":"world.get"})" "\n");
-  CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", "1 2 3 4 5 24 WT_Clear") == 0);
-  CHECK(ReadLine(h) == R"({"id":28,"ok":false,"text":"modQuen's read-back did not parse: 1 2 3 4 5 24 WT_Clear"})");
+  // world.get: 0.1.8's 7 fields, an hour past 23, a sky flag that isn't 0 or 1.
+  for (const char* bad : {"1 2 3 4 5 6 WT_Clear", "1 2 3 4 5 24 0 0 1 WT_Clear", "1 2 3 4 5 6 0 0 2 WT_Clear"}) {
+    Send(h, R"({"id":27,"ttl_ms":5000,"verb":"world.get"})" "\n");
+    CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", bad) == 0);
+    CHECK(ReadLine(h) == R"({"id":27,"ok":false,"text":"modQuen's read-back did not parse: )" + std::string(bad) + "\"}");
+  }
+  // The photo read-back: 19 numbers, a fifth name, a number that isn't one.
+  for (const char* bad : {"720 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0|WT_Clear||WT_Clear",
+                          "720 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 1|WT_Clear||WT_Clear|x",
+                          "720 1 1 1 1 1 1 1 1 nan 1 1 1 1 1 1 1 0 0 1|WT_Clear||WT_Clear"}) {
+    Send(h, R"({"id":29,"ttl_ms":5000,"verb":"photo.get"})" "\n");
+    CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", bad) == 0);
+    CHECK(ReadLine(h).starts_with(R"({"id":29,"ok":false,"text":"modQuen's read-back did not parse: )"));
+  }
   Send(h, R"({"id":25,"ttl_ms":5000,"verb":"listsaves"})" "\n");
   CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", std::string(70000, 's').c_str()) == 0);
   CHECK(ReadLine(h).starts_with(R"({"id":25,"ok":false,"text":"reply of 70)"));

@@ -31,7 +31,7 @@
 
 // quen-w3's release, named on W3Quen.log's first line and by pack.py's zip. Each release's ASI then differs from the last,
 // which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.8";
+constexpr char kVersion[] = "0.1.9";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -39,6 +39,12 @@ constexpr size_t kMaxReply = 64 * 1024;
 constexpr size_t kMaxQueued = 16;
 // protocol.rs's MAX_NOTICE_BYTES: notice's text, from quen-w3 0.1.8.
 constexpr size_t kMaxNotice = 160;
+// protocol.rs's MAX_FILTER_BYTES and MAX_TICK_S: photo.list's filter and photo.tick's seconds, from quen-w3 0.1.9.
+constexpr size_t kMaxFilter = 200;
+constexpr float kMaxTick = 10;
+// photo.grade's sliders, in modQuen's QUEN_Grade order, as protocol.rs names them.
+constexpr const char* kGrade[] = {"exposure", "contrast", "highlights", "saturation", "temperature", "vignette", "grain",
+                                  "chromatic_aberration"};
 
 namespace sweep {
 struct Path;
@@ -736,8 +742,41 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   } else if (v == "notice") {
     ok = name("text") && cmd.args.size() <= kMaxNotice + 1;
   } else if (v == "loadlast" || v == "listsaves" || v == "cam.get" || v == "cam.stop" || v == "save" ||
-             v == "world.get") {
+             v == "world.get" || v == "photo.get") {
     ok = true;
+  } else if (v == "photo.weather" || v == "photo.env") {
+    ok = name(v == "photo.env" ? "path" : "name");
+  } else if (v == "photo.time") {
+    Value x;
+    float m = 0;
+    ok = take("minute", Value::kNumber, x) && ParseFloat(x.text, m) && m >= 0 && m < 1440;
+    cmd.args = ' ' + Fixed(m);
+  } else if (v == "photo.grade" || v == "photo.tick") {
+    // Each value as "<given 0|1> <value>", in a fixed order, so the script sets only the given ones; at least one.
+    const std::vector<const char*> keys = v == "photo.tick" ? std::vector<const char*>{"tick_s", "cloth_s"}
+                                                            : std::vector<const char*>(std::begin(kGrade), std::end(kGrade));
+    bool any = false;
+    for (const char* key : keys) {
+      Value x;
+      float f = 0;
+      const bool given = fields.contains(key);
+      if (given)
+        ok = ok && take(key, Value::kNumber, x) && ParseFloat(x.text, f) && (v != "photo.tick" || (f >= 0 && f <= kMaxTick));
+      any = any || given;
+      cmd.args += given ? " 1 " + Fixed(f) : std::string(" 0 0");
+    }
+    ok = ok && any;
+  } else if (v == "photo.reset") {
+    const char* parts[] = {"weather", "env", "grading"};
+    int part = -1;
+    ok = Pick(fields, "part", {parts[0], parts[1], parts[2]}, -1, part) && part >= 0;
+    if (ok) cmd.args = std::string(" ") + parts[part];
+  } else if (v == "photo.list") {
+    int what = -1;
+    ok = Pick(fields, "what", {"weathers", "envs"}, -1, what) && what >= 0;
+    const std::string head = what == 1 ? " envs" : " weathers";
+    if (ok && fields.contains("filter")) ok = name("filter") && cmd.args.size() <= kMaxFilter + 1;
+    cmd.args = head + cmd.args;
   } else if (v == "cam.path") {
     if (const std::string why = CamPath(fields, cmd); !why.empty()) {
       error = "invalid cam.path: " + why;
@@ -759,7 +798,7 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     // ponytail: day capped at the script's int range, a stricter limit than protocol.rs's u32
     ok = whole("day", INT32_MAX, n) && whole("hour", 23, hour);
     cmd.args = ' ' + std::to_string(n) + ' ' + std::to_string(hour);
-  } else if (v == "pause") {
+  } else if (v == "pause" || v == "photo.mode") {
     Value on;
     ok = take("on", Value::kBool, on);
     cmd.args = on.flag ? " 1" : " 0";
@@ -769,7 +808,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   }
   if (!ok) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
-            "character, fov not above 0, hour past 23, a notice over 160 bytes)";
+            "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
+            "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes)";
     return false;
   }
   if (!fields.empty()) {
@@ -846,12 +886,15 @@ static void Next(void*, void* frame, void* result) {
   WNB_ReturnString(frame, result, wide.c_str(), uint32_t(wide.size()));
 }
 
-// The script's read-back as reply data: listsaves "a|b|c" (no file name holds a '|') -> ["a","b","c"];
-// cam.get, cam.set, cam.path and cam.frame "<camera> x y z pitch yaw roll fov" ->
-// {"camera":..,"pos":[..],"rot":[..],"fov":..}; world.get "x y z heading day hour weather" ->
-// {"player":{"pos":[..],"heading":..},"time":{"day":..,"hour":..},"weather":..}.
+// The script's read-back as reply data: listsaves and photo.list "a|b|c" (no file name, weather name or env path holds a
+// '|') -> ["a","b","c"]; cam.get, cam.set, cam.path and cam.frame "<camera> x y z pitch yaw roll fov" ->
+// {"camera":..,"pos":[..],"rot":[..],"fov":..}; world.get "x y z heading day hour rain snow skyclear weather" ->
+// {"player":{"pos":[..],"heading":..},"time":{"day":..,"hour":..},"rain":..,"snow":..,"sky_clear":..,"weather":..};
+// the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
+// {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
+// "world_weather":..}.
 static bool DataJson(const std::string& verb, std::string_view data, std::string& json) {
-  if (verb == "listsaves") {
+  if (verb == "listsaves" || verb == "photo.list") {
     json = "[";
     if (!data.empty())
       for (const std::string_view item : Split(data, '|')) json += Quote(item) + ',';
@@ -868,17 +911,40 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
            "],\"rot\":[" + Number(v[3]) + ',' + Number(v[4]) + ',' + Number(v[5]) + "],\"fov\":" + Number(v[6]) + '}';
     return true;
   }
-  if (verb == "world.get" && t.size() == 7) {
+  // rain, snow and the sky flag, "r s 0|1" as QUENRPC_Env writes them, as JSON members.
+  const auto env = [](std::string_view rain, std::string_view snow, std::string_view sky, std::string& out) {
+    float r = 0, s = 0;
+    if (!ParseFloat(rain, r) || !ParseFloat(snow, s) || (sky != "0" && sky != "1")) return false;
+    out = "\"rain\":" + Number(r) + ",\"snow\":" + Number(s) + ",\"sky_clear\":" + (sky == "1" ? "true" : "false");
+    return true;
+  };
+  std::string weather;
+  if (verb == "world.get" && t.size() == 10) {
     uint64_t day = 0, hour = 0;
     for (int k = 0; k < 4; ++k)
       if (!ParseFloat(t[k], v[k])) return false;
-    if (!Whole(t[4], INT32_MAX, day) || !Whole(t[5], 23, hour)) return false;
+    if (!Whole(t[4], INT32_MAX, day) || !Whole(t[5], 23, hour) || !env(t[6], t[7], t[8], weather)) return false;
     json = "{\"player\":{\"pos\":[" + Number(v[0]) + ',' + Number(v[1]) + ',' + Number(v[2]) + "],\"heading\":" +
-           Number(v[3]) + "},\"time\":{\"day\":" + std::to_string(day) + ",\"hour\":" + std::to_string(hour) +
-           "},\"weather\":" + Quote(t[6]) + '}';
+           Number(v[3]) + "},\"time\":{\"day\":" + std::to_string(day) + ",\"hour\":" + std::to_string(hour) + "}," +
+           weather + ",\"weather\":" + Quote(t[9]) + '}';
     return true;
   }
-  return false;
+  const std::vector<std::string_view> part = Split(data, '|');
+  if (!verb.starts_with("photo.") || part.size() != 4) return false;
+  const std::vector<std::string_view> n = Split(part[0], ' ');
+  float f[17];
+  if (n.size() != 20 || !env(n[17], n[18], n[19], weather)) return false;
+  for (int k = 0; k < 17; ++k)
+    if (!ParseFloat(n[k], f[k])) return false;
+  const auto grading = [&](int at) {
+    std::string out = "{";
+    for (int k = 0; k < 8; ++k) out += (k ? ",\"" : "\"") + std::string(kGrade[k]) + "\":" + Number(f[at + k]);
+    return out + '}';
+  };
+  json = "{\"weather\":" + Quote(part[1]) + ",\"minute\":" + Number(f[0]) + ",\"env\":" + Quote(part[2]) +
+         ",\"grading\":" + grading(1) + ",\"grading_at_open\":" + grading(9) + ',' + weather +
+         ",\"world_weather\":" + Quote(part[3]) + '}';
+  return true;
 }
 
 // import function QUEN_Reply(handle : int, ok : bool, text : string, data : string);
@@ -895,7 +961,8 @@ static void Reply(void*, void* frame, void*) {
     return;
   }
   std::string json;
-  const bool has_data = !data.empty() || (ok && g_current.verb == "listsaves");  // no saves: "data":[]
+  // no saves or no match: "data":[]
+  const bool has_data = !data.empty() || (ok && (g_current.verb == "listsaves" || g_current.verb == "photo.list"));
   if (!ValidUtf8(text)) {
     ok = false;
     text = "modQuen's reply text is not valid UTF-8";
