@@ -2,8 +2,6 @@
 
 quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This page says what quen can do there, where its limits are, and what it trusts. It covers quen's own behaviour only.
 
-> **For invited testers.** quen is in early access, in a private repository. Before it goes public, reporting moves to GitHub's private vulnerability reporting (below).
-
 ## In short
 
 - **quen limits what quen does. It is not a sandbox.** If your agent also has shell or file tools (Claude Code has them by default), it can do anything your account can, with or without quen.
@@ -14,8 +12,8 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 
 ## Reporting a problem
 
-- **During early access:** open an issue in this repository. It is private, so only the maintainer and the invited testers see it. For anything you'd rather not share with the other testers, contact the maintainer through the channel your invite came from. GitHub has no direct messages.
-- **Once the repository is public:** use GitHub's private vulnerability reporting (the repository's Security tab → Report a vulnerability). Never put the details of a vulnerability in a public issue.
+- **A vulnerability:** use GitHub's private vulnerability reporting (the repository's Security tab → Report a vulnerability). Only the maintainer sees the report. Never put the details of a vulnerability in a public issue.
+- **Any other problem:** open an issue. Issues are public: leave out anything that identifies you or your PC (the bug-report form lists what).
 
 ## What quen does on your PC
 

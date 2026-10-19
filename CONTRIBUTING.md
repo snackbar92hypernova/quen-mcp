@@ -1,6 +1,6 @@
 # Contributing to quen
 
-Thanks for helping. quen is in early access: this repository is private, and invited testers have read access. You contribute through a fork and a pull request. For anything bigger than a fix, open an issue first, so we agree on the approach before you build it.
+Thanks for helping. quen is in early access. You contribute through a fork and a pull request. For anything bigger than a fix, open an issue first, so we agree on the approach before you build it.
 
 [docs/intent.md](docs/intent.md) says what quen is for, the principles every change keeps (always restore, refuse before acting, the user decides, evidence over opinion, privacy) and what is out of scope. Read it before you propose a feature.
 

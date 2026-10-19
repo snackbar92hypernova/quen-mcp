@@ -2,7 +2,7 @@
 
 quen lets a coding agent (Claude Code, or another MCP client) drive one Witcher 3 session at a time for mod testing: launch with settings overrides and mods parked, load saves, take screenshots, run PresentMon A/B measurements, and record everything in a local database. Whatever happens, it puts the game folder back.
 
-> **Draft, for invited testers.** quen is in early development, and so is this guide.
+> **Early access.** quen is in early development, and so is this guide.
 >
 > quen runs on its own: it needs no Python. Sections that still differ from what's described say so.
 
@@ -10,17 +10,15 @@ quen lets a coding agent (Claude Code, or another MCP client) drive one Witcher 
 
 `install.ps1`, a file of each GitHub release beside its zips, installs quen and its in-game package in one step. It runs without admin rights and installs no third-party tool: the Native Bridge, PresentMon and the rest stay yours to install (section 1).
 
-**Download it, read it, run it** (recommended). In Windows PowerShell, while quen-mcp is private, with the GitHub CLI (<https://cli.github.com>) logged in once (`gh auth login`) as the account that has access:
+**Download it, read it, run it** (recommended). In Windows PowerShell:
 
 ```powershell
-gh release download --repo snackbar92hypernova/quen-mcp --pattern install.ps1
+Invoke-WebRequest https://github.com/snackbar92hypernova/quen-mcp/releases/latest/download/install.ps1 -OutFile install.ps1
 notepad install.ps1
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Once quen-mcp is public, the first line can be `Invoke-WebRequest https://github.com/snackbar92hypernova/quen-mcp/releases/latest/download/install.ps1 -OutFile install.ps1`.
-
-**Or in one line,** once quen-mcp is public. It runs the script without saving it, and takes no options:
+**Or in one line.** It runs the script without saving it, and takes no options:
 
 ```powershell
 irm https://github.com/snackbar92hypernova/quen-mcp/releases/latest/download/install.ps1 | iex

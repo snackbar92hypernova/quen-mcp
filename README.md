@@ -4,7 +4,7 @@
 
 quen gives an agent (Claude Code, VS Code's agent mode and other MCP clients) the tools to launch the game into a test session, control it, capture frames, measure frame times, read and patch memory, and fly the camera. Afterwards it puts the game back exactly as it was. Every boot, capture and measurement goes into a local SQLite ledger. Results from the other tools a modder uses (the RenoDX devkit, Nsight, RenderDoc, Tracy, REA / Ghidra) go there too, so a later agent can investigate across all of them.
 
-> **Status: early tester access.** This repository is private, for invited testers. quen has been built and tested on one PC: The Witcher 3 5.01 (Steam, DX12), on Windows. Expect rough edges, and config keys that may still change.
+> **Status: early access.** quen has been built and tested on one PC: The Witcher 3 5.01 (Steam, DX12), on Windows. Expect rough edges, and config keys that may still change.
 
 ## Why
 
@@ -117,7 +117,7 @@ quen never downloads or installs third-party tools: you install them yourself, u
 
 ## Reporting problems
 
-Open an issue in this repository; the bug-report template asks for the following. Include:
+Open an issue in this repository (issues are public; a security problem goes through [SECURITY.md](SECURITY.md) instead). The bug-report template asks for the following. Include:
 - what you asked the agent, and the tool's result (results show your user folder as `%USERPROFILE%`);
 - `quen --version`, and the output of `quen doctor`;
 - the session's journal: `logs\<time>-<session>\journal.jsonl` under `%USERPROFILE%\.quen`. Replace your user folder in it with `%USERPROFILE%` first.
