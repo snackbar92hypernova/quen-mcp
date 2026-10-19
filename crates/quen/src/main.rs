@@ -13,6 +13,8 @@ mod channel;
 #[cfg(windows)]
 mod config;
 #[cfg(windows)]
+mod data;
+#[cfg(windows)]
 mod disk;
 #[cfg(windows)]
 mod doctor;

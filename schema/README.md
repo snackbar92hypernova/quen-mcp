@@ -56,7 +56,7 @@ quen's agent playbook (the `quen_guide` tool's `playbook` topic, §2) keeps the 
 | RenderDoc | `renderdoc` | M |
 | REA / Ghidra, any disassembler, shader decompilers (DXC, the RenoDX devkit's) (no boot) | `static_re` | static_re |
 | live memory reads (`mem_*`, `game_cvar` reads) | `mem` | M |
-| game scripts, mod configs, logs, read by an agent | `files` | O |
+| game scripts, mod configs, logs, the game's data files (its bundles, REDkit's depot), read by an agent or quen's data tools | `files` | O |
 
 A file a tool wrote (a CSV, a `.tracy` or Nsight report, an EXR dump) is a `captures` row, and the measurements taken
 from it name it in `capture_id`. A knowledge-base page that backs a measurement or claim is a `re_refs` row.

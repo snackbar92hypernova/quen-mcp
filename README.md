@@ -43,6 +43,7 @@ quen makes that the agent's job, with guard rails:
   - **Nsight Systems** or **Nsight Graphics** GPU Trace.
   - **Tracy.** Built into quen's own package, dormant unless a Tracy launch triggers it.
   - Or with the **RenoDX devkit** loaded.
+- **The game's data.** Find, read and scan the files in its bundles and in REDkit's editor depot (CR2W files decoded to JSON; which files import or name something), and run REDkit's offline script compile on a scratch copy.
 - **Memory.**
   - Read, scan and follow pointers in the running game.
   - Apply and undo live patches defined in your reverse-engineering knowledge base. Saves written after a patch are flagged as tainted.
@@ -74,7 +75,8 @@ quen makes that the agent's job, with guard rails:
 - **Optional, each for its own tools:**
   - PresentMon 2.x (measurements);
   - RenderDoc, Nsight Systems, Nsight Graphics, and Tracy 0.14.1's capture tool (profiling);
-  - ReShade with RenoDX and its devkit.
+  - ReShade with RenoDX and its devkit;
+  - The Witcher 3 REDkit (the script compile, and its depot for the data tools).
 
 quen never downloads or installs third-party tools: you install them yourself, under their own terms.
 

@@ -299,6 +299,11 @@ pub fn fake_tracy_capture() -> PathBuf {
     example("fake_tracy_capture")
 }
 
+/// The stand-in for REDkit's wcc_lite (`examples/fake_wcc_lite.rs`).
+pub fn fake_wcc_lite() -> PathBuf {
+    example("fake_wcc_lite")
+}
+
 fn example(name: &str) -> PathBuf {
     let quen = Path::new(env!("CARGO_BIN_EXE_quen"));
     let exe = quen

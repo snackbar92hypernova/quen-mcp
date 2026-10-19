@@ -82,6 +82,8 @@ Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 
 **Optional:** ReShade with RenoDX, the RenoDX devkit, Nsight Systems, Nsight Graphics, RenderDoc, and Tracy's capture tool. Each stays off until its key is in the config (§3: `quen_setup` finds the ones an installer put in place, and writes a key once you confirm it; Tracy's capture tool comes as a zip, so you name its path); then a launch can ask for it. Tracy needs version 0.14.1 exactly, `tracy-capture.exe` from Tracy's v0.14.1 release (<https://github.com/wolfpld/tracy/releases>): it must match the Tracy client inside quen's package from quen-w3 0.1.3, which runs only in a `tracy` launch. Once the devkit is configured it loads by default (ReShade loads it; the RenoDX add-on isn't needed for it); `devkit: false` leaves it out, for timing runs.
 
+**Optional: The Witcher 3 REDkit** (Steam, free), for `script_compile` and the data tools' `where: redkit`. `quen_setup` finds it in Steam's libraries. Its licence (`wcc_eula.rtf` beside `wcc_lite.exe`) is yours to accept; quen never installs it.
+
 ## 2. Build and install
 
 In a terminal:
@@ -186,6 +188,8 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # Tracy, for profiler: 'tracy:NAME': Tracy 0.14.1's capture tool (quen doctor checks its version). A tracy
 # launch also needs quen-w3 0.1.3 or later in the game and kb above: the KB's hooks.tsv says which mods to park.
 # tracy_capture = '<folder>\tracy-capture.exe'
+# The Witcher 3 REDkit's folder, for script_compile and the data tools' where: redkit.
+# redkit = '<Steam library>\steamapps\common\The Witcher 3 REDkit'
 ```
 
 GPU Trace (`ngfx`) needs the GPU performance counters open to all users. That's a system setting only you change, in the NVIDIA Control Panel: Desktop > Enable Developer Settings, then Developer > Manage GPU Performance Counters > Allow access to all users. `quen doctor` shows whether it's on.

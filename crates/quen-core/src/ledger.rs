@@ -13,7 +13,7 @@ mod ingest;
 mod kb;
 mod knowledge;
 mod migrate;
-mod refs;
+pub(crate) mod refs;
 
 pub use ingest::{
     BootEnd, BootModStatus, BootStart, Capture, Claim, Game, LoadStatus, METHOD_FAMILIES,

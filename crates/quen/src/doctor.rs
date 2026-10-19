@@ -918,6 +918,34 @@ fn kb_build_state(cx: &Cx) -> State {
     }
 }
 
+pub(crate) const REDKIT: Dep = Dep {
+    name: "The Witcher 3 REDkit",
+    required: false,
+    enables: "script_compile (its wcc_lite), and data_find, data_read and data_scan with where: redkit (its depot, \
+        r4data)",
+    how_to_get: "The Witcher 3 REDkit on Steam (free, app 2684660), installed by you: its licence (wcc_eula.rtf beside \
+        wcc_lite.exe) is between you and CD PROJEKT RED, and quen never installs it. quen's config names its folder \
+        (redkit; quen_setup finds it in Steam's libraries)",
+    check: |cx| {
+        let Some(dir) = &cx.config.redkit else {
+            return State::missing("no redkit in quen's config".into());
+        };
+        let exe = dir.join(crate::data::WCC_LITE);
+        if !exe.is_file() {
+            return State::missing(format!("{} is not there", exe.display()));
+        }
+        let build = detect::steam_buildid(dir, crate::data::REDKIT_APPID);
+        let version = crate::win::file_version(&exe).unwrap_or_else(|| "unknown".into());
+        State {
+            version: Some(match build {
+                Some(build) => format!("wcc_lite {version}, Steam build {build}"),
+                None => format!("wcc_lite {version}"),
+            }),
+            ..State::found(exe)
+        }
+    },
+};
+
 /// A table of the RE knowledge base (live boot 1: the KB folder was there, its tables weren't).
 fn kb_table(cx: &Cx, file: &str) -> State {
     let Some(kb) = &cx.config.kb else {
@@ -943,7 +971,7 @@ fn kb_table(cx: &Cx, file: &str) -> State {
 }
 
 /// Every dependency, required ones first, as quen_doctor lists them.
-const DEPS: [&Dep; 20] = [
+const DEPS: [&Dep; 21] = [
     &GAME,
     &NATIVE_BRIDGE,
     &PACKAGE,
@@ -960,6 +988,7 @@ const DEPS: [&Dep; 20] = [
     &STREAMLINE,
     &STREAMLINE_DEV,
     &TRACY,
+    &REDKIT,
     &KB_CVARS,
     &KB_PATCHES,
     &KB_BUILD,

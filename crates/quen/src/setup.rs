@@ -25,7 +25,7 @@ use crate::{profile, relocate, w3, win};
 
 /// The keys `values` may set: every config key but the Python harness's (`harness`, `python`), the game's image name
 /// (`game_exe`) and the capture test switch (`force_duplication`).
-const SETTABLE: [&str; 17] = [
+const SETTABLE: [&str; 18] = [
     "data_root",
     "capture_root",
     "game_dir",
@@ -39,6 +39,7 @@ const SETTABLE: [&str; 17] = [
     "renderdoc",
     "streamline_dev_interposer",
     "tracy_capture",
+    "redkit",
     "renodx_build",
     "ngfx_args",
     "known_builds",
@@ -46,7 +47,7 @@ const SETTABLE: [&str; 17] = [
 ];
 
 /// The settable keys whose value is an absolute path.
-const PATHS: [&str; 12] = [
+const PATHS: [&str; 13] = [
     "data_root",
     "capture_root",
     "game_dir",
@@ -58,6 +59,7 @@ const PATHS: [&str; 12] = [
     "renderdoc",
     "streamline_dev_interposer",
     "tracy_capture",
+    "redkit",
     "renodx_build",
 ];
 
@@ -114,7 +116,8 @@ pub(crate) struct Machine {
     pub(crate) installs: Vec<Install>,
     /// `<Documents>\The Witcher 3`, with Documents from the known-folder API (so a OneDrive one is found).
     pub(crate) documents: Option<PathBuf>,
-    /// Each of [`PROGRAMS`]: every exe found where its installer puts it, then on PATH.
+    /// Each of [`PROGRAMS`]: every exe found where its installer puts it, then on PATH; and `redkit`, REDkit's folders
+    /// in Steam's libraries.
     pub(crate) programs: Vec<(&'static str, Vec<PathBuf>)>,
 }
 
@@ -137,10 +140,21 @@ impl Machine {
             .collect();
         let is_game = |dir: &Path| w3::is_game_dir(dir, game_exe);
         let program_files = env::var_os("ProgramFiles").map(PathBuf::from);
+        let mut programs = programs(program_files.as_deref(), env::var_os("PATH"));
+        let redkit = steam
+            .as_deref()
+            .map(|s| detect::steam(s, crate::data::REDKIT_APPID));
+        let redkit = redkit.unwrap_or_default().into_iter().map(|i| i.dir);
+        programs.push((
+            "redkit",
+            redkit
+                .filter(|d| d.join(crate::data::WCC_LITE).is_file())
+                .collect(),
+        ));
         Machine {
             installs: detect::installs(steam.as_deref(), boot::STEAM_APPID, gog, is_game),
             documents: win::documents().map(|d| d.join(w3::DOCUMENTS)),
-            programs: programs(program_files.as_deref(), env::var_os("PATH")),
+            programs,
         }
     }
 
@@ -414,7 +428,7 @@ fn report(disk: &OnDisk, machine: &Machine) -> Map<String, Value> {
     };
     let named = || Err("quen doesn't search for it: the user names it");
     let found = |key: &str| Ok(machine.found(key));
-    let tools: [(&str, &Dep, Found); 9] = [
+    let tools: [(&str, &Dep, Found); 10] = [
         ("presentmon", &doctor::PRESENTMON, found("presentmon")),
         ("kb", &doctor::KB_CVARS, named()),
         ("renodx_addon", &doctor::RENODX, renodx),
@@ -428,6 +442,7 @@ fn report(disk: &OnDisk, machine: &Machine) -> Map<String, Value> {
             named(),
         ),
         ("tracy_capture", &doctor::TRACY, named()),
+        ("redkit", &doctor::REDKIT, found("redkit")),
     ];
     for (key, dep, found) in tools {
         paths.push(tool_row(key, value(key), c, dep, found));
@@ -535,6 +550,7 @@ fn usable(key: &str, c: &Config) -> Result<(), String> {
         "renderdoc" => exe(&c.renderdoc, "renderdoccmd.exe"),
         "streamline_dev_interposer" => doctor(&doctor::STREAMLINE_DEV),
         "tracy_capture" => doctor(&doctor::TRACY),
+        "redkit" => doctor(&doctor::REDKIT),
         "kb" => match &c.kb {
             Some(kb) if !kb.is_dir() => Err(format!("kb {} is not a folder", kb.display())),
             Some(kb) if !KB_TABLES.iter().any(|t| kb.join(t).is_file()) => Err(format!(
@@ -787,6 +803,7 @@ pub fn tool() -> Value {
                         "renderdoc": s("RenderDoc's renderdoccmd.exe"),
                         "streamline_dev_interposer": s("the patched dev sl.interposer.dll (unsigned)"),
                         "tracy_capture": s("Tracy 0.14.1's tracy-capture.exe"),
+                        "redkit": s("The Witcher 3 REDkit's folder (bin\\x64_RedKit\\wcc_lite.exe in it)"),
                         "renodx_build": s("with renodx_addon: the .addon64 a launch requires installed"),
                         "ngfx_args": s("arguments for every ngfx launch, never --platform"),
                         "known_builds": s("verified game builds: '<steam|gog> <sha256> <label>', ';' between"),

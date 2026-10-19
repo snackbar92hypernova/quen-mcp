@@ -63,3 +63,5 @@ png = "0.18"
 # The concurrency tests hold the ledger open from outside quen, as a viewer or script would (quen-core's own SQLite).
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
+# The data tools' tests write their synthetic bundles' and CR2W files' crc32s (quen-core's own).
+crc32fast = "1"

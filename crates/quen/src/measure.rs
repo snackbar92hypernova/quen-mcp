@@ -23,7 +23,14 @@ use crate::{doctor, input};
 
 /// Images that skew a CPU-bound measurement: builds, and RE analysis (Ghidra's analyzeHeadless
 /// runs as java.exe).
-const BUSY: [&str; 5] = ["cl.exe", "link.exe", "cargo.exe", "rustc.exe", "java.exe"];
+const BUSY: [&str; 6] = [
+    "cl.exe",
+    "link.exe",
+    "cargo.exe",
+    "rustc.exe",
+    "java.exe",
+    "wcc_lite.exe",
+];
 /// How long PresentMon may run past its window before it is killed (`ini_session.py perf`'s timeout).
 const PRESENTMON_GRACE: Duration = Duration::from_secs(30);
 /// While the user plays: how long measure_presentmon waits for the game to be in front, and how often it looks
