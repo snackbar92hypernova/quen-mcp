@@ -51,6 +51,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../schema/0009_knowledge.sql"),
     include_str!("../../../schema/0010_saves_made_by_boot.sql"),
     include_str!("../../../schema/0011_play_sessions.sql"),
+    include_str!("../../../schema/0012_pose_yaw_optional.sql"),
 ];
 
 /// The schema version this build migrates to.
@@ -174,7 +175,8 @@ impl Ledger {
         Ok(Ledger { conn })
     }
 
-    /// Checks and migrates the database `conn` opened; `path` is its file, where one is to be backed up.
+    /// Checks and migrates the database `conn` opened, then fills in extraction rvas (`fill_rvas`); `path` is its file,
+    /// where one is to be backed up.
     fn init(mut conn: Connection, path: Option<&Path>) -> Result<Ledger> {
         configure(&conn)?;
         // The checks run under the write lock, so a second quen opening a new ledger at the same time waits, then
@@ -208,7 +210,9 @@ impl Ledger {
                 other?;
             }
         }
-        Ok(Ledger { conn })
+        let mut ledger = Ledger { conn };
+        ledger.fill_rvas()?;
+        Ok(ledger)
     }
 
     /// Runs `f` in one write transaction: everything it wrote stays, or after an error nothing does. The transaction

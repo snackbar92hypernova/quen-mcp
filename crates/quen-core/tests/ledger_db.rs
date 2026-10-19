@@ -682,7 +682,7 @@ fn captures_are_stored_relative_to_the_capture_root() {
             fov: 60.0,
             player: Some(PlayerPose {
                 position: [1.5, 2.5, 0.0],
-                yaw: 45.0,
+                yaw: Some(45.0),
             }),
             ref_capture_id: Some(c),
             ..Default::default()
@@ -708,6 +708,20 @@ fn captures_are_stored_relative_to_the_capture_root() {
         &[json!(p)],
     );
     assert_eq!(r, vec![vec![json!(90.0), json!(45.0), json!(c)]]);
+
+    // Schema 0012: a player position without a yaw.
+    let row = json!({"table": "poses", "name": "P3", "camera": [0, 0, 0], "rotation": [0, 0, 0], "fov": 60,
+                     "player": {"position": [4, 5, 6]}});
+    let ids = l.ingest(&[Row::from_json(&row).unwrap()]).unwrap();
+    let r = rows(
+        &l,
+        "SELECT player_x, player_y, player_z, player_yaw FROM poses WHERE id = ?1",
+        &[json!(ids[0])],
+    );
+    assert_eq!(
+        r,
+        vec![vec![json!(4.0), json!(5.0), json!(6.0), Value::Null]]
+    );
 }
 
 #[test]

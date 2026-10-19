@@ -587,6 +587,45 @@ fn an_rea_bundle_is_copied_pinned_indexed_and_imported_once() {
 }
 
 #[test]
+fn records_without_an_address_location_take_the_rva_their_parameters_ask_about() {
+    let (db, mut l) = ledger();
+    l.scan_kb(&fake_kb(db.dir(), &sha(1))).unwrap();
+    // REA 6.5.0's shape: locations empty, the address in the parameters (`procedure`, or `address` for xrefs).
+    let path = fake_bundle(&db.dir().join("rea-6.5.0.json"), &sha(1), 1, 10);
+    let mut bundle: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for r in bundle["records"].as_array_mut().unwrap() {
+        r["locations"] = json!([]);
+    }
+    bundle["records"][1]["operation"] = json!("xrefs");
+    bundle["records"][1]["parameters"] = json!({"address": "0x140002000"});
+    fs::write(&path, bundle.to_string()).unwrap();
+    let root = db.dir().join("captures");
+    let import = l.import_rea_bundle(&root, &path, "6.5.0").unwrap();
+    let extractions = "SELECT x.evidence_id, x.rva, e.key FROM extractions x LEFT JOIN entities e ON e.id = x.entity_id
+                       ORDER BY x.id";
+    let alpha = vec![json!(ev(10)), json!(0x1000), json!("Alpha_Draw")];
+    let beta = vec![json!(ev(11)), json!(0x2000), json!("Beta_Setup")];
+    assert_eq!(rows(&l, extractions, &[]), [alpha.clone(), beta]);
+
+    // As quen 0.1.0 imported it: no rva, no entity. The next open fills that in from the stored parameters, with the
+    // bundle file gone, and leaves an rva already set as it is.
+    drop(l);
+    let raw = rusqlite::Connection::open(&db.0).unwrap();
+    raw.execute_batch(&format!(
+        "UPDATE extractions SET rva = NULL, entity_id = NULL WHERE evidence_id = '{}';
+         UPDATE extractions SET rva = 12288 WHERE evidence_id = '{}';",
+        ev(10),
+        ev(11)
+    ))
+    .unwrap();
+    drop(raw);
+    fs::remove_file(root.join(&import.path)).unwrap();
+    let l = Ledger::open(&db.0).unwrap();
+    let kept = vec![json!(ev(11)), json!(0x3000), json!("Beta_Setup")];
+    assert_eq!(rows(&l, extractions, &[]), [alpha, kept]);
+}
+
+#[test]
 fn about_gathers_everything_known_and_says_whether_it_was_extracted() {
     let (db, mut l) = ledger();
     let kb = fake_kb(db.dir(), &sha(1));

@@ -279,7 +279,8 @@ pub struct Pose {
 #[serde(deny_unknown_fields)]
 pub struct PlayerPose {
     pub position: [f64; 3],
-    pub yaw: f64,
+    /// Degrees; none: not given.
+    pub yaw: Option<f64>,
 }
 
 /// A camera sweep, stored canonical.
@@ -783,7 +784,7 @@ impl Ledger {
                 player.map(|q| q.position[0]),
                 player.map(|q| q.position[1]),
                 player.map(|q| q.position[2]),
-                player.map(|q| q.yaw),
+                player.and_then(|q| q.yaw),
                 p.save_id,
                 p.ref_capture_id,
             ],

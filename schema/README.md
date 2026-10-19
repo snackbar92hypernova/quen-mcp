@@ -157,8 +157,9 @@ What each mod did at load in a boot, from its log or state export. Key (`boot_id
 ### poses (table)
 
 A named camera position for repeatable captures. `id`; `name` (unique, e.g. `P1`); camera `cam_x`, `cam_y`, `cam_z`,
-rotation `cam_pitch`, `cam_yaw`, `cam_roll` (degrees), `fov`; the player's `player_x`, `player_y`, `player_z`,
-`player_yaw` (all set or all NULL); `save_id` → saves: the save the pose is in; `ref_capture_id` → captures: its
+rotation `cam_pitch`, `cam_yaw`, `cam_roll` (degrees), `fov`; the player's `player_x`, `player_y`, `player_z` (all set
+or all NULL) and `player_yaw` (degrees; never set without the position; since schema 0012 it may be NULL with one,
+before it was set exactly when they were); `save_id` → saves: the save the pose is in; `ref_capture_id` → captures: its
 reference image.
 
 ### captures (table)
@@ -169,9 +170,10 @@ files whose boot isn't known); `path` (relative to the capture root, `/` separat
 every tool. Exceptions, from before this was the rule: the history import names five of the earlier tool's files by their role
 (`boot_log`, `presentmon_csv`, `camera_ref`, `camera_cal`, `boots_jsonl`), and quen's own screenshot rows written before
 `quen_guide` existed say `screenshot`. So tell what took a file by `method`, not `kind`. `method` (how it was taken,
-e.g. `printwindow`, `wgc_fp16`, `presentmon`); `encoding` (pixels: `srgb8`, `pq_bt2020_u16`, `pq_codes_f16`,
-`scrgb_f16`); `includes_overlay`, `includes_desktop`; `display_state` and `frame_state` (JSON objects: the display and
-the frame when it was taken; quen's `display_state` names the monitor by `monitor_sha`, a short hash of its model name,
+e.g. `printwindow`, `wgc_fp16`, `presentmon`); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
+`pq_codes_f16`, `scrgb_f16`; any other buffer, e.g. scene-linear data or a G-buffer target, leaves it NULL and gives its
+format in `frame_state`); `includes_overlay`, `includes_desktop`; `display_state` and `frame_state` (JSON objects: the
+display and the frame when it was taken; quen's `display_state` names the monitor by `monitor_sha`, a short hash of its model name,
 since 2026-10-18, by `monitor` before); `pose_id` → poses; `t` (when it was taken); `pinned` (1: never a cleanup candidate);
 `removed_at` (when `capture_clean` took the file off the disk, NULL while it is there) and `removed_to` (`recycle_bin`,
 `to_delete`: `<data root>\_to_delete\<date>\`, for the user to empty, or `missing`: the file was gone already, removed
@@ -269,11 +271,12 @@ new game build misses every entry); `profile_digest` → extraction_profiles; `o
 of the canonical JSON `{"operation", "parameters", "profile_digest", "target_sha256"}`, the same for the same query on
 the same analysis; `evidence_id` (unique: REA's `ev_<64 hex>`, which hashes the record's content); `result_sha256` (of
 the canonical raw result: one key with two result hashes gave two answers); `confidence` (`observed`, `derived` or
-`inferred`, REA's word); `rva` (the record's first address location minus the image base); `entity_id` → entities (the
-function or label at that RVA in that build when imported); `capture_id` → captures (the bundle file holding the whole
-record, decompiled text included: a pinned capture under the capture root); `t` (when imported). An exact hit is the
-same `key_sha256` with its file present (`captures.removed_at` NULL); a near hit is the same target, operation and
-params under another profile.
+`inferred`, REA's word); `rva` (the record's first address location, else the `procedure` or `address` parameter, minus
+the image base; REA 6.5.0 leaves locations empty for single-address queries, and rows quen 0.1.0 imported without an rva
+get it at the next open); `entity_id` → entities (the function or label at that RVA in that build when the rva was
+recorded); `capture_id` → captures (the bundle file holding the whole record, decompiled text included: a pinned capture
+under the capture root); `t` (when imported). An exact hit is the same `key_sha256` with its file present
+(`captures.removed_at` NULL); a near hit is the same target, operation and params under another profile.
 
 ### links (table)
 

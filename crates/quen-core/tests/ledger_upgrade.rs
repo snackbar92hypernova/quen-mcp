@@ -60,6 +60,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0011_play_sessions.sql",
         "681ebdee3fd14f168e3c9fd9f95bb6dd3d9eba9b908c158dde665beeb564d254",
     ),
+    (
+        "0012_pose_yaw_optional.sql",
+        "ca2b57c2ca94a77338594d4007b50909c0edfc2cdecb7b16b7d649292398f08e",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -150,8 +154,9 @@ fn old_ledger(path: &Path, k: usize) -> Connection {
                    0, NULL, '[]', 'ok', '%LOCALAPPDATA%/quen/logs/1/journal.jsonl'),
                   (2, 1, '2026-10-11T10:00:00Z', '2026-10-11T11:00:00Z', 1, 1, '{{\"Rendering\":{{\"SomeCvar\":\"1\"}}}}',
                    0, NULL, '[]', 'ok', NULL);
-         INSERT INTO poses (id, name, cam_x, cam_y, cam_z, cam_pitch, cam_yaw, cam_roll, fov, save_id)
-           VALUES (1, 'P1', 1, 2, 3, -10, 90, 0, 60, 1);
+         INSERT INTO poses (id, name, cam_x, cam_y, cam_z, cam_pitch, cam_yaw, cam_roll, fov, player_x, player_y,
+             player_z, player_yaw, save_id)
+           VALUES (1, 'P1', 1, 2, 3, -10, 90, 0, 60, 4, 5, 6, 30, 1);
          INSERT INTO captures (id, boot_id, path, sha256, bytes, kind, method, encoding, pose_id, t)
            VALUES (1, 1, 'shots/P1_a.png', '{c}', 10, 'screenshot', 'printwindow', 'srgb8', 1, '2026-10-10T10:30:00Z'),
                   (2, 1, 'ini/perf_A.csv', '{c}', 20, 'presentmon_csv', 'presentmon', NULL, NULL, '2026-10-10T10:40:00Z');
@@ -489,6 +494,16 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
         );
         let want = vec![json!("photo"), Value::Null, Value::Null, json!("play")];
         assert_eq!(shown, vec![want], "v{k}");
+        // 0012: a player position may come without a yaw; the position's three columns still pair, and a yaw never
+        // comes without them.
+        now.execute("UPDATE poses SET player_yaw = NULL WHERE id = 1", [])
+            .unwrap();
+        for bad in [
+            "UPDATE poses SET player_y = NULL WHERE id = 1",
+            "UPDATE poses SET player_x = NULL, player_y = NULL, player_z = NULL, player_yaw = 30 WHERE id = 1",
+        ] {
+            assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
+        }
         drop(now);
         let run = rows(
             &l,
