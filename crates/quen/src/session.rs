@@ -540,7 +540,7 @@ pub(crate) fn envelope(
     ledger: Map<String, Value>,
     done: Done,
 ) -> Value {
-    let (ok, refused, reason, fields) = match done {
+    let (ok, refused, reason, mut fields) = match done {
         Done::Ok(fields) => (true, false, None, fields),
         Done::Refused(why) => (false, true, Some(why), Map::new()),
         Done::RefusedWith(why, fields) => (false, true, Some(why), fields),
@@ -552,12 +552,18 @@ pub(crate) fn envelope(
         ),
         Done::Failed(why, fields) => (false, false, Some(why), fields),
     };
+    let mut state = state(shared);
+    // A tool's own state (the mem tools' world) goes into the envelope's.
+    if let (Some(Value::Object(own)), Some(state)) = (fields.remove("state"), state.as_object_mut())
+    {
+        state.extend(own);
+    }
     let mut out = json!({
         "ok": ok,
         "tool": tool,
         "refused": refused,
         "reason": reason,
-        "state": state(shared),
+        "state": state,
         "timing_s": timing,
         "artifacts": artifacts,
         "ledger": ledger,

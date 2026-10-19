@@ -343,7 +343,7 @@ fn run_id(cx: &Ctx, tag: &str) -> String {
 
 /// What the world did, as quen sees it when the rows are written (schema 0011's `measurements.world`): the user had
 /// the controls, photo mode, quen's pause, or else running with the agent's.
-fn world(cx: &Ctx) -> &'static str {
+pub(crate) fn world(cx: &Ctx) -> &'static str {
     if cx.hands == Some(Hands::User) {
         "user"
     } else if cx.last_flags().is_some_and(in_photo) {
