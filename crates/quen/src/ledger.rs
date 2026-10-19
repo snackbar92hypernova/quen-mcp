@@ -20,7 +20,7 @@ use crate::session::{Done, Shared, envelope};
 use crate::win;
 
 /// Query results longer than this go to a file; the envelope keeps the first rows that fit.
-const INLINE_BYTES: usize = 16 * 1024;
+pub(crate) const INLINE_BYTES: usize = 16 * 1024;
 const TIME_LIMIT_S: f64 = 10.0;
 const TIME_LIMIT_MAX_S: f64 = 30.0;
 const LOCK_HELD: &str = "another quen holds the game lock (a live session): only the lock holder records captures, \
@@ -226,7 +226,10 @@ fn lock_held_elsewhere(config: &Config) -> bool {
 }
 
 /// The arguments as an object with only `known` keys.
-fn object<'a>(args: &'a Value, known: &[&str]) -> Result<&'a Map<String, Value>, String> {
+pub(crate) fn object<'a>(
+    args: &'a Value,
+    known: &[&str],
+) -> Result<&'a Map<String, Value>, String> {
     let args = args.as_object().ok_or("arguments must be an object")?;
     match args.keys().find(|k| !known.contains(&k.as_str())) {
         Some(key) => Err(format!("unknown argument {key:?} ({})", known.join(", "))),
@@ -362,7 +365,11 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
 }
 
 /// `data` written to a new JSON file under `<data root>\logs\queries`, listed in `artifacts`: its path.
-fn spill(config: &Config, data: &Value, artifacts: &mut Vec<Value>) -> Result<PathBuf, String> {
+pub(crate) fn spill(
+    config: &Config,
+    data: &Value,
+    artifacts: &mut Vec<Value>,
+) -> Result<PathBuf, String> {
     let dir = config.data_root.join("logs").join("queries");
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
