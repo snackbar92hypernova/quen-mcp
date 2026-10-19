@@ -456,12 +456,12 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                 job.finish(envelope, cancelled);
             }
             Msg::Dropped(conn) => match &session.live {
-                // The user plays on; the session ends when the game exits.
+                // The agent's writes of the hand-over undone, the user plays on; the session ends when the game exits.
                 Some(live) if live.owner == conn && live.play => {
-                    shared.set_hands(Some(Hands::User));
+                    let undo = hands::dropped(&session);
                     eprintln!(
                         "quen: the connection that launched the play session closed: the user has the controls, \
-                         and the session ends when the game exits"
+                         and the session ends when the game exits. The hand-over's writes: {undo}"
                     );
                 }
                 Some(live) if live.owner == conn => {

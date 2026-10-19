@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
+use std::ops::ControlFlow;
 
 use serde::Serialize;
 
@@ -225,34 +226,53 @@ pub fn find(mem: &dyn Memory, image: &Image, layout: &Layout, full: &str) -> Fou
     let mut found = Found::default();
     let needle = [&[0], name.as_bytes(), &[0]].concat();
     let mut names = HashSet::new();
+    let mut buf = Vec::new();
     for s in image
         .sections
         .iter()
         .filter(|s| s.flags & (SCN_EXECUTE | SCN_WRITE) == 0)
     {
         let tail = needle.len() as u64 - 1;
-        mem::chunks(mem, s.base, s.size, tail, &mut found.skipped, |at, b| {
-            let hits = b
-                .windows(needle.len())
-                .enumerate()
-                .filter(|(_, w)| *w == needle);
-            names.extend(hits.map(|(i, _)| at + i as u64 + 1));
-        });
+        let _ = mem::chunks(
+            mem,
+            s.base,
+            s.size,
+            tail,
+            &mut buf,
+            &mut found.skipped,
+            |at, b| {
+                let hits = b
+                    .windows(needle.len())
+                    .enumerate()
+                    .filter(|(_, w)| *w == needle);
+                names.extend(hits.map(|(i, _)| at + i as u64 + 1));
+                ControlFlow::Continue(())
+            },
+        );
     }
     let mut objects = Vec::new();
     for s in image.sections.iter().filter(|s| s.flags & SCN_WRITE != 0) {
         if names.is_empty() {
             break;
         }
-        mem::chunks(mem, s.base, s.size, 0, &mut found.skipped, |at, b| {
-            for (i, q) in b.chunks_exact(8).enumerate() {
-                let site = at + 8 * i as u64;
-                let pointer = u64::from_le_bytes(q.try_into().expect("8 bytes"));
-                if names.contains(&pointer) && site - s.base >= layout.name {
-                    objects.push(site - layout.name);
+        let _ = mem::chunks(
+            mem,
+            s.base,
+            s.size,
+            0,
+            &mut buf,
+            &mut found.skipped,
+            |at, b| {
+                for (i, q) in b.chunks_exact(8).enumerate() {
+                    let site = at + 8 * i as u64;
+                    let pointer = u64::from_le_bytes(q.try_into().expect("8 bytes"));
+                    if names.contains(&pointer) && site - s.base >= layout.name {
+                        objects.push(site - layout.name);
+                    }
                 }
-            }
-        });
+                ControlFlow::Continue(())
+            },
+        );
     }
     objects.sort_unstable();
     for address in objects {
@@ -533,6 +553,7 @@ mod tests {
                 base: self.base,
                 size,
                 kind: RegionKind::Image,
+                protect: 0x02,
                 section: None,
             }])
         }

@@ -252,7 +252,7 @@ Cursor's timeout can't be changed: about 60 minutes in the editor, 60 s in its C
 **Permissions.** Your client asks you before every launch: quen marks `session_launch` so that Claude Code (2.1.214 or newer) shows its permission prompt each time, in every permission mode, with no "always allow". In another client, keep `session_launch` on the permission prompt: allow it once each time it asks, never "always allow". The agent must ask you before a launch (`user_ok`), but quen can't check that it did: the prompt is your check. `session_plan`, which only checks a launch, doesn't ask. What else quen can do on your PC, and what it trusts: [SECURITY.md](SECURITY.md).
 
 **Claude Code's auto mode** may refuse a quen tool in the middle of a session (seen 2026-10-19: `mem_patch` as "Modify Shared Resources", `mem_read` as "Security Weaken"). An allow rule in `%USERPROFILE%\.claude\settings.json`, under `permissions.allow`, names a tool that may run: the rule for quen's tool `<tool>` is `mcp__quen__<tool>`, for example `{"permissions": {"allow": ["mcp__quen__mem_read"]}}`. Which tools you allow is your decision; quen doesn't read Claude Code's settings. The tools on the game's memory:
-- **Only read it:** `mem_read`, `mem_scan`, `mem_follow`, `mem_walk`, `mem_find`.
+- **Only read it:** `mem_read`, `mem_scan`, `mem_follow`, `mem_walk`, `mem_find`, `mem_regions`.
 - **Write it:** `mem_patch`, `mem_unpatch` (journaled; every save the game writes afterwards is marked tainted).
 - **Both:** `game_cvar` reads a cvar, and with `set` or `restore` writes it. One rule, `mcp__quen__game_cvar`, covers both.
 - `session_launch`, `game_save`, `capture_clean` and `hands_take` prompt on every call, whatever the rules say.
@@ -308,7 +308,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 - The agent sends no key and writes nothing to the game until you ask it in the chat and approve the hand-over (Claude Code asks you each time); you get the controls back with `hands_give`. With your OK it may take screenshots, record frame times or read the game's memory while you play.
 - Your saves stay yours; the end lists them. A save written while the agent has the controls gives them back to you.
 - After a memory write, cvar write, teleport, time or weather change, every save the game writes in that session is marked tainted in quen's ledger.
-- The session ends when you quit the game: quen then puts the console line and `steam_appid.txt` back by itself. Closing the agent's chat leaves the game running. If `quen serve` itself exits (a crash, an update that stops it), the game closes with it.
+- The session ends when you quit the game: quen then puts the console line and `steam_appid.txt` back by itself. Closing the agent's chat leaves the game running; if the agent had the controls then, quen first undoes its memory and cvar writes of that hand-over, except the ones you agreed to keep. If `quen serve` itself exits (a crash, an update that stops it), the game closes with it.
 
 **How it puts things back:**
 - Before each change, quen writes the step to its journal, with what it takes to undo it.

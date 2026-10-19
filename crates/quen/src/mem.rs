@@ -1,15 +1,18 @@
-//! The live-memory tools: `mem_read`, `mem_scan`, `mem_find`, `mem_follow`, `mem_walk`, `mem_patch` and
-//! `mem_unpatch`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
+//! The live-memory tools: `mem_read`, `mem_scan`, `mem_find`, `mem_follow`, `mem_walk`, `mem_regions`, `mem_patch`
+//! and `mem_unpatch`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
 //! access only, on the pid from the session's job (never "the first witcher3.exe"). [`Ctx::write`] journals a planned
 //! write, then makes it with a handle open for that write only. game_cvar and measure_ab's cvar actions (game.rs) go
 //! through the same two.
 
+use std::cmp::Reverse;
 use std::ffi::c_void;
 use std::fmt::Display;
 use std::fs;
 use std::io;
 use std::mem::{size_of, zeroed};
+use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::time::{Duration, Instant};
 
 use quen_core::mem::{
     self, Field, Filter, Image, Kind, Memory, Op, Pattern, Region, Scope, Section, Type, Walk,
@@ -29,7 +32,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::doctor;
-use crate::game::{self, Ctx, Fields, ctx, text};
+use crate::game::{self, Ctx, Fields, ctx, flag, text};
 use crate::ledger::{self, INLINE_BYTES};
 use crate::session::{Call, Done, Session};
 
@@ -37,6 +40,11 @@ use crate::session::{Call, Done, Session};
 const LIMIT: usize = 100;
 /// A find hit's context bytes on each side when the call gives no `context`.
 const CONTEXT: u64 = 16;
+/// A scan or find page's `deadline_s` when the call gives none, and the most it takes.
+const DEADLINE_S: u64 = 60;
+const MAX_DEADLINE_S: u64 = 600;
+/// How many of the biggest regions mem_regions names.
+const LARGEST: usize = 16;
 
 pub fn tools() -> Vec<Value> {
     let token = json!({"type": "string", "description": "the token session_launch returned"});
@@ -56,6 +64,10 @@ pub fn tools() -> Vec<Value> {
     let len =
         json!({"type": "integer", "minimum": 1, "maximum": 4096, "description": "bytes: how many"});
     let limit = json!({"type": "integer", "minimum": 1, "maximum": 1000, "description": "hits per page, default 100"});
+    let deadline = json!({"type": "integer", "minimum": 1, "maximum": 600, "description": "seconds before the page stops early, default 60"});
+    let sections = json!({"type": "array", "items": {"type": "string"}, "description": "image sections: .text, .rdata, .data"});
+    let regions = json!({"type": "array", "items": {"type": "string"}, "description": "region bases (mem_regions, skipped): numbers or 0x hex"});
+    let kinds = json!({"type": "array", "items": {"type": "string", "enum": ["image", "mapped", "private"]}, "description": "what backs the regions"});
     let name = json!({"type": "string", "description": "a patch's name in the KB's patches.tsv"});
     let patch = |verb: &str, does: &str| {
         json!({
@@ -85,34 +97,45 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "mem_scan",
             "description": "Search the running game's memory for a byte pattern (IDA-style `48 8B ?? ?? 4?`, with an \
-                optional hex bit mask), an ASCII string or a UTF-16LE one (exact, no terminator). Scope: sections of \
-                the game's image (.text, .rdata, .data: faster), region bases from an earlier result, or by default \
-                every readable region (slow on a big game). One page of hits (default 100, at most 1000); pass next \
-                as from for the page after. skipped lists what couldn't be read, so may hold hits nobody saw.",
+                optional hex bit mask), an ASCII string or a UTF-16LE one (exact, no terminator). Scope, one of: \
+                sections of the game's image (.text, .rdata, .data), region bases (mem_regions lists them), kinds \
+                (image, mapped, private); by default every readable region. One page of hits (default 100, at most \
+                1000); pass next as from for the page after. deadline_s (default 60, at most 600) ends a page early: \
+                stopped says why, next where to go on. A region that can't be read whole is read page by page: \
+                skipped lists the pages that couldn't be read, so may hold hits nobody saw. A match never spans two \
+                regions.",
             "inputSchema": schema(json!({
                 "pattern": {"type": "string", "description": "bytes in hex, ?? or 4? for any byte or nibble"},
                 "mask": {"type": "string", "description": "hex, one byte per pattern byte"},
                 "ascii": {"type": "string", "description": "an ASCII string to find"},
                 "utf16": {"type": "string", "description": "a string to find as UTF-16LE"},
-                "sections": {"type": "array", "items": {"type": "string"}, "description": "image sections: .text, .rdata, .data"},
-                "regions": {"type": "array", "items": {"type": "string"}, "description": "region bases from an earlier result: numbers or 0x hex"},
+                "sections": sections,
+                "regions": regions,
+                "kinds": kinds,
                 "from": number("search from"),
                 "limit": limit,
+                "deadline_s": deadline,
             }), &[]),
         }),
         json!({
             "name": "mem_find",
-            "description": "Search the running game's image and private regions for a 64-bit value at 8-byte-aligned \
-                addresses, each hit with up to context bytes before and after it (default 16, at most 256), cut at the \
-                edges of its region. The game is the one in the session's job, with read access only. One page of \
-                hits (default 100, at most 1000); pass next as from for the page after. skipped lists what couldn't \
-                be read, so may hold hits nobody saw. A result over 16 KB comes back as its first hits and the path \
-                of a JSON file holding all of it.",
+            "description": "Search the running game's memory for a 64-bit value at 8-byte-aligned addresses, each hit \
+                with up to context bytes before and after it (default 16, at most 256), cut at the edges of its \
+                region. The game is the one in the session's job, with read access only. Scope as mem_scan's, one of \
+                sections, regions and kinds; by default the image and private regions. One page of hits (default \
+                100, at most 1000); pass next as from for the page after. deadline_s (default 60, at most 600) ends a \
+                page early: stopped says why, next where to go on. skipped lists the pages that couldn't be read, so \
+                may hold hits nobody saw. A result over 16 KB comes back as its first hits and the path of a JSON \
+                file holding all of it.",
             "inputSchema": schema(json!({
                 "value": number("the qword to find"),
                 "context": {"type": "integer", "minimum": 0, "maximum": 256, "description": "bytes before and after each hit, default 16"},
+                "sections": sections,
+                "regions": regions,
+                "kinds": kinds,
                 "from": number("search from"),
                 "limit": limit,
+                "deadline_s": deadline,
             }), &["value"]),
         }),
         json!({
@@ -162,6 +185,18 @@ pub fn tools() -> Vec<Value> {
                 }, "required": ["field"], "additionalProperties": false},
             }), &["stride", "count", "fields"]),
         }),
+        json!({
+            "name": "mem_regions",
+            "description": "List the running game's readable memory regions (committed, neither guard nor no-access \
+                pages), with read access only: regions and bytes in all; groups, the count and bytes per kind \
+                (image, mapped, private), protection and image section, most bytes first; largest, the 16 biggest \
+                regions. protect is Windows' PAGE_* value as 0x hex. list: true adds every region in address order \
+                (base, size, kind, protect, section). A result over 16 KB comes back as its first regions and the \
+                path of a JSON file holding all of it.",
+            "inputSchema": schema(json!({
+                "list": {"type": "boolean", "description": "true: every region too. Default false"},
+            }), &[]),
+        }),
         patch(
             "patch",
             "Apply a live code or data patch defined in the KB's patches.tsv: its new bytes over its old ones, at its \
@@ -181,6 +216,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "mem_find" => find(session, call, args),
         "mem_follow" => follow(session, call, args),
         "mem_walk" => walk(session, call, args),
+        "mem_regions" => regions(session, call, args),
         "mem_patch" => patch(session, call, args, Op::Patch),
         "mem_unpatch" => patch(session, call, args, Op::Unpatch),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
@@ -278,8 +314,8 @@ impl Process {
                 let piece = Region {
                     base: at,
                     size: cut - at,
-                    kind: r.kind,
                     section: section.map(|s| s.name.clone()),
+                    ..r
                 };
                 at = cut;
                 piece
@@ -352,6 +388,7 @@ impl Memory for Process {
                     base,
                     size,
                     kind,
+                    protect: info.Protect,
                     section: None,
                 }));
             }
@@ -475,6 +512,62 @@ fn paging(args: &Value) -> Result<(u64, usize), String> {
     Ok((from, limit))
 }
 
+/// The scope `args` give: `sections`, `regions` or `kinds`, at most one of them; `default` without.
+fn scope(args: &Value, default: Scope) -> Result<Scope, String> {
+    let list = |key: &str| {
+        args.get(key)
+            .map(|v| v.as_array().ok_or(format!("{key} must be an array")))
+    };
+    Ok(match (list("sections"), list("regions"), list("kinds")) {
+        (None, None, None) => default,
+        (Some(s), None, None) => Scope::Sections(
+            s?.iter()
+                .map(|v| v.as_str().map(String::from))
+                .collect::<Option<_>>()
+                .ok_or("sections must be names")?,
+        ),
+        (None, Some(r), None) => Scope::Regions(
+            r?.iter()
+                .map(unsigned)
+                .collect::<Option<_>>()
+                .ok_or("regions must be bases: numbers or 0x hex")?,
+        ),
+        (None, None, Some(k)) => Scope::Kinds(
+            serde_json::from_value(Value::Array(k?.clone()))
+                .map_err(|_| "kinds must be image, mapped or private")?,
+        ),
+        _ => return Err("one of sections, regions and kinds, not two".into()),
+    })
+}
+
+/// A scan or find page's `deadline_s`.
+fn deadline(args: &Value) -> Result<Duration, String> {
+    let secs = match args.get("deadline_s") {
+        Some(v) => v
+            .as_u64()
+            .filter(|s| (1..=MAX_DEADLINE_S).contains(s))
+            .ok_or(format!("deadline_s must be 1 to {MAX_DEADLINE_S}"))?,
+        None => DEADLINE_S,
+    };
+    Ok(Duration::from_secs(secs))
+}
+
+/// A scan's tick ([`mem::scan`]): stops it once `budget` has run out or the call was cancelled, and reports its
+/// progress.
+fn ticker(call: &Call, budget: Duration) -> impl FnMut(u64, u64) -> ControlFlow<&'static str> {
+    let deadline = Instant::now() + budget;
+    move |bytes, total| {
+        if call.stopped() {
+            return ControlFlow::Break("cancelled");
+        }
+        if Instant::now() >= deadline {
+            return ControlFlow::Break("deadline");
+        }
+        call.progress(&format!("{} of {} MiB searched", bytes >> 20, total >> 20));
+        ControlFlow::Continue(())
+    }
+}
+
 /// The address `args` give: `key`, or `rva` from the game's image base; exactly one of them.
 fn address(game: &Process, args: &Value, key: &str) -> Result<u64, String> {
     match (args.get(key), args.get("rva")) {
@@ -499,7 +592,16 @@ fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
 
 fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let known = [
-        "pattern", "mask", "ascii", "utf16", "sections", "regions", "from", "limit",
+        "pattern",
+        "mask",
+        "ascii",
+        "utf16",
+        "sections",
+        "regions",
+        "kinds",
+        "from",
+        "limit",
+        "deadline_s",
     ];
     let cx = checked(session, args, &known)?;
     let string = |key| {
@@ -519,30 +621,19 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         Some(mask) => pattern.masked(mask?)?,
         None => pattern,
     };
-    let list = |key: &str| {
-        args.get(key)
-            .map(|v| v.as_array().ok_or(format!("{key} must be an array")))
-    };
-    let scope = match (list("sections"), list("regions")) {
-        (None, None) => Scope::All,
-        (Some(s), None) => Scope::Sections(
-            s?.iter()
-                .map(|v| v.as_str().map(String::from))
-                .collect::<Option<_>>()
-                .ok_or_else(|| String::from("sections must be names"))?,
-        ),
-        (None, Some(r)) => Scope::Regions(
-            r?.iter()
-                .map(unsigned)
-                .collect::<Option<_>>()
-                .ok_or_else(|| String::from("regions must be bases: numbers or 0x hex"))?,
-        ),
-        _ => return Err("sections or regions, not both".to_string().into()),
-    };
+    let scope = scope(args, Scope::All)?;
     let (from, limit) = paging(args)?;
+    let budget = deadline(args)?;
     let game = cx.game()?;
-    let page = mem::scan(&game, &pattern, &scope, from, limit)
-        .map_err(|e| format!("the game's regions: {e}"))?;
+    let page = mem::scan(
+        &game,
+        &pattern,
+        &scope,
+        from,
+        limit,
+        &mut ticker(call, budget),
+    )
+    .map_err(|e| format!("the game's regions: {e}"))?;
     call.lap("scan");
     Ok(fields(json!(page)))
 }
@@ -558,7 +649,17 @@ fn follow(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Do
 }
 
 fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = checked(session, args, &["value", "context", "from", "limit"])?;
+    let known = [
+        "value",
+        "context",
+        "sections",
+        "regions",
+        "kinds",
+        "from",
+        "limit",
+        "deadline_s",
+    ];
+    let cx = checked(session, args, &known)?;
     let value = args.get("value").and_then(unsigned);
     let value = value.ok_or_else(|| String::from("value must be a number or 0x hex of 64 bits"))?;
     let context = match args.get("context") {
@@ -567,10 +668,14 @@ fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             .ok_or_else(|| String::from("context must be a whole number"))?,
         None => CONTEXT,
     };
+    let scope = scope(args, Scope::Kinds(vec![Kind::Image, Kind::Private]))?;
     let (from, limit) = paging(args)?;
+    let budget = deadline(args)?;
     let game = cx.game()?;
-    let page = mem::find(&game, value, from, limit, context)
-        .map_err(|e| format!("the game's regions: {e}"))?;
+    let mut tick = ticker(call, budget);
+    let page = mem::find(&game, value, &scope, from, limit, context, &mut tick);
+    drop(tick);
+    let page = page.map_err(|e| format!("the game's regions: {e}"))?;
     call.lap("find");
     inline(&cx, call, fields(json!(page)), "hits")
 }
@@ -643,6 +748,30 @@ fn walk(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let errors = rows.iter().filter(|r| r.contains_key("why")).count();
     let out = json!({"base": base, "row_count": rows.len(), "errors": errors, "rows": rows});
     inline(&cx, call, fields(out), "rows")
+}
+
+fn regions(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let cx = checked(session, args, &["list"])?;
+    let list = flag(args, "list")?;
+    let game = cx.game()?;
+    let all = game
+        .regions()
+        .map_err(|e| format!("the game's regions: {e}"))?;
+    call.lap("regions");
+    let mut largest = all.clone();
+    largest.sort_by_key(|r| Reverse(r.size));
+    largest.truncate(LARGEST);
+    let bytes: u64 = all.iter().map(|r| r.size).sum();
+    let mut out = json!({
+        "regions": all.len(),
+        "bytes": bytes,
+        "groups": mem::census(&all),
+        "largest": largest,
+    });
+    if list {
+        out["list"] = json!(all);
+    }
+    inline(&cx, call, fields(out), "list")
 }
 
 /// `out` as it is or, over [`INLINE_BYTES`], all of it in a file (`file`, in the call's artifacts) and inline only the
@@ -1130,6 +1259,128 @@ pub(crate) mod tests {
         );
     }
 
+    /// mem_regions lists the dummy game's image sections and private regions with their protection; mem_find and mem_scan
+    /// search the scope they are given.
+    #[test]
+    fn regions_and_scopes_in_the_dummy_game() {
+        let fx = Fake::new("memregions");
+        let tok = |more: Value| {
+            let mut args = json!({"token": "tok"});
+            let args_map = args.as_object_mut().unwrap();
+            args_map.extend(more.as_object().unwrap().clone());
+            args
+        };
+        let census = fx.run("mem_regions", tok(json!({})));
+        assert_eq!(census["ok"], true, "{census}");
+        assert!(census.get("list").is_none(), "{census}");
+        let groups = census["groups"].as_array().unwrap();
+        let has = |kind: &str, section: Option<&str>| {
+            groups
+                .iter()
+                .any(|g| g["kind"] == kind && g["section"] == json!(section))
+        };
+        assert!(
+            has("image", Some(".data")) && has("image", Some(".text")) && has("private", None),
+            "{census}"
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|g| g["protect"].as_str().unwrap().starts_with("0x")),
+            "{census}"
+        );
+        let total: u64 = groups.iter().map(|g| g["bytes"].as_u64().unwrap()).sum();
+        assert_eq!(census["bytes"], total);
+        assert!(census["largest"].as_array().unwrap().len() <= LARGEST);
+        let listed = fx.run("mem_regions", tok(json!({"list": true})));
+        let list = match listed["truncated"] == true {
+            true => serde_json::from_str::<Value>(
+                &fs::read_to_string(listed["file"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap()["list"]
+                .clone(),
+            false => listed["list"].clone(),
+        };
+        let session = fx.session();
+        let game = ctx(&session, &json!({"token": "tok"}), &[])
+            .unwrap()
+            .game()
+            .unwrap();
+        let buf = game.image.base + rva(BUF.address());
+        let data = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                let base = r["base"].as_u64().unwrap();
+                base <= buf && buf < base + r["size"].as_u64().unwrap()
+            })
+            .unwrap();
+        assert_eq!(
+            (&data["kind"], &data["section"]),
+            (&json!("image"), &json!(".data")),
+            "{data}"
+        );
+
+        // HOP holds BUF's address, in .data: a mapped-only scope can't see it.
+        let hop = game.image.base + rva(HOP.address());
+        let value = format!("{buf:#x}");
+        let found = fx.run(
+            "mem_find",
+            tok(json!({"value": value, "sections": [".data"], "context": 0})),
+        );
+        let hits: Vec<u64> = found["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["address"].as_u64().unwrap())
+            .collect();
+        assert!(hits.contains(&hop), "{found}");
+        let (lo, hi) = (
+            data["base"].as_u64().unwrap(),
+            data["base"].as_u64().unwrap() + data["size"].as_u64().unwrap(),
+        );
+        assert!(hits.iter().all(|h| (lo..hi).contains(h)), "{found}");
+        let mapped = fx.run(
+            "mem_find",
+            tok(json!({"value": value, "kinds": ["mapped"], "deadline_s": 5})),
+        );
+        assert_eq!(mapped["ok"], true, "{mapped}");
+        assert!(
+            !mapped["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["address"] == hop),
+            "{mapped}"
+        );
+        let image = fx.run(
+            "mem_scan",
+            tok(json!({"ascii": "quen-dummy-buf", "kinds": ["image"]})),
+        );
+        assert!(
+            image["hits"].as_array().unwrap().contains(&json!(buf)),
+            "{image}"
+        );
+        for (tool, args) in [
+            (
+                "mem_find",
+                json!({"value": 1, "sections": [".data"], "kinds": ["image"]}),
+            ),
+            ("mem_find", json!({"value": 1, "kinds": ["heap"]})),
+            ("mem_find", json!({"value": 1, "deadline_s": 0})),
+            ("mem_scan", json!({"ascii": "a", "deadline_s": 601})),
+            (
+                "mem_scan",
+                json!({"ascii": "a", "regions": [1], "kinds": ["image"]}),
+            ),
+            ("mem_regions", json!({"list": "yes"})),
+        ] {
+            let out = fx.run(tool, tok(args.clone()));
+            assert_eq!(out["refused"], true, "{tool} {args}: {out}");
+        }
+    }
+
     /// While the KB's tables name a build, the mem_* tools and game_cvar refuse a session whose exe is another.
     #[test]
     fn a_kb_of_another_build_is_refused() {
@@ -1160,6 +1411,7 @@ rva	name
                 json!({"token": "tok", "address": 8, "stride": 8, "count": 1, "fields": []}),
             ),
             ("mem_patch", json!({"token": "tok", "name": "dummy"})),
+            ("mem_regions", json!({"token": "tok"})),
             ("game_cvar", json!({"token": "tok", "name": "X"})),
         ] {
             let out = fx.run(tool, args);
@@ -1178,6 +1430,7 @@ rva	name
             base: image.base,
             size: text.base + text.size + 0x10_0000 - image.base,
             kind: Kind::Image,
+            protect: 0x02,
             section: None,
         };
         let pieces = process.split(whole.clone());
