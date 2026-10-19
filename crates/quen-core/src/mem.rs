@@ -1,5 +1,6 @@
-//! The platform-neutral half of the live-memory tools (`mem.read`, `mem.scan`, `mem.follow`, `mem.patch` /
-//! `mem.unpatch`), against a [`Memory`] trait the Windows layer implements with VirtualQueryEx and ReadProcessMemory.
+//! The platform-neutral half of the live-memory tools (`mem.read`, `mem.scan`, `mem.find`, `mem.follow`, `mem.walk`,
+//! `mem.patch` / `mem.unpatch`), against a [`Memory`] trait the Windows layer implements with VirtualQueryEx and
+//! ReadProcessMemory.
 //!
 //! Nothing here writes. A patch [`plan`] checks the KB definition (`patches.tsv`) and the live bytes, and returns the one
 //! [`Write`] allowed, or a [`Refusal`]. The platform layer journals it as an
@@ -8,8 +9,10 @@
 
 use std::fmt;
 use std::io;
+use std::ops::Range;
 
 use serde::Serialize;
+use serde_json::json;
 
 use crate::build::Stamp;
 use crate::seeds::{rva, tsv_rows};
@@ -44,7 +47,8 @@ pub enum Kind {
 /// The most bytes one raw read returns.
 pub const MAX_BYTES: usize = 4096;
 
-/// What `mem.read` reads at an address: a little-endian number, or 1 to [`MAX_BYTES`] raw bytes.
+/// What `mem.read` reads at an address: a little-endian number (`Ptr`: a u64 shown as 0x hex), or 1 to
+/// [`MAX_BYTES`] raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     U8,
@@ -52,12 +56,92 @@ pub enum Type {
     U32,
     U64,
     I32,
+    I64,
     F32,
     F64,
+    Ptr,
     Bytes(usize),
 }
 
-/// A value read. It serializes as a JSON number (serde_json writes a NaN or an infinity as `null`), or raw bytes as hex.
+impl Type {
+    /// The type `name` names; `bytes` takes `len`, and only it.
+    pub fn named(name: &str, len: Option<usize>) -> Result<Type, String> {
+        let ty = match name {
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            "i32" => Type::I32,
+            "i64" => Type::I64,
+            "f32" => Type::F32,
+            "f64" => Type::F64,
+            "ptr" => Type::Ptr,
+            "bytes" => return len.map(Type::Bytes).ok_or("bytes needs len".into()),
+            other => {
+                return Err(format!(
+                    "type {other:?}: u8 u16 u32 u64 i32 i64 f32 f64 ptr or bytes"
+                ));
+            }
+        };
+        match len {
+            Some(_) => Err("len is for type bytes only".into()),
+            None => Ok(ty),
+        }
+    }
+
+    /// How many bytes a value of this type takes.
+    pub fn size(self) -> usize {
+        match self {
+            Type::U8 => 1,
+            Type::U16 => 2,
+            Type::U32 | Type::I32 | Type::F32 => 4,
+            Type::U64 | Type::I64 | Type::F64 | Type::Ptr => 8,
+            Type::Bytes(len) => len,
+        }
+    }
+
+    /// The value in `b`, which is [`Type::size`] bytes.
+    fn decode(self, b: &[u8]) -> Value {
+        match self {
+            Type::U8 => Value::U8(b[0]),
+            Type::U16 => Value::U16(u16::from_le_bytes(sized(b))),
+            Type::U32 => Value::U32(u32::from_le_bytes(sized(b))),
+            Type::U64 => Value::U64(u64::from_le_bytes(sized(b))),
+            Type::I32 => Value::I32(i32::from_le_bytes(sized(b))),
+            Type::I64 => Value::I64(i64::from_le_bytes(sized(b))),
+            Type::F32 => Value::F32(f32::from_le_bytes(sized(b))),
+            Type::F64 => Value::F64(f64::from_le_bytes(sized(b))),
+            Type::Ptr => Value::Ptr(u64::from_le_bytes(sized(b))),
+            Type::Bytes(_) => Value::Bytes(b.to_vec()),
+        }
+    }
+
+    /// `text` as this type's little-endian bytes: a whole number ([`number`]) that fits it, a float, or hex bytes of
+    /// its length.
+    fn encode(self, text: &str) -> Result<Vec<u8>, String> {
+        let size = self.size();
+        let int = |range: Range<i128>| {
+            number(text)
+                .filter(|n| range.contains(n))
+                .map(|n| n.to_le_bytes()[..size].to_vec())
+        };
+        let bytes = match self {
+            Type::F32 => text.parse::<f32>().ok().map(|f| f.to_le_bytes().to_vec()),
+            Type::F64 => text.parse::<f64>().ok().map(|f| f.to_le_bytes().to_vec()),
+            Type::Bytes(_) => parse_hex(text).ok().filter(|b| b.len() == size),
+            Type::I32 | Type::I64 => {
+                let half = 1i128 << (8 * size - 1);
+                int(-half..half)
+            }
+            _ => int(0..1 << (8 * size)),
+        };
+        let ty = format!("{self:?}").to_lowercase();
+        bytes.ok_or_else(|| format!("{text:?} is not a {ty}"))
+    }
+}
+
+/// A value read. It serializes as a JSON number (serde_json writes a NaN or an infinity as `null`), a pointer as 0x
+/// hex, or raw bytes as spaced hex.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Value {
@@ -66,47 +150,49 @@ pub enum Value {
     U32(u32),
     U64(u64),
     I32(i32),
+    I64(i64),
     F32(f32),
     F64(f64),
+    Ptr(#[serde(serialize_with = "hex::address")] u64),
     Bytes(#[serde(with = "hex")] Vec<u8>),
 }
 
 /// Reads one value of type `ty` at `address`.
 pub fn read(mem: &dyn Memory, address: u64, ty: Type) -> io::Result<Value> {
-    let len = match ty {
-        Type::U8 => 1,
-        Type::U16 => 2,
-        Type::U32 | Type::I32 | Type::F32 => 4,
-        Type::U64 | Type::F64 => 8,
-        Type::Bytes(len) if (1..=MAX_BYTES).contains(&len) => len,
-        Type::Bytes(len) => {
-            let why = format!("{len} bytes: a raw read is 1 to {MAX_BYTES}");
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
-        }
-    };
-    let mut b = vec![0; len];
+    if let Type::Bytes(len) = ty
+        && !(1..=MAX_BYTES).contains(&len)
+    {
+        let why = format!("{len} bytes: a raw read is 1 to {MAX_BYTES}");
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    let mut b = vec![0; ty.size()];
     mem.read(address, &mut b)?;
-    Ok(match ty {
-        Type::U8 => Value::U8(b[0]),
-        Type::U16 => Value::U16(u16::from_le_bytes(sized(&b))),
-        Type::U32 => Value::U32(u32::from_le_bytes(sized(&b))),
-        Type::U64 => Value::U64(u64::from_le_bytes(sized(&b))),
-        Type::I32 => Value::I32(i32::from_le_bytes(sized(&b))),
-        Type::F32 => Value::F32(f32::from_le_bytes(sized(&b))),
-        Type::F64 => Value::F64(f64::from_le_bytes(sized(&b))),
-        Type::Bytes(_) => Value::Bytes(b),
-    })
+    Ok(ty.decode(&b))
+}
+
+/// A whole number in text: decimal, or `0x` hex, either with a `-` before it.
+pub fn number(text: &str) -> Option<i128> {
+    let (negative, s) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
+    let n = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => i128::from_str_radix(hex, 16).ok()?,
+        None => s.parse().ok()?,
+    };
+    Some(if negative { -n } else { n })
 }
 
 fn sized<const N: usize>(b: &[u8]) -> [u8; N] {
     b.try_into().expect("read sizes the buffer by its type")
 }
 
-/// A byte pattern: memory matches at `i` where `(byte ^ bytes[i]) & mask[i] == 0`. It always has a fixed bit.
+/// A byte pattern: memory matches at `i` where `(byte ^ bytes[i]) & mask[i] == 0`, at addresses that are a multiple
+/// of `align`. It always has a fixed bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     bytes: Vec<u8>,
     mask: Vec<u8>,
+    align: u64,
 }
 
 impl Pattern {
@@ -160,13 +246,27 @@ impl Pattern {
         Self::new(bytes, mask)
     }
 
+    /// A qword's little-endian bytes, at 8-byte-aligned addresses only.
+    pub fn qword(value: u64) -> Self {
+        let (bytes, mask) = (value.to_le_bytes().into(), vec![0xff; 8]);
+        Self {
+            bytes,
+            mask,
+            align: 8,
+        }
+    }
+
     /// Refuses a pattern that matches everywhere: empty, or wildcards only.
     fn new(bytes: Vec<u8>, mask: Vec<u8>) -> Result<Self, String> {
         if mask.iter().all(|&m| m == 0) {
             return Err("the pattern has no fixed bit: it would match everywhere".into());
         }
         let bytes = bytes.iter().zip(&mask).map(|(b, m)| b & m).collect();
-        Ok(Self { bytes, mask })
+        Ok(Self {
+            bytes,
+            mask,
+            align: 1,
+        })
     }
 
     fn matches(&self, at: &[u8]) -> bool {
@@ -186,6 +286,8 @@ pub enum Scope {
     Sections(Vec<String>),
     /// The regions at these bases, as [`Memory::regions`] lists them.
     Regions(Vec<u64>),
+    /// The regions of these kinds.
+    Kinds(Vec<Kind>),
 }
 
 /// The most hits one scan page returns.
@@ -196,9 +298,9 @@ pub(crate) const CHUNK: u64 = 1 << 20;
 
 /// One page of scan hits, and what the page covered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct ScanPage {
-    /// Where the pattern matches, ascending.
-    pub hits: Vec<u64>,
+pub struct ScanPage<H = u64> {
+    /// Where the pattern matches, ascending ([`find`]'s: with their context).
+    pub hits: Vec<H>,
     /// The `from` of the next page when this one is full; `None` when the scope is done.
     pub next: Option<u64>,
     /// The regions this page searched, in whole or in part, and the bytes it covered in them (from a region's base or
@@ -236,6 +338,7 @@ pub fn scan(
         Scope::All => true,
         Scope::Sections(names) => r.section.as_ref().is_some_and(|s| names.contains(s)),
         Scope::Regions(bases) => bases.contains(&r.base),
+        Scope::Kinds(kinds) => kinds.contains(&r.kind),
     });
     if let Scope::Regions(bases) = scope {
         for &base in bases
@@ -270,7 +373,7 @@ pub fn scan(
             // At most CHUNK windows: matches starting past them are the next chunk's.
             for (i, window) in buf.windows(n as usize).enumerate() {
                 let hit = at + i as u64;
-                if pattern.matches(window) {
+                if hit.is_multiple_of(pattern.align) && pattern.matches(window) {
                     page.hits.push(hit);
                     if page.hits.len() == limit {
                         page.regions += 1;
@@ -288,6 +391,73 @@ pub fn scan(
         }
     }
     Ok(page)
+}
+
+/// The most context bytes a [`find`] hit has on each side.
+pub const MAX_CONTEXT: u64 = 256;
+
+/// A [`find`] hit, and the bytes before and after its qword.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Found {
+    pub address: u64,
+    #[serde(with = "hex")]
+    pub before: Vec<u8>,
+    #[serde(with = "hex")]
+    pub after: Vec<u8>,
+    /// Why the context couldn't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// [`scan`]'s page for the qword `value` at 8-byte-aligned addresses in the image and private regions, each hit with up
+/// to `context` bytes (clamped to [`MAX_CONTEXT`]) on each side, cut at the edges of its region.
+pub fn find(
+    mem: &dyn Memory,
+    value: u64,
+    from: u64,
+    limit: usize,
+    context: u64,
+) -> io::Result<ScanPage<Found>> {
+    let scope = Scope::Kinds(vec![Kind::Image, Kind::Private]);
+    let page = scan(mem, &Pattern::qword(value), &scope, from, limit)?;
+    let regions = mem.regions()?;
+    let n = context.min(MAX_CONTEXT);
+    let hits = page
+        .hits
+        .iter()
+        .map(|&address| {
+            let region = regions
+                .iter()
+                .find(|r| r.base <= address && address < r.base + r.size);
+            let (lo, hi) = region.map_or((address, address + 8), |r| {
+                let hi = address.saturating_add(8 + n).min(r.base + r.size);
+                (address.saturating_sub(n).max(r.base), hi)
+            });
+            let mut b = vec![0; (hi - lo) as usize];
+            let at = (address - lo) as usize;
+            match mem.read(lo, &mut b) {
+                Ok(()) => Found {
+                    address,
+                    before: b[..at].to_vec(),
+                    after: b[at + 8..].to_vec(),
+                    why: None,
+                },
+                Err(e) => Found {
+                    address,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                    why: Some(e.to_string()),
+                },
+            }
+        })
+        .collect();
+    Ok(ScanPage {
+        hits,
+        next: page.next,
+        regions: page.regions,
+        bytes: page.bytes,
+        skipped: page.skipped,
+    })
 }
 
 /// One hop of a pointer chain: the qword read at `at`.
@@ -348,6 +518,150 @@ pub fn follow(mem: &dyn Memory, base: u64, offsets: &[i64]) -> Chain {
     }
     chain.end = Some(pointer);
     chain
+}
+
+/// The most elements a walk reads, its longest stride, and the most bytes it reads in all: per element, its struct's
+/// bytes from its first field to the end of its last, and 8 per deref hop.
+pub const MAX_COUNT: u64 = 100_000;
+pub const MAX_STRIDE: u64 = 64 * 1024;
+pub const MAX_WALK: u64 = 16 << 20;
+
+/// An array of structs to read: `count` elements `stride` bytes apart from `base`. Each element is the struct its
+/// fields are read from or, with `deref`, the start of a pointer chain to it ([`follow`]'s offsets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    pub base: u64,
+    pub stride: u64,
+    pub count: u64,
+    pub deref: Vec<i64>,
+    pub fields: Vec<Field>,
+    pub filter: Option<Filter>,
+}
+
+/// A field of a walked struct: a value of `ty` at `offset` from the struct's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub offset: u64,
+    pub ty: Type,
+}
+
+/// Keeps the rows whose field `field` holds `value` (`eq`), or the rows whose field doesn't: the field's bytes against
+/// `value` written as the field's type ([`number`], a float, or hex bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    pub field: String,
+    pub eq: bool,
+    pub value: String,
+}
+
+/// A walk's row, as JSON.
+pub type Row = serde_json::Map<String, serde_json::Value>;
+
+/// Reads `w`: per element, `{index, address, <field>: value, ...}`, with `target` (the struct's address) when it has a
+/// deref, or `{index, address, why}` when it can't be read. The filter drops rows, never a `why` one. Err: refused,
+/// nothing read.
+pub fn walk(mem: &dyn Memory, w: &Walk) -> Result<Vec<Row>, String> {
+    if !(1..=MAX_COUNT).contains(&w.count) {
+        return Err(format!("count {}: a walk is 1 to {MAX_COUNT}", w.count));
+    }
+    if !(1..=MAX_STRIDE).contains(&w.stride) {
+        return Err(format!("stride {}: 1 to {MAX_STRIDE}", w.stride));
+    }
+    if w.fields.is_empty() {
+        return Err("no fields".into());
+    }
+    // Without a deref the struct is the element; past one, it is read up to MAX_STRIDE bytes from its start.
+    let room = if w.deref.is_empty() {
+        w.stride
+    } else {
+        MAX_STRIDE
+    };
+    for (i, f) in w.fields.iter().enumerate() {
+        let name = &f.name;
+        if name.is_empty() || ["index", "address", "target", "why"].contains(&name.as_str()) {
+            return Err(format!(
+                "field name {name:?}: blank, or index, address, target or why"
+            ));
+        }
+        if w.fields[..i].iter().any(|g| g.name == *name) {
+            return Err(format!("field {name} is named twice"));
+        }
+        if let Type::Bytes(len) = f.ty
+            && !(1..=MAX_BYTES).contains(&len)
+        {
+            return Err(format!(
+                "field {name}: {len} bytes, a field is 1 to {MAX_BYTES}"
+            ));
+        }
+        if f.offset.saturating_add(f.ty.size() as u64) > room {
+            return Err(format!(
+                "field {name} ends past {room:#x}: the stride, or {MAX_STRIDE:#x} from a deref's target"
+            ));
+        }
+    }
+    let lo = w.fields.iter().map(|f| f.offset).min().unwrap_or(0);
+    let hi = w.fields.iter().map(|f| f.offset + f.ty.size() as u64);
+    let len = hi.max().unwrap_or(0) - lo;
+    let total = w.count * (len + 8 * w.deref.len() as u64);
+    if total > MAX_WALK {
+        return Err(format!(
+            "{total} bytes to read: a walk reads at most {MAX_WALK}"
+        ));
+    }
+    let filter = match &w.filter {
+        None => None,
+        Some(Filter { field, eq, value }) => {
+            let f = w.fields.iter().find(|f| f.name == *field);
+            let f = f.ok_or(format!("filter: no field {field}"))?;
+            let want = f.ty.encode(value).map_err(|e| format!("filter: {e}"))?;
+            Some(((f.offset - lo) as usize, *eq, want))
+        }
+    };
+    let mut rows = Vec::new();
+    let mut buf = vec![0; len as usize];
+    // ponytail: one read per element (and per hop), ~100k syscalls at the cap; read whole arrays if that is slow.
+    for index in 0..w.count {
+        let address = w.base.checked_add(index * w.stride);
+        let mut row = Row::from_iter([
+            ("index".into(), json!(index)),
+            ("address".into(), json!(address)),
+        ]);
+        let target = match address {
+            None => Err("past the top of memory".to_string()),
+            Some(a) if w.deref.is_empty() => Ok(a),
+            Some(a) => {
+                let chain = follow(mem, a, &w.deref);
+                let broken = chain.broken.map(|b| format!("deref: {}", b.why));
+                chain.end.ok_or_else(|| broken.unwrap_or_default())
+            }
+        };
+        let read = target.and_then(|t| {
+            if !w.deref.is_empty() {
+                row.insert("target".into(), json!(t));
+            }
+            let at = t.checked_add(lo).ok_or("past the top of memory")?;
+            mem.read(at, &mut buf)
+                .map_err(|e| format!("can't read {len} bytes at {at:#x}: {e}"))
+        });
+        if let Err(why) = read {
+            row.insert("why".into(), json!(why));
+            rows.push(row);
+            continue;
+        }
+        if let Some((at, eq, want)) = &filter
+            && (buf[*at..*at + want.len()] == want[..]) != *eq
+        {
+            continue;
+        }
+        for f in &w.fields {
+            let at = (f.offset - lo) as usize;
+            let value = f.ty.decode(&buf[at..at + f.ty.size()]);
+            row.insert(f.name.clone(), json!(value));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// A PE image as loaded in memory, from its headers: the build stamp the KB names builds by, and its sections.
@@ -709,12 +1023,16 @@ fn to_hex(bytes: &[u8]) -> String {
     hex.join(" ")
 }
 
-/// Serde for bytes as spaced lowercase hex.
+/// Serde for bytes as spaced lowercase hex, and for an address as 0x hex.
 mod hex {
     use serde::Serializer;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&super::to_hex(bytes))
+    }
+
+    pub fn address<S: Serializer>(address: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{address:#x}"))
     }
 }
 
@@ -792,6 +1110,18 @@ mod tests {
             "02 03 04"
         );
         assert_eq!(serde_json::to_value(at(20, Type::I32)).unwrap(), -7);
+        assert_eq!(at(12, Type::I64), Value::I64((-2.25f64).to_bits() as i64));
+        assert_eq!(json!(at(0, Type::Ptr)), "0x807060504030201");
+        assert_eq!(Type::named("ptr", None), Ok(Type::Ptr));
+        assert_eq!(Type::named("bytes", Some(3)), Ok(Type::Bytes(3)));
+        for (name, len, why) in [
+            ("bytes", None, "bytes needs len"),
+            ("u8", Some(1), "len is for type bytes only"),
+            ("u128", None, "u8 u16"),
+        ] {
+            let err = Type::named(name, len).unwrap_err();
+            assert!(err.contains(why), "{name}: {err}");
+        }
         for len in [0, MAX_BYTES + 1] {
             let err = read(&mem, 0x1000, Type::Bytes(len)).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1009,6 +1339,255 @@ mod tests {
         assert_eq!(broken(&[8], 0), (0, "the base is null".into()));
         let chain = follow(&mem, base, &[]);
         assert_eq!((chain.hops.len(), chain.end), (0, Some(base)));
+    }
+
+    #[test]
+    fn finds_aligned_qwords_in_the_image_and_private_regions_with_their_context() {
+        let v: u64 = 0x7ff6_0000_1234;
+        let mut image = vec![0x11; 0x20];
+        image[0x08..0x10].copy_from_slice(&v.to_le_bytes());
+        image[0x15..0x1d].copy_from_slice(&v.to_le_bytes());
+        let mut private = vec![0x22; 0x10];
+        private[..8].copy_from_slice(&v.to_le_bytes());
+        let mut mem = Fake::default()
+            .with(0x1000, image, Some(".data"))
+            .with(0x3000, private, None);
+        let mapped = Region {
+            base: 0x5000,
+            size: 8,
+            kind: Kind::Mapped,
+            section: None,
+        };
+        mem.regions.push((mapped, v.to_le_bytes().into()));
+        let page = find(&mem, v, 0, 100, 4).unwrap();
+        let found = |address, before, after| Found {
+            address,
+            before,
+            after,
+            why: None,
+        };
+        assert_eq!(
+            page.hits,
+            [
+                found(0x1008, vec![0x11; 4], vec![0x11; 4]),
+                found(0x3000, vec![], vec![0x22; 4])
+            ],
+            "unaligned and mapped copies aren't hits; context stops at the region's edge"
+        );
+        assert_eq!((page.next, page.regions), (None, 2));
+        assert_eq!(
+            json!(page.hits[1]),
+            json!({"address": 0x3000, "before": "", "after": "22 22 22 22"})
+        );
+        let wide = find(&mem, v, 0, 100, 10_000).unwrap();
+        let sides: Vec<(usize, usize)> = wide
+            .hits
+            .iter()
+            .map(|h| (h.before.len(), h.after.len()))
+            .collect();
+        assert_eq!(sides, [(8, 16), (0, 8)], "the region's bytes, at most");
+        let first = find(&mem, v, 0, 1, 0).unwrap();
+        assert_eq!(first.next, Some(0x1009));
+        let second = find(&mem, v, 0x1009, 1, 0).unwrap();
+        assert_eq!(
+            (second.hits[0].address, second.next),
+            (0x3000, Some(0x3001))
+        );
+        assert!(find(&mem, v, 0x3001, 1, 0).unwrap().hits.is_empty());
+    }
+
+    /// Three 16-byte elements: an id, a float and a pointer to a 32-byte struct (null for the second).
+    fn array() -> Fake {
+        let mut elements = Vec::new();
+        for (id, to) in [(7u32, 0x2000u64), (8, 0), (9, 0x2020)] {
+            elements.extend(id.to_le_bytes());
+            elements.extend(1.5f32.to_le_bytes());
+            elements.extend(to.to_le_bytes());
+        }
+        let mut structs = vec![0; 0x40];
+        structs[..4].copy_from_slice(b"abcd");
+        structs[0x10..0x18].copy_from_slice(&(-5i64).to_le_bytes());
+        structs[0x20..0x24].copy_from_slice(b"wxyz");
+        Fake::default()
+            .with(0x1000, elements, None)
+            .with(0x2000, structs, None)
+    }
+
+    fn field(name: &str, offset: u64, ty: Type) -> Field {
+        let name = name.into();
+        Field { name, offset, ty }
+    }
+
+    fn elements(fields: Vec<Field>) -> Walk {
+        Walk {
+            base: 0x1000,
+            stride: 0x10,
+            count: 3,
+            deref: Vec::new(),
+            fields,
+            filter: None,
+        }
+    }
+
+    fn filter(field: &str, eq: bool, value: &str) -> Option<Filter> {
+        let (field, value) = (field.into(), value.into());
+        Some(Filter { field, eq, value })
+    }
+
+    #[test]
+    fn walks_read_each_element_or_say_why_not() {
+        let mem = array();
+        let fields = vec![
+            field("id", 0, Type::U32),
+            field("f", 4, Type::F32),
+            field("p", 8, Type::Ptr),
+        ];
+        let rows = walk(&mem, &elements(fields.clone())).unwrap();
+        assert_eq!(
+            json!(rows),
+            json!([
+                {"index": 0, "address": 0x1000, "id": 7, "f": 1.5, "p": "0x2000"},
+                {"index": 1, "address": 0x1010, "id": 8, "f": 1.5, "p": "0x0"},
+                {"index": 2, "address": 0x1020, "id": 9, "f": 1.5, "p": "0x2020"},
+            ])
+        );
+        let derefs = Walk {
+            deref: vec![8],
+            ..elements(vec![
+                field("name", 0, Type::Bytes(4)),
+                field("n", 0x10, Type::I64),
+            ])
+        };
+        let rows = walk(&mem, &derefs).unwrap();
+        assert_eq!(
+            json!(rows),
+            json!([
+                {"index": 0, "address": 0x1000, "target": 0x2000, "name": "61 62 63 64", "n": -5},
+                {"index": 1, "address": 0x1010, "target": 0, "why": "can't read 24 bytes at 0x0: no 24 readable bytes at 0x0"},
+                {"index": 2, "address": 0x1020, "target": 0x2020, "name": "77 78 79 7a", "n": 0},
+            ])
+        );
+        let two = Walk {
+            deref: vec![8, 0],
+            ..derefs.clone()
+        };
+        assert_eq!(
+            walk(&mem, &two).unwrap()[1]["why"],
+            "deref: hop 0 read a null pointer"
+        );
+        let index = |rows: Vec<Row>| -> Vec<u64> {
+            rows.iter().map(|r| r["index"].as_u64().unwrap()).collect()
+        };
+        for (filter, kept) in [
+            (filter("p", false, "0"), vec![0, 2]),
+            (filter("id", true, "0x9"), vec![2]),
+            (filter("f", true, "1.5"), vec![0, 1, 2]),
+            (filter("id", true, "10"), vec![]),
+        ] {
+            let w = Walk {
+                filter: filter.clone(),
+                ..elements(fields.clone())
+            };
+            assert_eq!(index(walk(&mem, &w).unwrap()), kept, "{filter:?}");
+        }
+        let named = Walk {
+            filter: filter("name", true, "61 62 63 64"),
+            ..derefs
+        };
+        assert_eq!(
+            index(walk(&mem, &named).unwrap()),
+            [0, 1],
+            "a why row stays"
+        );
+    }
+
+    #[test]
+    fn walks_refuse_before_reading() {
+        let mem = array();
+        let one = || elements(vec![field("id", 0, Type::U32)]);
+        for (w, why) in [
+            (Walk { count: 0, ..one() }, "count 0"),
+            (
+                Walk {
+                    count: MAX_COUNT + 1,
+                    ..one()
+                },
+                "count 100001",
+            ),
+            (Walk { stride: 0, ..one() }, "stride 0"),
+            (
+                Walk {
+                    stride: MAX_STRIDE + 1,
+                    ..one()
+                },
+                "stride 65537",
+            ),
+            (elements(vec![]), "no fields"),
+            (elements(vec![field("why", 0, Type::U8)]), "field name"),
+            (
+                elements(vec![field("a", 0, Type::U8), field("a", 1, Type::U8)]),
+                "named twice",
+            ),
+            (elements(vec![field("b", 0, Type::Bytes(0))]), "0 bytes"),
+            (elements(vec![field("x", 0xc, Type::F64)]), "ends past 0x10"),
+            (
+                Walk {
+                    deref: vec![8],
+                    ..elements(vec![field("x", MAX_STRIDE, Type::U8)])
+                },
+                "ends past 0x10000",
+            ),
+            (
+                Walk {
+                    count: MAX_COUNT,
+                    stride: MAX_STRIDE,
+                    ..elements(vec![field("b", 0, Type::Bytes(MAX_BYTES))])
+                },
+                "a walk reads at most",
+            ),
+            (
+                Walk {
+                    filter: filter("nope", true, "1"),
+                    ..one()
+                },
+                "no field nope",
+            ),
+            (
+                Walk {
+                    filter: filter("id", true, "-1"),
+                    ..one()
+                },
+                r#""-1" is not a u32"#,
+            ),
+        ] {
+            let err = walk(&mem, &w).unwrap_err();
+            assert!(err.contains(why), "{w:?}: {err}");
+        }
+        assert!(
+            walk(
+                &mem,
+                &Walk {
+                    deref: vec![8],
+                    ..elements(vec![field("x", 0x20, Type::U8)])
+                }
+            )
+            .is_ok(),
+            "a deref's struct reaches past the stride"
+        );
+        for (ty, text, ok) in [
+            (Type::U8, "255", true),
+            (Type::U8, "256", false),
+            (Type::I32, "-2147483648", true),
+            (Type::I32, "2147483648", false),
+            (Type::U64, "0xffffffffffffffff", true),
+            (Type::Ptr, "-0x1", false),
+            (Type::F32, "x", false),
+            (Type::Bytes(2), "61 62", true),
+            (Type::Bytes(2), "61", false),
+        ] {
+            assert_eq!(ty.encode(text).is_ok(), ok, "{ty:?} {text}");
+        }
+        assert_eq!(Type::I32.encode("-1"), Ok(vec![0xff; 4]));
     }
 
     const HEADER: &str = "name\trva\told\tnew\tbuild\tboundaries-checked\n";
