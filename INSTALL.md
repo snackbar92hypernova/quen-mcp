@@ -216,7 +216,7 @@ Nothing to set for time: its tool timeout is about 28 hours.
 2. Open Codex. Its `quen mcp` connects to that `quen serve`.
 3. When you're done, press Ctrl+C in that terminal: a live session ends the normal way, then `quen serve` exits. Don't close the terminal window during a session: Windows gives a closing console only 5 s.
 
-The terminal must run the same `quen.exe` as Codex's `command` (both ends check). Tested against a simulated Codex job, not yet with real Codex. Details: [docs/clients.md](docs/clients.md#clients-that-hold-servers-in-a-job-object). Codex's entry, in `%USERPROFILE%\.codex\config.toml`:
+The terminal must run the same `quen.exe` as Codex's `command` (both ends check). Tested against a simulated Codex job, and with real Codex CLI for read-only calls; a launch through Codex is untested. Details: [docs/clients.md](docs/clients.md#clients-that-hold-servers-in-a-job-object). Codex's entry, in `%USERPROFILE%\.codex\config.toml`:
 
 ```toml
 [mcp_servers.quen]

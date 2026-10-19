@@ -76,7 +76,8 @@ quen's daemon (`quen serve`) must outlive the client process, so a closed client
 - Both ends check that the other is the same `quen.exe` and the same user, so the terminal's `quen` and the client's `command` must be one file. Both find the config the same way (`QUEN_CONFIG`, else `%USERPROFILE%\.quen\config.toml`); with another config, the client's `quen mcp` looks for another daemon.
 - Its log goes to that terminal, not to `logs\serve.log` under the data root.
 - A second `quen serve --stay` for the same config refuses and changes nothing. So does one started while a daemon another client started is still running: it exits 5 s after its last client.
-- Tested against a simulated Codex job (kill on close, no breakaway; test `a_relay_in_a_no_breakaway_job_uses_a_stay_daemon`), not yet with real Codex or the Python SDK.
+- Tested against a simulated Codex job (kill on close, no breakaway; test `a_relay_in_a_no_breakaway_job_uses_a_stay_daemon`).
+- With real Codex CLI 0.163.0-alpha.10.2 (2026-10-19): its `quen mcp` ran under `codex.exe`, connected to a running `quen serve`, and answered `session_status` and `quen_guide`. That `quen serve` was one another client had started, not a `--stay`. Not yet tried with real Codex: a `--stay` daemon on its own, a launch, a call long enough to answer with a job. Not tried with the Python SDK.
 
 ## Conformance (2026-10-18, no game)
 
