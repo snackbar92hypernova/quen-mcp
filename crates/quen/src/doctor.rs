@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.9 adds the photo.* verbs (game_photo, photo.rs) and world.get's rain, snow and sky flag to both files.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.9",
+        sha256: "4a9e4c2436fe1dd13e70ffd67ebb6a35e84f8484cb3b3f8846f5fe494927fe0b",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.9",
+        sha256: "c2a4da337f4f626234144590e153751a41184ba23268279543e1a1cf0e3918a3",
+        exact: true,
+    },
     // 0.1.8 adds the notice verb (hands_give's notice, hands.rs) to both files.
     Pin {
         file: PACKAGE_ASI,
@@ -208,6 +221,18 @@ pub(crate) const BEFORE_NOTICE: &[&str] = &[
     "quen-w3 0.1.7",
 ];
 
+/// The package releases from before the photo-mode verbs (quen-w3 0.1.9): game_photo refuses them with needs.
+pub(crate) const BEFORE_PHOTO: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+];
+
 /// Refused with needs, nothing sent, while quen's package in the game is one of `before`: releases without what
 /// `tool` needs, which came in quen-w3 `since`. An unpinned package (a dev build) goes on: its ASI refuses a verb it
 /// doesn't know.
@@ -309,7 +334,7 @@ pub(crate) const PACKAGE: Dep = Dep {
         that isn't the newest, game_listsaves, game_pause, game_settime, game_weather, game_teleport, game_camera \
         and (from quen-w3 0.1.2) sweep_play; from quen-w3 0.1.3, session_launch profiler tracy:NAME; from quen-w3 \
         0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
-        quen-w3 0.1.8, hands_give's notice in the game",
+        quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

@@ -235,7 +235,8 @@ pub fn tools() -> Vec<Value> {
             "description": format!("Change the weather, blending over 1 s, as the vanilla console's \
                 changeweather does: only a name the current area's list holds, e.g. WT_Clear. An unknown name is \
                 refused with the area's list. In photo mode the weather didn't change: world_get still read the old \
-                one 40 s later (observed 2026-10-19). {confirms} {taints}. {needs}, or {game}."),
+                one 40 s later (observed 2026-10-19); game_photo sets photo mode's own. {confirms} {taints}. {needs}, \
+                or {game}."),
             "inputSchema": schema(json!({"name": {"type": "string", "description": "a weather name, e.g. WT_Clear"}}), &["name"]),
         }),
         json!({
@@ -243,7 +244,9 @@ pub fn tools() -> Vec<Value> {
             "description": format!("Read where the player is and what the world is: player.pos ([x, y, z]: \
                 thePlayer.GetWorldPosition()) and player.heading (GetHeading()), time.day and time.hour \
                 (GameTimeDays and GameTimeHours of theGame.GetGameTime(): game_settime's arguments) and weather \
-                (GetWeatherConditionName()). Changes nothing: not journaled, taints no save. Runs while the user has \
+                (GetWeatherConditionName()); from quen-w3 0.1.9 also rain and snow (GetRainStrength, \
+                GetSnowStrength: blended values) and sky_clear (IsSkyClear()). Changes nothing: not journaled, taints \
+                no save. Runs while the user has \
                 the controls in a play session too. {needs}; with needs: quen-w3 0.1.4 or older, or {game}, or no \
                 player. Failed: no reply within 5 s."),
             "inputSchema": schema(json!({}), &[]),
@@ -429,7 +432,8 @@ fn confirm(cx: &Ctx, verb: &Verb, fields: &mut Fields) -> Result<(), String> {
         (false, false) => None,
     };
     if photo {
-        why += "; quen's state shows photo mode";
+        why += "; quen's state shows photo mode, where game_photo (quen-w3 0.1.9) sets photo mode's own weather and \
+            time";
     }
     if paused {
         why += "; quen's pause is on";

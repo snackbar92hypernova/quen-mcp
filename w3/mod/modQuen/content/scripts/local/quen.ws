@@ -2,7 +2,7 @@
 // W3Quen.asi. Needs in bin\x64_dx12: an ASI loader, WitcherNativeBridge.asi (public 2.0) and W3Quen.asi. It imports
 // W3Quen.asi's natives, so without them the script compile fails at boot: remove this folder first, then the ASI.
 //
-// Four parts, all quiet outside quen sessions (the ASI writes and serves nothing without quen's launch token):
+// Five parts, all quiet outside quen sessions (the ASI writes and serves nothing without quen's launch token):
 // - Game state: from CR4Game.OnTick, at most 4 times a second by local time, QUEN_State(flags) whenever the flags
 //   change; the ASI writes each to W3QuenState.log. Also at once when a game starts (OnGameStarted,
 //   OnAfterLoadingScreenGameStart) and when the photo-mode menu opens or closes. OnGameEnded sends 0 at once: a load or
@@ -20,8 +20,13 @@
 //   cam.get, cam.set, cam.path and cam.frame "<camera> x y z pitch yaw roll fov". The ASI guarantees each verb's
 //   number count; a script error mid-command comes back to quen as "no reply" at the next poll. save (from quen-w3
 //   0.1.4) writes a new manual save as the menu's "Empty save slot" does; the game names the file. world.get (from
-//   quen-w3 0.1.5) reads back "x y z heading day hour weather" and changes nothing. notice (from quen-w3 0.1.8) shows
-//   quen's text on screen for 8 s, as QUEN_Say does, and changes nothing.
+//   quen-w3 0.1.5) reads back "x y z heading day hour rain snow skyclear weather" (rain, snow and skyclear from quen-w3
+//   0.1.9) and changes nothing. notice (from quen-w3 0.1.8) shows quen's text on screen for 8 s, as QUEN_Say does, and
+//   changes nothing.
+// - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
+//   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
+//   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
+//   open: it turns the effects on as it opens and off as it closes. Every set reads back the whole photo state.
 // - Camera paths: cam.path loads one on the photo-mode camera, played from CR4Game.OnTick, one
 //   set per tick: real time, or frame step (cam.frame sets frame n, then holds). W3Quen.asi checks and interpolates the
 //   path as quen-core sweep.rs does, in double precision (its offline test checks sweep.rs's reference vectors), and
@@ -51,6 +56,8 @@ import function QUEN_CamAt(frame : int) : string;
 @addField(CR4Game) var quenCamPath : int;    // the camera path loaded: 0 none, 1 real time, 2 frame step
 @addField(CR4Game) var quenCamFrame : int;   // frame step: the frame shown
 @addField(CR4Game) var quenCamFrames : int;  // frame step: how many frames the path has
+@addField(CR4Game) var quenPhotoMenu : CR4PhotomodeMenu;  // photo mode's menu while it is open, else NULL
+@addField(CR4Game) var quenGradeOpen : array<float>;     // the grading sliders (QUEN_Grade) as that menu opened
 
 @wrapMethod(CR4Game) function OnTick()
 {
@@ -89,13 +96,123 @@ import function QUEN_CamAt(frame : int) : string;
 @wrapMethod(CR4PhotomodeMenu) function OnMenuShown()
 {
 	wrappedMethod();
+	theGame.QUEN_PhotoMenu(this);
 	theGame.QUEN_PollState(true);
 }
 
 @wrapMethod(CR4PhotomodeMenu) function OnClosingMenu()
 {
 	wrappedMethod();
+	theGame.QUEN_PhotoMenu(NULL);
 	theGame.QUEN_PollState(true);
+}
+
+// ---- photo mode ----
+
+// Photo mode's menu as it opens (its OnMenuShown turned the effects on) and the grading then, or NULL as it closes (its
+// OnClosingMenu turned them off). The menu takes its own slider defaults from the same getters as it opens.
+@addMethod(CR4Game) function QUEN_PhotoMenu(menu : CR4PhotomodeMenu)
+{
+	quenPhotoMenu = menu;
+	if (menu)
+		quenGradeOpen = QUEN_Grade(GetPhotomodeEffects());
+}
+
+// EnablePhotomode (private) after vanilla's own conditions for it, as its key calls it: "" when it ran, else the
+// conditions that hold. EnablePhotomode returns without a word on any of them (photomodeManager.ws).
+@addMethod(PhotomodeManager) function QUEN_Enable() : string
+{
+	var why : string;
+
+	if (m_photomodeEnabled)
+		why += ", its manager has it on";
+	if (theGame.IsDialogOrCutscenePlaying())
+		why += ", a dialogue or cutscene";
+	if (!thePlayer.IsAlive())
+		why += ", the player is dead";
+	if (thePlayer.IsInCutsceneIntro())
+		why += ", a cutscene intro";
+	if (theGame.IsBlackscreenOrFading() || theGame.HasBlackscreenRequested())
+		why += ", a blackscreen or fade";
+	if (theGame.IsCurrentlyPlayingNonGameplayScene())
+		why += ", a non-gameplay scene";
+	if (theGame.GetGuiManager().IsAnyMenu())
+		why += ", a menu is open";
+	if (theGame.GetTutorialSystem().HasActiveTutorial())
+		why += ", a tutorial shows";
+	if (why != "")
+		return StrAfterFirst(why, ", ");
+	EnablePhotomode();
+	return "";
+}
+
+// The 8 grading sliders of photo mode's Effect and Overlay tabs, in photo.grade's order: exposure, contrast, highlights,
+// saturation, temperature (kelvin: the menu's steps are BinToTemperature's), vignette, film grain, chromatic aberration.
+function QUEN_Grade(fx : CR4PhotomodeEffects) : array<float>
+{
+	var g : array<float>;
+
+	g.PushBack(fx.GetExposure());
+	g.PushBack(fx.GetContrast());
+	g.PushBack(fx.GetHighlights());
+	g.PushBack(fx.GetSaturation());
+	g.PushBack(fx.GetTemperature());
+	g.PushBack(fx.GetVignette());
+	g.PushBack(fx.GetFilmGrain());
+	g.PushBack(fx.GetChromaticAberration());
+	return g;
+}
+
+function QUEN_SetGrade(fx : CR4PhotomodeEffects, i : int, v : float)
+{
+	switch (i)
+	{
+		case 0: fx.SetExposure(v); break;
+		case 1: fx.SetContrast(v); break;
+		case 2: fx.SetHighlights(v); break;
+		case 3: fx.SetSaturation(v); break;
+		case 4: fx.SetTemperature(v); break;
+		case 5: fx.SetVignette(v); break;
+		case 6: fx.SetFilmGrain(v); break;
+		case 7: fx.SetChromaticAberration(v); break;
+	}
+}
+
+// photo.*'s read-back, 4 decimals: "<time> <8 grading> <8 grading as the menu opened> <rain> <snow> <skyclear 0|1>|<photo
+// weather>|<env path, or empty>|<world weather>". The time is GetTimeOfDay's; the menu's slider passes minutes of the day.
+@addMethod(CR4Game) function QUENRPC_PhotoState() : string
+{
+	var fx : CR4PhotomodeEffects;
+	var env : CEnvironmentDefinition;
+	var g : array<float>;
+	var text, path : string;
+	var i : int;
+
+	fx = GetPhotomodeEffects();
+	g = QUEN_Grade(fx);
+	text = FloatToStringPrec(fx.GetTimeOfDay(), 4);
+	for (i = 0; i < 8; i += 1)
+		text += " " + FloatToStringPrec(g[i], 4);
+	for (i = 0; i < 8; i += 1)
+		text += " " + FloatToStringPrec(quenGradeOpen[i], 4);
+	text += " " + QUENRPC_Env();
+	fx.GetEnvDef(env);
+	path = "";
+	if (env)
+		path = env.GetPath();
+	return text + "|" + fx.GetWeather() + "|" + path + "|" + NameToString(GetWeatherConditionName());
+}
+
+// The blended weather values the scripts can read, "<rain> <snow> <skyclear 0|1>" (environment.ws; the HUD's weather icon
+// reads the same three, environmentManager.ws GetCurWeather). Nothing in the scripts reads the environment's blend weight.
+function QUENRPC_Env() : string
+{
+	var text : string;
+
+	text = FloatToStringPrec(GetRainStrength(), 4) + " " + FloatToStringPrec(GetSnowStrength(), 4);
+	if (IsSkyClear())
+		return text + " 1";
+	return text + " 0";
 }
 
 // With `now`, polls at once; else at most every 250 ms.
@@ -331,15 +448,17 @@ function QUENRPC_PhotoPose() : string
 @addMethod(CR4Game) function QUENRPC_Poll()
 {
 	var line, head, rest, verb, args, text : string;
-	var handle, i, slots, manual : int;
+	var handle, i, slots, manual, count : int;
 	var photo : bool;
 	var n : array<float>;
 	var pos : Vector;
 	var rot : EulerAngles;
 	var saves : array<SSavegameInfo>;
 	var weathers : array<name>;
+	var paths : array<string>;
 	var t : GameTime;
 	var gui : CR4GuiManager;
+	var fx : CR4PhotomodeEffects;
 
 	line = QUEN_Next();
 	if (line == "")
@@ -348,9 +467,161 @@ function QUENRPC_PhotoPose() : string
 	handle = StringToInt(head);
 	QUENRPC_Split(rest, verb, args);
 	photo = theGame.GetPhotomodeEnabled();
+	// The effects are on only while photo mode's menu is open (its OnMenuShown and OnClosingMenu).
+	if (StrBeginsWith(verb, "photo.") && verb != "photo.mode" && (!photo || !quenPhotoMenu))
+	{
+		QUEN_Reply(handle, false, verb + " needs photo mode with its menu open (photo.mode on opens it)", "");
+		return;
+	}
+	fx = GetPhotomodeEffects();
 
 	switch (verb)
 	{
+		case "photo.mode":
+			// On: EnablePhotomode, as photo mode's key calls it. Off: the menu's own exit, OnConfirmExit (it clears what the
+			// user spawned, then DisablePhotomode, which restores the weather), never its "Exit Photo Mode?" dialog: escape
+			// shows that only when HaveChangesBeenMade, else exits at once (photomodeMenu.ws OnTryClosingMenu).
+			if (args == "1")
+			{
+				if (photo)
+					QUEN_Reply(handle, true, "photo mode is already on", "");
+				else if (!thePlayer)
+					QUEN_Reply(handle, false, "no player (not in a game session)", "");
+				else
+				{
+					text = thePlayer.GetPhotomodeManager().QUEN_Enable();
+					if (text != "")
+						QUEN_Reply(handle, false, "photo mode doesn't open now (vanilla's own check): " + text, "");
+					else if (!GetPhotomodeEnabled())
+						QUEN_Reply(handle, false, "EnablePhotomode returned without photo mode", "");
+					else
+						QUEN_Reply(handle, true, "photo mode on; its menu opens on a later tick", "");
+				}
+				return;
+			}
+			if (!photo)
+			{
+				QUEN_Reply(handle, true, "photo mode is already off", "");
+				return;
+			}
+			if (quenPhotoMenu)
+				quenPhotoMenu.OnConfirmExit();
+			else
+				thePlayer.GetPhotomodeManager().DisablePhotomode();
+			QUEN_Reply(handle, true, "leaving photo mode by its menu's own exit, no dialog", "");
+			return;
+
+		case "photo.get":
+			QUEN_Reply(handle, true, "photo mode's time, grading, weather and env", QUENRPC_PhotoState());
+			return;
+
+		case "photo.weather":
+			// The menu's own call (PM_Weather); only names the area's list holds, as for weather.
+			GetWeatherNames(weathers);
+			text = "";
+			for (i = 0; i < weathers.Size(); i += 1)
+			{
+				if (NameToString(weathers[i]) == args)
+				{
+					fx.SetWeather(args);
+					QUEN_Reply(handle, true, "photo mode's weather set; data is the read-back", QUENRPC_PhotoState());
+					return;
+				}
+				text += " " + NameToString(weathers[i]);
+			}
+			QUEN_Reply(handle, false, "unknown weather " + args + "; this area has:" + text, "");
+			return;
+
+		case "photo.env":
+			// The menu's own call (PM_EnvDef), with a path of GetAllEnvironmentDefinitions, any case, sent as it lists it.
+			GetAllEnvironmentDefinitions(paths);
+			for (i = 0; i < paths.Size(); i += 1)
+			{
+				if (StrLower(paths[i]) == StrLower(args))
+				{
+					fx.SetEnvDefUsingPath(paths[i]);
+					QUEN_Reply(handle, true, "photo mode's env set; data is the read-back", QUENRPC_PhotoState());
+					return;
+				}
+			}
+			QUEN_Reply(handle, false, "no environment definition " + args + " (photo.list envs lists them)", "");
+			return;
+
+		case "photo.time":
+			// The menu's own calls (PM_TimeOfDay): its slider passes minutes of the day; then the city lights.
+			fx.SetTimeOfDay(StringToFloat(args));
+			GetCityLightManager().SetUpdateEnabled(true);
+			GetCityLightManager().ForceUpdate();
+			QUEN_Reply(handle, true, "photo mode's time set; data is the read-back", QUENRPC_PhotoState());
+			return;
+
+		case "photo.grade":
+			// 8 pairs "<given 0|1> <value>" in QUEN_Grade's order, from the ASI; the menu's own setters.
+			QUENRPC_Numbers(args, n);
+			for (i = 0; i < 8; i += 1)
+			{
+				if (n[2 * i] > 0.5)
+					QUEN_SetGrade(fx, i, n[2 * i + 1]);
+			}
+			QUEN_Reply(handle, true, "photo mode's grading set; data is the read-back", QUENRPC_PhotoState());
+			return;
+
+		case "photo.reset":
+			// weather: RestoreWeather, the menu's "none" (and DisablePhotomode's); env: SetEnvDefNull, the menu's "none";
+			// grading: the sliders back to their values as the menu opened.
+			if (args == "weather")
+				fx.RestoreWeather();
+			else if (args == "env")
+				fx.SetEnvDefNull();
+			else
+			{
+				for (i = 0; i < 8; i += 1)
+					QUEN_SetGrade(fx, i, quenGradeOpen[i]);
+			}
+			QUEN_Reply(handle, true, "photo mode's " + args + " reset; data is the read-back", QUENRPC_PhotoState());
+			return;
+
+		case "photo.tick":
+			// 2 pairs "<given 0|1> <seconds>": the menu's own calls (DoFakeTick passes 0.00001 s, WarmupClothsSimulation 1 s).
+			QUENRPC_Numbers(args, n);
+			if (n[0] > 0.5)
+				fx.SetPhotomodeTickTime(n[1]);
+			if (n[2] > 0.5)
+				fx.SetPhotomodeClothsSimulationTime(n[3]);
+			QUEN_Reply(handle, true, "called; neither has a getter to read back", "");
+			return;
+
+		case "photo.list":
+			// "weathers" or "envs", then a filter (case-insensitive, may hold spaces): GetWeatherNames, the area's list, or
+			// GetAllEnvironmentDefinitions, every env path; the menu shows fewer of either.
+			QUENRPC_Split(args, head, rest);
+			if (head == "weathers")
+			{
+				GetWeatherNames(weathers);
+				for (i = 0; i < weathers.Size(); i += 1)
+					paths.PushBack(NameToString(weathers[i]));
+			}
+			else
+				GetAllEnvironmentDefinitions(paths);
+			text = "";
+			count = 0;
+			for (i = 0; i < paths.Size(); i += 1)
+			{
+				if (rest != "" && StrFindFirst(StrLower(paths[i]), StrLower(rest)) < 0)
+					continue;
+				if (count > 0)
+					text += "|";
+				text += paths[i];
+				count += 1;
+			}
+			// ponytail: a cap below the ASI's 64 KiB reply, so the reason says how many matched.
+			if (StrLen(text) > 60000)
+				QUEN_Reply(handle, false, IntToString(count) + " of " + IntToString(paths.Size()) + " " + head
+					+ " match, over 60000 characters: narrow the filter", "");
+			else
+				QUEN_Reply(handle, true, IntToString(count) + " of " + IntToString(paths.Size()) + " " + head, text);
+			return;
+
 		case "load":
 			if (QUEN_LoadSave(args))
 				QUEN_Reply(handle, true, "loading the save matching " + args, "");
@@ -544,7 +815,7 @@ function QUENRPC_PhotoPose() : string
 			QUEN_Reply(handle, true, "the player's position and heading, the game time and the weather",
 				FloatToStringPrec(pos.X, 4) + " " + FloatToStringPrec(pos.Y, 4) + " " + FloatToStringPrec(pos.Z, 4) + " "
 				+ FloatToStringPrec(thePlayer.GetHeading(), 4) + " " + IntToString(GameTimeDays(t)) + " "
-				+ IntToString(GameTimeHours(t)) + " " + NameToString(GetWeatherConditionName()));
+				+ IntToString(GameTimeHours(t)) + " " + QUENRPC_Env() + " " + NameToString(GetWeatherConditionName()));
 			return;
 
 		case "notice":

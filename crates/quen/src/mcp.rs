@@ -23,8 +23,8 @@ use serde_json::{Map, Value, json};
 use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
-    camera, capture, channel, config, disk, doctor, focus, game, hands, ledger, measure, mem, save,
-    setup,
+    camera, capture, channel, config, disk, doctor, focus, game, hands, ledger, measure, mem,
+    photo, save, setup,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -859,6 +859,7 @@ fn tools() -> Value {
     list.extend(channel::tools());
     list.push(capture::tool());
     list.extend(camera::tools());
+    list.push(photo::tool());
     list.extend(measure::tools());
     list.extend(mem::tools());
     list.extend(ledger::tools());

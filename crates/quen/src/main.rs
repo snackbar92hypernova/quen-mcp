@@ -33,6 +33,8 @@ mod measure;
 #[cfg(windows)]
 mod mem;
 #[cfg(windows)]
+mod photo;
+#[cfg(windows)]
 mod profile;
 #[cfg(windows)]
 mod proxy;
