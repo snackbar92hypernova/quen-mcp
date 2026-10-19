@@ -348,9 +348,31 @@ impl Pattern {
     }
 }
 
-/// Which regions a scan reads.
+/// Windows' `PAGE_NOCACHE | PAGE_WRITECOMBINE`: a [`Scope`] leaves out the regions whose protection has either bit,
+/// unless it asks for them. Measured on one PC (2026-10-19, Witcher 3 5.01): 13.42 GB of the game's 21.06 GB readable
+/// was private 0x404, read at 107 MB/s against 2,390 MB/s for private 0x4.
+pub const UNCACHED: u32 = 0x200 | 0x400;
+
+/// Which regions a scan reads: those `which` names, less the ones whose protection has an [`UNCACHED`] bit unless
+/// `uncached`. A region named by base is read whatever its protection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scope {
+pub struct Scope {
+    pub which: Which,
+    pub uncached: bool,
+}
+
+impl From<Which> for Scope {
+    fn from(which: Which) -> Self {
+        Scope {
+            which,
+            uncached: false,
+        }
+    }
+}
+
+/// Which regions a [`Scope`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Which {
     /// Every region [`Memory::regions`] lists.
     All,
     /// The regions in these sections (`.text`, `.rdata`).
@@ -387,6 +409,15 @@ pub struct ScanPage<H = u64> {
     /// wasn't listed.
     /// ponytail: unbounded; a dying process lists every region here. Cap it if that ever floods a result.
     pub skipped: Vec<Skipped>,
+    /// The regions the scope named but left out for their protection ([`UNCACHED`]), so may hold matches nobody saw.
+    pub left_out: LeftOut,
+}
+
+/// How many regions a scope left out, and their bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct LeftOut {
+    pub regions: usize,
+    pub bytes: u64,
 }
 
 /// A part of the scope that wasn't read, and why.
@@ -414,13 +445,20 @@ pub fn scan(
     let limit = limit.clamp(1, MAX_HITS);
     let mut page = ScanPage::default();
     let mut regions = mem.regions()?;
-    regions.retain(|r| match scope {
-        Scope::All => true,
-        Scope::Sections(names) => r.section.as_ref().is_some_and(|s| names.contains(s)),
-        Scope::Regions(bases) => bases.contains(&r.base),
-        Scope::Kinds(kinds) => kinds.contains(&r.kind),
+    regions.retain(|r| match &scope.which {
+        Which::All => true,
+        Which::Sections(names) => r.section.as_ref().is_some_and(|s| names.contains(s)),
+        Which::Regions(bases) => bases.contains(&r.base),
+        Which::Kinds(kinds) => kinds.contains(&r.kind),
     });
-    if let Scope::Regions(bases) = scope {
+    let named = matches!(scope.which, Which::Regions(_));
+    let leave = |r: &Region| !scope.uncached && !named && r.protect & UNCACHED != 0;
+    for r in regions.iter().filter(|r| leave(r)) {
+        page.left_out.regions += 1;
+        page.left_out.bytes += r.size;
+    }
+    regions.retain(|r| !leave(r));
+    if let Which::Regions(bases) = &scope.which {
         for &base in bases
             .iter()
             .filter(|&&b| !regions.iter().any(|r| r.base == b))
@@ -540,6 +578,7 @@ pub fn find(
         regions: page.regions,
         bytes: page.bytes,
         skipped: page.skipped,
+        left_out: page.left_out,
     })
 }
 
@@ -1297,13 +1336,13 @@ mod tests {
             .with(0x9000, [0xaa, 0xaa], None);
         let p = Pattern::parse("aa aa").unwrap();
         let all = [0x1000, 0x1001, 0x1004, 0x2001, 0x9000];
-        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
+        let page = scan(&mem, &p, &Which::All.into(), 0, 100, &mut go).unwrap();
         assert_eq!(page.hits, all, "overlapping matches too");
         assert_eq!((page.next, page.regions, page.bytes), (None, 3, 11));
         assert!(page.skipped.is_empty());
         let (mut hits, mut from) = (Vec::new(), 0);
         loop {
-            let page = scan(&mem, &p, &Scope::All, from, 2, &mut go).unwrap();
+            let page = scan(&mem, &p, &Which::All.into(), from, 2, &mut go).unwrap();
             assert!(page.hits.len() <= 2);
             hits.extend(page.hits);
             match page.next {
@@ -1312,22 +1351,22 @@ mod tests {
             }
         }
         assert_eq!(hits, all, "pages resume after their last hit");
-        let text = Scope::Sections(vec![".text".into()]);
+        let text = Which::Sections(vec![".text".into()]).into();
         assert_eq!(
             scan(&mem, &p, &text, 0x1002, 100, &mut go).unwrap().hits,
             [0x1004]
         );
-        let regions = Scope::Regions(vec![0x9000, 0x2000]);
+        let regions = Which::Regions(vec![0x9000, 0x2000]).into();
         assert_eq!(
             scan(&mem, &p, &regions, 0, 100, &mut go).unwrap().hits,
             [0x2001, 0x9000]
         );
-        let page = scan(&mem, &p, &Scope::All, 0, 0, &mut go).unwrap();
+        let page = scan(&mem, &p, &Which::All.into(), 0, 0, &mut go).unwrap();
         assert_eq!(
             (page.hits, page.next, page.bytes),
             (vec![0x1000], Some(0x1001), 1)
         );
-        let page = scan(&mem, &p, &Scope::All, 0, usize::MAX, &mut go).unwrap();
+        let page = scan(&mem, &p, &Which::All.into(), 0, usize::MAX, &mut go).unwrap();
         assert_eq!(
             page.hits.len(),
             all.len(),
@@ -1341,7 +1380,7 @@ mod tests {
     }
 
     fn image_private() -> Scope {
-        Scope::Kinds(vec![Kind::Image, Kind::Private])
+        Which::Kinds(vec![Kind::Image, Kind::Private]).into()
     }
 
     #[test]
@@ -1353,7 +1392,7 @@ mod tests {
         );
         mem.bad.push(0x2000..0x2001);
         let p = Pattern::parse("aa").unwrap();
-        let text = Scope::Sections(vec![".text".into()]);
+        let text = Which::Sections(vec![".text".into()]).into();
         let page = scan(&mem, &p, &text, 0, 100, &mut go).unwrap();
         assert_eq!(page.hits, [0x1000, 0x1001, 0x1002, 0x1003]);
         assert_eq!(
@@ -1370,7 +1409,7 @@ mod tests {
                 why
             }]
         );
-        let regions = Scope::Regions(vec![0x1000, 0x5000]);
+        let regions = Which::Regions(vec![0x1000, 0x5000]).into();
         let page = scan(&mem, &p, &regions, 0, 100, &mut go).unwrap();
         let why = "not a readable region now".into();
         assert_eq!(
@@ -1403,13 +1442,13 @@ mod tests {
         let all = at.map(|i| base + i as u64);
         let mut mem = Fake::default().with(base, bytes, None);
         let p = Pattern::parse("01 02 03 04").unwrap();
-        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
+        let page = scan(&mem, &p, &Which::All.into(), 0, 100, &mut go).unwrap();
         assert_eq!(page.hits, all);
         assert_eq!((page.regions, page.bytes), (1, size));
         assert!(page.skipped.is_empty());
         let bad = base + CHUNK + PAGE;
         mem.bad.push(bad + 100..bad + 101);
-        let page = scan(&mem, &p, &Scope::All, 0, 100, &mut go).unwrap();
+        let page = scan(&mem, &p, &Which::All.into(), 0, 100, &mut go).unwrap();
         assert_eq!(
             page.hits, all,
             "before and after the page, and the region's rest"
@@ -1546,7 +1585,7 @@ mod tests {
         let all = |p: &Pattern| {
             let (mut hits, mut from) = (Vec::new(), 0);
             loop {
-                let page = scan(&mem, p, &Scope::All, from, MAX_HITS, &mut go).unwrap();
+                let page = scan(&mem, p, &Which::All.into(), from, MAX_HITS, &mut go).unwrap();
                 hits.extend(page.hits);
                 match page.next {
                     Some(next) => from = next,
@@ -1597,7 +1636,7 @@ mod tests {
             Some(".data"),
         );
         let p = Pattern::parse("aa bb").unwrap();
-        let every = scan(&mem, &p, &Scope::All, 0, MAX_HITS, &mut go).unwrap();
+        let every = scan(&mem, &p, &Which::All.into(), 0, MAX_HITS, &mut go).unwrap();
         assert_eq!((every.next, every.stopped), (None, None));
         // A deadline at every page's second tick.
         let (mut hits, mut from, mut pages) = (Vec::new(), 0, 0);
@@ -1610,7 +1649,7 @@ mod tests {
                     _ => ControlFlow::Continue(()),
                 }
             };
-            let page = scan(&mem, &p, &Scope::All, from, MAX_HITS, &mut tick).unwrap();
+            let page = scan(&mem, &p, &Which::All.into(), from, MAX_HITS, &mut tick).unwrap();
             pages += 1;
             hits.extend(page.hits.iter().copied());
             let Some(next) = page.next else { break };
@@ -1642,10 +1681,43 @@ mod tests {
             let page = find(&mem, v, &scope, 0, 100, 0, &mut go).unwrap();
             page.hits.iter().map(|h| h.address).collect()
         };
-        assert_eq!(at(Scope::Sections(vec![".data".into()])), [0x1000]);
-        assert_eq!(at(Scope::Kinds(vec![Kind::Mapped])), [0x5000]);
-        assert_eq!(at(Scope::Regions(vec![0x3000])), [0x3000]);
+        assert_eq!(at(Which::Sections(vec![".data".into()]).into()), [0x1000]);
+        assert_eq!(at(Which::Kinds(vec![Kind::Mapped]).into()), [0x5000]);
+        assert_eq!(at(Which::Regions(vec![0x3000]).into()), [0x3000]);
         assert_eq!(at(image_private()), [0x1000, 0x2000, 0x3000]);
+    }
+
+    /// Write-combined (0x404) and no-cache (0x204) regions are left out and counted, unless named by base or asked for.
+    #[test]
+    fn uncached_regions_are_left_out_unless_named_or_asked_for() {
+        let v: u64 = 0x1122_3344_5566_7788;
+        let q = v.to_le_bytes();
+        let mut mem = Fake::default()
+            .with(0x1000, q, None)
+            .with(0x2000, q, None)
+            .with(0x3000, [q, q].concat(), None);
+        (mem.regions[1].0.protect, mem.regions[2].0.protect) = (0x404, 0x204);
+        let at = |scope: Scope| {
+            let page = find(&mem, v, &scope, 0, 100, 0, &mut go).unwrap();
+            let hits: Vec<u64> = page.hits.iter().map(|h| h.address).collect();
+            (hits, page.left_out)
+        };
+        let out = |regions, bytes| LeftOut { regions, bytes };
+        assert_eq!(at(image_private()), (vec![0x1000], out(2, 24)));
+        let named = Which::Regions(vec![0x2000, 0x3000]).into();
+        assert_eq!(at(named), (vec![0x2000, 0x3000, 0x3008], out(0, 0)));
+        let all = Scope {
+            uncached: true,
+            ..image_private()
+        };
+        assert_eq!(at(all), (vec![0x1000, 0x2000, 0x3000, 0x3008], out(0, 0)));
+        let p = Pattern::qword(v);
+        let page = scan(&mem, &p, &Which::All.into(), 0, 100, &mut go).unwrap();
+        assert_eq!(
+            (&page.hits, page.regions, page.bytes),
+            (&vec![0x1000], 1, 8)
+        );
+        assert_eq!(json!(page)["left_out"], json!({"regions": 2, "bytes": 24}));
     }
 
     /// The scan before the fast paths (f9e9353): a fresh zeroed buffer per chunk, every window, the alignment check,
@@ -1695,7 +1767,7 @@ mod tests {
             let old = old_scan(&mem, &p);
             let old_s = t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
-            let new = scan(&mem, &p, &Scope::All, 0, MAX_HITS, &mut go).unwrap();
+            let new = scan(&mem, &p, &Which::All.into(), 0, MAX_HITS, &mut go).unwrap();
             let new_s = t.elapsed().as_secs_f64();
             assert_eq!(new.hits, old);
             println!(
