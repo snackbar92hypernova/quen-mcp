@@ -5,8 +5,9 @@
 //! every other tool call to the one session thread, one at a time. A `notifications/cancelled` only sets a flag the
 //! session thread checks between journal steps. A session belongs to the connection that launched it, and ends the
 //! normal way when that connection closes; other connections are unaffected. Ctrl+C or the console closing end the
-//! session and exit; so does having no connection and no session for [`LINGER`]. Before it exits, a journal an end
-//! left is replayed again (`session::work`).
+//! session and exit; so does having no connection and no session for [`LINGER`], except with `--stay` (started by
+//! hand, for clients whose job no daemon can leave: docs/clients.md). Before it exits, a journal an end left is
+//! replayed again (`session::work`).
 //!
 //! Every session-thread call is a [`Job`]: a client whose tool timeout is short gets `{job, state}` once the call
 //! outlives its budget, or at once with `wait: false`, and polls `job_status` for the call's own result.
@@ -295,8 +296,9 @@ struct Global {
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
 
-/// `quen serve`: listens on this config's pipe until there has been no connection and no session for [`LINGER`].
-pub fn serve() -> ! {
+/// `quen serve`: listens on this config's pipe until there has been no connection and no session for [`LINGER`]; with
+/// `stay`, until Ctrl+C or its console closes.
+pub fn serve(stay: bool) -> ! {
     let name = match config::daemon_name() {
         Ok(name) => name,
         Err(e) => {
@@ -309,7 +311,10 @@ pub fn serve() -> ! {
     let mut next = match Pipe::create(&path, true) {
         Ok(pipe) => Some(pipe),
         Err(e) => {
-            eprintln!("quen serve: {path}: {e} (another quen serve for this config?)");
+            eprintln!(
+                "quen serve: {path}: {e}: a quen serve for this config already listens there (or another program \
+                 holds the name); nothing was changed"
+            );
             std::process::exit(1)
         }
     };
@@ -332,7 +337,17 @@ pub fn serve() -> ! {
         worker: Mutex::new(Some((tx.clone(), worker))),
     });
     win::on_console_ctrl(|| shutdown("Ctrl+C or the console closed"));
-    eprintln!("quen serve: pid {} on {path}", std::process::id());
+    let until = if stay {
+        "; it stays until Ctrl+C, which ends the session first (closing this window allows only 5 s)"
+    } else {
+        ""
+    };
+    let file = config::path().unwrap_or_default();
+    eprintln!(
+        "quen serve: pid {} on {path} for {}{until}",
+        std::process::id(),
+        file.display()
+    );
     let conns = Arc::new(AtomicUsize::new(0));
     let mut idle = Instant::now();
     loop {
@@ -346,7 +361,7 @@ pub fn serve() -> ! {
         };
         let mut exiting = None;
         let came = pipe.accept(|| {
-            if conns.load(Ordering::SeqCst) > 0 || shared.live() {
+            if stay || conns.load(Ordering::SeqCst) > 0 || shared.live() {
                 idle = Instant::now();
             }
             // Under the startup mutex, no `quen mcp` is between finding no daemon and starting one, or connecting.

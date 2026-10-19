@@ -56,7 +56,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["mcp"] => proxy::run(),
-        ["serve"] => mcp::serve(),
+        ["serve"] => mcp::serve(false),
+        ["serve", "--stay"] => mcp::serve(true),
         ["serve", "--spawn"] => proxy::spawn_serve(),
         ["ledger", ..] => std::process::exit(ledger::cli(&args[1..])),
         ["kb", ..] => std::process::exit(ledger::cli_kb(&args[1..])),
@@ -74,6 +75,9 @@ fn main() {
                 "usage: quen mcp      the stdio MCP server: a proxy to quen serve, started when needed"
             );
             eprintln!("       quen serve    the daemon that owns the game session");
+            eprintln!(
+                "       quen serve --stay   the same, started by hand, until Ctrl+C (for Codex CLI: docs/clients.md)"
+            );
             eprintln!("       quen ledger   add | about | migrate: see quen ledger --help");
             eprintln!(
                 "       quen kb       scan | claims | export: the RE knowledge base's index (quen kb --help)"

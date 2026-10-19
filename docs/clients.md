@@ -7,8 +7,8 @@ quen is a standard MCP server over stdio (`quen mcp`), so any local MCP client c
 | Client | Starts quen on Windows | Tool-call timeout (default → how to change) | Progress | quen's job budget |
 |---|---|---|---|---|
 | Claude Code | yes | ~28 h (`MCP_TOOL_TIMEOUT`, per server `"timeout"` in ms) | shown; resets only the 30 min idle timer | none: waits for every call |
-| Codex CLI | **no** (see [Blocker](#blocker-clients-that-hold-servers-in-a-job-object)) | source 300 s, docs 60 s → `tool_timeout_sec` | sends no token | 20 s |
-| OpenAI Agents SDK, Python | **no** (same blocker) | **5 s** → `client_session_timeout_seconds` | sends no token | 20 s |
+| Codex CLI | only with `quen serve --stay` running first ([below](#clients-that-hold-servers-in-a-job-object)) | source 300 s, docs 60 s → `tool_timeout_sec` | sends no token | 20 s |
+| OpenAI Agents SDK, Python | only with `quen serve --stay` running first (same job) | **5 s** → `client_session_timeout_seconds` | sends no token | 20 s |
 | OpenAI Agents SDK, JS | yes (Node) | 60 s → `timeout` (ms) | sends no token | 20 s |
 | VS Code / Copilot agent mode | yes | none | shown | 20 s |
 | Cursor | yes | IDE ~60 min, CLI/ACP fixed 60 s; not configurable | doesn't extend the timeout | 20 s |
@@ -52,14 +52,31 @@ Also for every client (2026-10-18, after feature tests 1):
 - **The focus switch** (`focus`, 2026-10-19): when a client connects, quen walks the parent chain from its `quen mcp` up to the first process with a visible top-level window that isn't a tool window: the client's own app, or the terminal a CLI client runs in. So `to: "client"` needs nothing from the client, and works in any client that has a window. A client with none in that chain (an SDK script started by a service, a CI runner) gets a refusal saying so. A classic console window reports its shell's process, so a CLI in one is found too (checked 2026-10-19, without a game); the walk has not yet run under each client listed above. No `_meta` mark: it moves windows, and on the way back sends the game one escape to close the pause menu it opened when it lost the front, as `game_keys` can.
 - **A UTF-8 BOM** before the first line (a Windows PowerShell 5.1 / .NET Framework client writes one) is skipped (test `a_bom_before_the_first_line_is_skipped`).
 
-## Blocker: clients that hold servers in a Job Object
+## Clients that hold servers in a Job Object
 
-quen's daemon (`quen serve`) must outlive the client process, so a closed client never kills the game mid-save. The proxy starts it with `CREATE_BREAKAWAY_FROM_JOB`. A client that puts its server in a Job Object that **kills on close and forbids breakaway** leaves no way out, so quen refuses to start the daemon there, loudly (test `a_job_that_refuses_breakaway_fails_loudly`):
+quen's daemon (`quen serve`) must outlive the client process, so a closed client never kills the game mid-save. The proxy starts it with `CREATE_BREAKAWAY_FROM_JOB`. A client that puts its server in a Job Object that **kills on close and forbids breakaway** leaves no way out, so quen refuses to start the daemon there, loudly, and its error names `quen serve --stay` (test `a_job_that_refuses_breakaway_fails_loudly`):
 - **Codex CLI** launches every stdio server suspended inside `JobObject::create_without_breakaway()`: `KILL_ON_JOB_CLOSE`, no `BREAKAWAY_OK` ([stdio_server_launcher.rs][codex-launch], [job.rs][codex-job]; in source since about 2026-08).
 - **The Python MCP SDK** (the Agents SDK's stdio client) assigns the server to a job with `KILL_ON_JOB_CLOSE` only ([win32/utilities.py][py-job]).
 - Node-based clients (VS Code, Cursor, Gemini CLI, the JS Agents SDK, the Inspector) use libuv's job, which allows silent breakaway: verified with the Inspector and the TypeScript SDK below.
 
-Under Codex, `quen mcp` works only while a daemon for the same config already runs (started by another client); otherwise every call fails at start. Fixing it means starting the daemon outside the client's job by another route (for example WMI `Win32_Process.Create`, or a per-user scheduled task). The route isn't chosen yet.
+`quen mcp` uses a daemon that already listens for the same config, and starts one only when none does. So with these clients, start the daemon yourself first: it then runs under your terminal, outside the client's job.
+
+1. In a terminal, run the same `quen.exe` the client's config names: `quen serve --stay`. It prints one line: its pid, its pipe, its config file, and that Ctrl+C ends it. Leave the terminal open. Unlike a daemon `quen mcp` starts, it doesn't exit 5 s after its last client.
+2. Open the client. Its `quen mcp` connects to that daemon. Codex's entry in `%USERPROFILE%\.codex\config.toml`:
+
+   ```toml
+   [mcp_servers.quen]
+   command = "quen"
+   args = ["mcp"]
+   startup_timeout_sec = 30
+   tool_timeout_sec = 120
+   ```
+3. When you're done, press Ctrl+C in that terminal: a live session ends the normal way (saves first, the game closed, everything put back), then the daemon exits. Closing the terminal window instead gives it only 5 s (Windows' limit for a closing console, [HandlerRoutine][handler]); a session end that takes longer is cut off, and the game closes with the daemon, as when any `quen serve` exits (the next `quen serve` replays the journal it left).
+
+- Both ends check that the other is the same `quen.exe` and the same user, so the terminal's `quen` and the client's `command` must be one file. Both find the config the same way (`QUEN_CONFIG`, else `%USERPROFILE%\.quen\config.toml`); with another config, the client's `quen mcp` looks for another daemon.
+- Its log goes to that terminal, not to `logs\serve.log` under the data root.
+- A second `quen serve --stay` for the same config refuses and changes nothing. So does one started while a daemon another client started is still running: it exits 5 s after its last client.
+- Tested against a simulated Codex job (kill on close, no breakaway; test `a_relay_in_a_no_breakaway_job_uses_a_stay_daemon`), not yet with real Codex or the Python SDK.
 
 ## Conformance (2026-10-18, no game)
 
@@ -84,6 +101,7 @@ They can't start a local stdio server: they need a public HTTPS endpoint (stream
 [codex-compact]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/tools/src/json_schema/compaction.rs
 [codex-launch]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/rmcp-client/src/stdio_server_launcher.rs
 [codex-job]: https://github.com/openai/codex/blob/8d9f6466ff0294785d56f55b1fe363d132fe4133/codex-rs/utils/pty/src/win/job.rs
+[handler]: https://learn.microsoft.com/en-us/windows/console/handlerroutine
 [agents-py]: https://github.com/openai/openai-agents-python/blob/v0.24.0/src/agents/agent.py
 [py-job]: https://github.com/modelcontextprotocol/python-sdk/blob/v2.3.0/src/mcp/os/win32/utilities.py
 [vsc-norm]: https://github.com/microsoft/vscode/blob/1.142.0/extensions/copilot/src/extension/tools/common/toolSchemaNormalizer.ts

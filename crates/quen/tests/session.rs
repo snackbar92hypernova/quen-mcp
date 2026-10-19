@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlE
 use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
 mod common;
 
@@ -1859,6 +1859,84 @@ fn a_job_that_refuses_breakaway_fails_loudly() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && out.stdout.is_empty(), "{out:?}");
     assert!(stderr.contains("refused breakaway"), "{stderr}");
+    assert!(stderr.contains("quen serve --stay"), "{stderr}");
+}
+
+/// Codex's way (docs/clients.md): the user starts `quen serve --stay` in a terminal first. It outlives LINGER with no
+/// connection, a second one for the same config refuses, and a relay in a job that kills on close and refuses
+/// breakaway (Codex's) connects to it instead of starting one. Closing that job leaves the daemon.
+#[test]
+fn a_relay_in_a_no_breakaway_job_uses_a_stay_daemon() {
+    /// A `--stay` daemon never exits by itself: killed when the test ends, however it ends.
+    struct Stay(std::process::Child);
+    impl Drop for Stay {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fx = Fixture::new();
+    let stay = || {
+        let child = Command::new(env!("CARGO_BIN_EXE_quen"))
+            .args(["serve", "--stay"])
+            .env("QUEN_CONFIG", fx.path("config.toml"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        Stay(child)
+    };
+    let mut serve = stay();
+    fx.1.lock().unwrap().push(serve.0.id());
+    let mut log = BufReader::new(serve.0.stderr.take().unwrap());
+    let mut first = String::new();
+    log.read_line(&mut first).unwrap();
+    assert!(
+        first.contains(r"on \\.\pipe\quen-") && first.contains("Ctrl+C"),
+        "{first}"
+    );
+    // The rest of its log, read so it never meets a full pipe.
+    thread::spawn(move || std::io::read_to_string(log));
+    sleep(Duration::from_secs(7)); // past LINGER, 5 s
+    assert!(serve.0.try_wait().unwrap().is_none(), "--stay exited idle");
+    let mut second = stay();
+    assert!(dies(second.0.id()), "a second --stay for the config ran");
+    let stderr = std::io::read_to_string(second.0.stderr.take().unwrap()).unwrap();
+    assert!(
+        !second.0.wait().unwrap().success() && stderr.contains("already listens"),
+        "{stderr}"
+    );
+    let mut relay = Command::new(env!("CARGO_BIN_EXE_quen"))
+        .arg("mcp")
+        .env("QUEN_CONFIG", fx.path("config.toml"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let job = job_holding(&relay, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "codex-mcp-client", "version": "0"}}});
+    writeln!(relay.stdin.as_mut().unwrap(), "{init}").unwrap();
+    let mut answer = String::new();
+    BufReader::new(relay.stdout.take().unwrap())
+        .read_line(&mut answer)
+        .unwrap();
+    // SAFETY: the job's only handle, closed once: the relay dies with it.
+    unsafe { CloseHandle(job) };
+    assert!(!answer.is_empty(), "{:?}", relay.wait_with_output());
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["result"]["serverInfo"]["name"], "quen", "{answer}");
+    relay.wait().unwrap();
+    sleep(Duration::from_millis(500));
+    assert!(
+        serve.0.try_wait().unwrap().is_none(),
+        "the daemon died with the job"
+    );
 }
 
 /// Feature tests 1: a Windows PowerShell 5.1 / .NET Framework client writes a UTF-8 BOM before its first line. quen skips

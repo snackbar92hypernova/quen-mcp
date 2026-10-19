@@ -70,7 +70,7 @@ quen makes that the agent's job, with guard rails:
 - **An MCP client.**
   - Claude Code (the CLI or the desktop app) is the one quen is built and tested with.
   - VS Code, Cursor and Gemini CLI should work: quen passes the protocol checks with the official MCP tools, but nobody has tried them with a model yet.
-  - Codex can't start quen on Windows yet. [docs/clients.md](docs/clients.md) has the details.
+  - Codex CLI works once you start `quen serve --stay` in a terminal yourself, before opening Codex. Tested against a simulated Codex job, not yet with real Codex. [docs/clients.md](docs/clients.md) has the details.
 - **Optional, each for its own tools:**
   - PresentMon 2.x (measurements);
   - RenderDoc, Nsight Systems, Nsight Graphics, and Tracy 0.14.1's capture tool (profiling);

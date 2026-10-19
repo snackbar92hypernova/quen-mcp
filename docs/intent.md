@@ -76,7 +76,7 @@ A session belongs to the connection that launched it. When that connection goes 
 
 Session steps run on one dedicated thread. A cancel only sets a flag that is checked between steps, so no step stops half-way. Long calls send progress notifications. Clients other than Claude Code tend to time out after about a minute, so for them a call that runs past 20 seconds answers with a job to poll instead.
 
-Some clients (Codex CLI, the Python MCP SDK) hold their servers in a Job Object that kills everything when the client closes and forbids leaving it. There quen refuses to start its background process, rather than run in a way that would take the game down with the client. [docs/clients.md](clients.md) has the details.
+Some clients (Codex CLI, the Python MCP SDK) hold their servers in a Job Object that kills everything when the client closes and forbids leaving it. There quen refuses to start its background process, rather than run in a way that would take the game down with the client. Instead, the user starts `quen serve --stay` in a terminal before opening the client, and the client's relay connects to it. [docs/clients.md](clients.md) has the details.
 
 ### One driver
 
@@ -241,9 +241,9 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 ## Status
 
-- **Early access.** quen is 0.1.6; its in-game package is quen-w3 0.1.9.
+- **Early access.** quen is 0.1.7; its in-game package is quen-w3 0.1.9.
 - **One test machine.** Built and tested on one PC: The Witcher 3 5.01, Steam, DX12, on Windows, with one GPU and one display. GOG copies are untested: their exe counts as an unknown build.
-- **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex can't start quen on Windows yet.
+- **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex CLI works with `quen serve --stay` started in a terminal first; tested against a simulated Codex job, not yet with real Codex.
 - **Not yet checked:**
   - whether a window grab gives the same values as the game's own frame, which HDR screenshot values depend on: until that check runs, treat HDR values as untested;
   - whether quen's job still holds the game when it is started under Nsight;
@@ -253,7 +253,6 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 **These are plans, not features.** None of what follows is built.
 
-- **More clients.** Starting the background process by another route, so clients that hold their servers in a closing job (Codex CLI, the Python MCP SDK) can run quen. The route isn't chosen yet.
 - **Installing the package from quen.** A journaled install of quen's in-game package from a release, with the user's approval.
 - **Recovery at logon.** An optional, user-approved task that replays a stale journal when the user logs on.
 - **Retiring the typed console commands** once the channel's load has proven itself in the game.

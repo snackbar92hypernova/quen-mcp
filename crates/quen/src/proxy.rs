@@ -175,7 +175,8 @@ fn spawn_daemon() -> io::Result<()> {
     if win::job_kills_on_close()? && env::var_os("QUEN_TEST_IN_JOB").is_none() {
         return Err(io::Error::other(
             "the client's job refused breakaway, and it kills its processes when it closes: quen serve won't run \
-             inside it, where closing the client would kill the game mid-save",
+             inside it, where closing the client would kill the game mid-save. Start `quen serve --stay` in a \
+             terminal yourself before opening the client (docs/clients.md)",
         ));
     }
     let exe = env::current_exe()?;
