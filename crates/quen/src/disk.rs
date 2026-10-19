@@ -22,9 +22,6 @@ use crate::config::Config;
 use crate::session::{self, Call, Done, Session, Shared};
 use crate::{capture, doctor, game, input, win};
 
-/// The largest file sent to the Recycle Bin: for bigger ones Windows asks the user, whatever the bin's size (over
-/// about 4 GB, to be safe: a file the bin can't hold whole is deleted at once instead).
-const RECYCLE_MAX: u64 = 4_000_000_000;
 /// The selection keys both tools take.
 const SELECT: [&str; 5] = [
     "boots",
@@ -68,8 +65,8 @@ pub fn tools() -> Vec<Value> {
                 same selection first. The client asks the user on every call (user_ok is only your word). Takes the \
                 files every given filter matches (boots, older_than_days, kinds) and those named in capture_ids. \
                 Keeps a cited file (a claim's evidence, a pose's image, pinned, or named in a document) unless \
-                capture_ids names it. Files go to the Recycle Bin. For one it can't take whole (over 4 GB or the \
-                bin's size, or no bin on the drive), Windows' own dialog asks the user whether to delete it for \
+                capture_ids names it. Files go to the Recycle Bin. For one it can't take whole (over the bin's \
+                size, or no bin on the drive), Windows' own dialog asks the user whether to delete it for \
                 good, and the call waits: yes deletes it (deleted), no keeps it in place (kept). Ledger rows stay, \
                 with removed_at and removed_to. Emptied folders go (folders, leftover_folders). missing: true also \
                 marks the rows in capture_usage's missing (removed_to missing). Refused, nothing moved: no \
@@ -171,10 +168,11 @@ impl Found {
     }
 }
 
-/// The largest file the Recycle Bin takes whole on `path`'s volume, or why it takes none.
+/// The largest file the Recycle Bin takes whole on `path`'s volume: its size as the registry gives it (this PC's,
+/// 2026-10-20: 188 GB; an earlier 4 GB cap had no source), or `u64::MAX` where the registry doesn't say, since
+/// [`win::shell_delete`] lets Windows ask before it deletes a file the bin can't take. Or why it takes none.
 fn recycle_max(path: &Path) -> Result<u64, String> {
-    let bin = win::recycle_bin(path)?;
-    Ok(bin.map_or(RECYCLE_MAX, |size| size.min(RECYCLE_MAX)))
+    Ok(win::recycle_bin(path)?.unwrap_or(u64::MAX))
 }
 
 fn to_delete(config: &Config) -> PathBuf {
@@ -271,6 +269,10 @@ pub fn usage(shared: &Shared, args: &Value) -> Value {
         out.extend(usage.as_object().cloned().unwrap_or_default());
         let max = recycle_max(&config.capture_root());
         match &max {
+            Ok(u64::MAX) => out.insert(
+                "recycle_bin".into(),
+                json!("its size isn't in the registry: Windows asks before it deletes a file it can't take"),
+            ),
             Ok(max) => out.insert("recycle_bin_max_gb".into(), json!(disk::gb(*max))),
             Err(why) => out.insert("recycle_bin".into(), json!(format!("none: {why}"))),
         };
