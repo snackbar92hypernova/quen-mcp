@@ -1,0 +1,5 @@
+#!/bin/sh
+# Staged paths and added lines go through the pattern scan, then the local deny-list.
+d=$(dirname "$0")
+staged=$(git diff --cached --name-only; git diff --cached -U0 --no-color | grep '^+' | grep -v '^+++')
+printf '%s\n' "$staged" | "$d/generic-scan" "staged changes" && printf '%s\n' "$staged" | "$d/deny-scan" "staged changes"

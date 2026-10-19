@@ -1,0 +1,48 @@
+name: rust
+# Actions minutes are limited: pushes to main and pull requests into main that can change what the checks see, and
+# on demand, `gh workflow run rust --ref <branch>` (both jobs). Docs, w3/ and tools/ are skipped, except the files the
+# build reads (include_str!). A fork's pull request runs only after the maintainer approves it (the repository's
+# Actions setting).
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!w3/**'
+      - '!tools/**'
+      - 'schema/README.md'
+      - 'docs/agents.md'
+      - 'w3/asi/hooks.inc'
+      - 'w3/third_party/tracy/public/common/TracyVersion.hpp'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!w3/**'
+      - '!tools/**'
+      - 'schema/README.md'
+      - 'docs/agents.md'
+      - 'w3/asi/hooks.inc'
+      - 'w3/third_party/tracy/public/common/TracyVersion.hpp'
+  workflow_dispatch:
+# A newer run on the same ref cancels the one in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --workspace

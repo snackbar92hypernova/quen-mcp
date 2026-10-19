@@ -1,0 +1,27 @@
+#!/bin/sh
+# generic-scan WHAT [FILE...]: refuse (exit 1) when the files (or stdin) look like personal data, by pattern only, so this
+# file holds no personal strings. Refused: a user-folder path (\Users\<name> or /Users/<name> in any case, with or without
+# a drive letter; /home/<name>), a UNC path (\\<host>\<share>), an email address other than noreply@anthropic.com and
+# <id>@users.noreply.github.com, a Witcher 3 save-file name (CamelCase or lower case), a SteamID64, a Steam userdata\<id>
+# folder, a default Windows machine name (DESKTOP-<id>, LAPTOP-<id>). Runs in the hooks before deny-scan, and in CI, where
+# the personal deny-list doesn't exist. Placeholders like %USERPROFILE% pass; binary files are skipped (-I). -o prints each
+# match on its own line, so the noreply filter drops only those matches, never another match on the same line. A grep
+# error (e.g. a missing file) refuses.
+what=$1; shift
+matches=$(grep -noIE \
+  -e '[\\/][Uu][Ss][Ee][Rr][Ss][\\/]+[A-Za-z0-9._-]+' \
+  -e '/home/[A-Za-z0-9._-]+' \
+  -e '(^|[^A-Za-z0-9._:%\\-])\\\\[A-Za-z][A-Za-z0-9.-]+\\[A-Za-z0-9$._-]+' \
+  -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+  -e '([Mm]anual|[Qq]uick|[Aa]uto)[Ss]ave_[0-9A-Fa-f]+_' \
+  -e '[Cc]heck[Pp]oint_[0-9A-Fa-f]+_' \
+  -e '\b7656119[0-9]{10}\b' \
+  -e '[Uu]serdata[\\/]+[0-9]+' \
+  -e '\b(DESKTOP|LAPTOP)-[A-Z0-9]{5,}\b' \
+  "$@")
+[ $? -gt 1 ] && { echo "generic-scan: grep failed on the $what, refused" >&2; exit 1; }
+hits=$(printf '%s\n' "$matches" | grep -vE '(^|:)noreply@anthropic\.com$|@users\.noreply\.github\.com$|^$')
+[ -z "$hits" ] && exit 0
+echo "generic-scan: possible personal data in the $what (see the patterns in .githooks/generic-scan), refused:" >&2
+echo "$hits" | cut -c1-160 >&2
+exit 1

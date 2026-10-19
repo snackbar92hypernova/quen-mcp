@@ -1,0 +1,2 @@
+# The patch's context lines carry Streamline's CRLF line ends: kept byte for byte, so git apply matches them.
+*.patch -text

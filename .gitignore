@@ -1,0 +1,11 @@
+/target/
+*.db
+*.db-*
+/captures/
+*.log
+.env
+/w3/out/
+# Tracy 0.14.1 files whose copyright lines hold an author's email, which the privacy scan refuses: copied in, never
+# committed (w3/third_party/README.md has their sha256s; pack.py checks them).
+/w3/third_party/tracy/LICENSE
+/w3/third_party/tracy/public/client/tracy_SPSCQueue.h

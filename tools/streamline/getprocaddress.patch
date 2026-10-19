@@ -1,0 +1,15 @@
+diff --git a/source/core/sl.interposer/hook.cpp b/source/core/sl.interposer/hook.cpp
+index 172dee4..9352b46 100644
+--- a/source/core/sl.interposer/hook.cpp
++++ b/source/core/sl.interposer/hook.cpp
+@@ -156,6 +156,10 @@ if (config.contains(#a))
+             f.name = reinterpret_cast<const char*>(dllBase + reinterpret_cast<const DWORD*>(dllBase + exportDir->AddressOfNames)[i]);
+             auto ordinal = exportBase + reinterpret_cast<const  WORD*>(dllBase + exportDir->AddressOfNameOrdinals)[i];
+             f.target = const_cast<void*>(reinterpret_cast<const void*>(dllBase + reinterpret_cast<const DWORD*>(dllBase + exportDir->AddressOfFunctions)[ordinal - exportBase]));
++#ifndef SL_PRODUCTION
++            // renodx local patch: resolve through GetProcAddress so capture tools (RenderDoc) that hook it see D3D12/DXGI calls.
++            if (auto p = GetProcAddress(handle, f.name)) f.target = reinterpret_cast<void*>(p);
++#endif
+         }
+         return true;
+     }

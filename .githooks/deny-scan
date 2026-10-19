@@ -1,0 +1,23 @@
+#!/bin/sh
+# deny-scan WHAT: refuse (exit 1) when stdin contains a string from the local deny-list (case-insensitive, fixed strings).
+# The list lives outside the repo, so the repo never holds the personal strings it blocks: %USERPROFILE%\.quen\deny.txt,
+# else (before quen's move out of AppData) %APPDATA%\quen\deny.txt. QUEN_DENY_LIST overrides the path.
+# Case is folded with tr, not grep -i: Git for Windows' grep 3.0 aborts on -i -F -f, and an abort must never pass a commit.
+# ponytail: text only; binary diffs are not scanned (.gitignore keeps captures and databases out).
+home_list="${USERPROFILE:-$HOME}/.quen/deny.txt"
+old_list="${APPDATA:-${XDG_CONFIG_HOME:-$HOME/.config}}/quen/deny.txt"
+if [ -n "$QUEN_DENY_LIST" ]; then list=$QUEN_DENY_LIST
+elif [ -f "$home_list" ]; then list=$home_list
+else list=$old_list
+fi
+lower() { tr '[:upper:]' '[:lower:]'; }
+pat=$(mktemp)
+trap 'rm -f "$pat"' EXIT
+grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$list" 2>/dev/null | lower > "$pat"
+[ -s "$pat" ] || { echo "deny-scan: no deny-list at $list (AGENTS.md): commit refused" >&2; exit 1; }
+hits=$(lower | grep -nF -f "$pat")
+case $? in
+  0) echo "deny-scan: personal data in the $1 (deny-list match), commit refused:" >&2; echo "$hits" | cut -c1-160 >&2; exit 1 ;;
+  1) exit 0 ;;
+  *) echo "deny-scan: grep failed, commit refused" >&2; exit 1 ;;
+esac

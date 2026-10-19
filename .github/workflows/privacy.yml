@@ -1,0 +1,44 @@
+# Pattern scan only: the personal deny-list stays local (AGENTS.md).
+name: privacy
+# Pushes to main, every pull request into main (contributors don't have the maintainer's deny-list), and on demand
+# (`gh workflow run privacy --ref <branch>`): branch commits on the maintainer's PC run generic-scan and deny-scan in
+# the local hooks, and cloud sessions run generic-scan themselves (AGENTS.md). A fork's pull request runs only after
+# the maintainer approves it (the repository's Actions setting).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Tracked files and commit messages
+        run: |
+          git ls-files -z | xargs -0 sh .githooks/generic-scan "tracked files"
+          git log --format=%B | sh .githooks/generic-scan "commit messages"
+      - name: Pushed diffs and identities
+        # The pull request's or the push's range; HEAD's whole history when the base isn't a commit here (a dispatch,
+        # a force push, no base).
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          range=HEAD
+          git cat-file -e "$BASE^{commit}" 2>/dev/null && range=$BASE..HEAD
+          git log -p --cc --format='%an %ae%n%cn %ce%n%B' "$range" | sh .githooks/generic-scan "commits in $range"
+      - name: Path, branch and tag names
+        run: |
+          git ls-files | sh .githooks/generic-scan "path names"
+          git for-each-ref --format='%(refname:short)' | sh .githooks/generic-scan "ref names"
+      - name: No captures, saves, databases or binaries
+        # ALLOW: exact tracked paths exempt from this check, one per line.
+        env:
+          ALLOW: ""
+        run: |
+          if git ls-files | grep -iE '\.(png|jpe?g|bmp|dds|exr|npy|sav|db|sqlite|csv|rdc|zip|7z|asi|dll|exe|pdb|nsys-rep|ngfx-gputrace|xlsx?|etl)$' | grep -vxF -e "$ALLOW"; then
+            echo "privacy: tracked capture, save, database or binary files (above), refused" >&2; exit 1
+          fi

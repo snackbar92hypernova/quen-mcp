@@ -1,0 +1,3 @@
+#!/bin/sh
+d=$(dirname "$0")
+"$d/generic-scan" "commit message" < "$1" && "$d/deny-scan" "commit message" < "$1"
