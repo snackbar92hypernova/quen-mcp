@@ -427,7 +427,7 @@ param(
             Say 'other MCP clients (INSTALL.md section 4):'
             Write-Host ('  VS Code, in mcp.json''s "servers": "quen": {{ "type": "stdio", "command": "{0}", "args": ["mcp"] }}' -f $json)
             Write-Host ('  Cursor, in %USERPROFILE%\.cursor\mcp.json''s "mcpServers": "quen": {{ "command": "{0}", "args": ["mcp"] }}' -f $json)
-            Write-Host '  Codex CLI can''t start quen on Windows yet.'
+            Write-Host ('  Codex CLI: run "{0}" serve --stay in a terminal first, then Codex (INSTALL.md section 4)' -f $exe)
             Say 'next: ask your agent to run quen_setup, then quen_doctor'
         } finally {
             try { Recycle $tmp } catch { Say "the temp folder $tmp stays: $($_.Exception.Message)" }
