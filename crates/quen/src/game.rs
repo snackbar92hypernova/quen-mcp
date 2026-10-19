@@ -18,7 +18,6 @@ use quen_core::cvar;
 use quen_core::input::{Event, GAP_MS, GRAVE, HOLD_MS, describe};
 use quen_core::journal::{Action as Step, Journal};
 use quen_core::mem::Write;
-use quen_core::protocol::Verb;
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 use windows_sys::Win32::Foundation::{
@@ -36,7 +35,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::capture;
-use crate::channel::{self, REPLY_MAX};
+use crate::channel;
 use crate::config::Config;
 use crate::doctor;
 use crate::hands::Hands;
@@ -74,9 +73,9 @@ pub fn tools() -> Vec<Value> {
                 console command `quenload(<save>)` instead (via: console, as game_console types; the game must be in \
                 front) and closes the console once gameplay is back. Refused, nothing sent: wrong token, a save that isn't \
                 exactly one file in gamesaves or has a character other than letters, digits, _ and -, not in gameplay or \
-                photo mode, the game refused it (no single save of that name in its own list: game_listsaves) or didn't \
-                take it in time (expired, queue full); with needs: quen's in-game package not installed. Failed: no reply \
-                within 5 s, no load began within 20 s, the typed line didn't show on the prompt, the load didn't reach \
+                photo mode, the game refused it (not one save of that name in its own list; the reason lists the \
+                matches) or didn't take it in time (expired, queue full); with needs: quen's in-game package not \
+                installed. Failed: no reply within 5 s, no load began within 20 s, the typed line didn't show on the prompt, the load didn't reach \
                 gameplay (a 4.04 save's migration notice waits for Enter), or the console didn't close.",
             "inputSchema": schema(json!({
                 "save": {"type": "string", "description": "a gamesaves file name, with or without .sav: letters, digits, _ and -"},
@@ -910,7 +909,7 @@ fn load(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let typed = match cx.channel() {
         Ok(channel) => {
             fields.insert("via".into(), json!("channel"));
-            let sent = channel.call(Verb::Load { save: name.into() }, REPLY_MAX);
+            let sent = channel::load(&cx, channel, name);
             call.lap("send");
             let reply = sent.map_err(|e| e.done(fields.clone()))?;
             fields.insert("reply".into(), json!(reply.text));
