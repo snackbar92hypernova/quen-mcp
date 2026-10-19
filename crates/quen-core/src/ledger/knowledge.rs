@@ -72,6 +72,15 @@ fn rva_of(va: u64) -> Option<i64> {
         .map(|r| r as i64)
 }
 
+/// The address a record's parameters ask about, as REA 6.5.0 names it: `procedure` (procedure_pseudo_code,
+/// procedure_assembly, procedure_callers, ...) or `address` (xrefs, read_bytes, resolve_containing_procedure). Its
+/// records of these leave `locations` empty.
+fn param_address(params: &Value) -> Option<u64> {
+    ["procedure", "address"]
+        .into_iter()
+        .find_map(|k| address(params[k].as_str()?))
+}
+
 fn sha256(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -145,7 +154,8 @@ fn parse_bundle(text: &str) -> std::result::Result<(Vec<Record>, usize), String>
             .into_iter()
             .flatten()
             .find(|l| l["kind"] == "address")
-            .and_then(|l| address(l["address"].as_str()?));
+            .and_then(|l| address(l["address"].as_str()?))
+            .or_else(|| param_address(&r["parameters"]));
         out.push(Record {
             evidence_id: id.into(),
             target: target.into(),
@@ -224,6 +234,32 @@ impl Ledger {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Fills in the rva and entity of extractions imported without an rva, from their stored parameters: quen 0.1.0
+    /// read the rva from `locations` only, which REA 6.5.0 leaves empty for single-address queries. Only NULL rvas are
+    /// filled, and the bundle file isn't read, so one that's gone doesn't matter. Runs at every read-write open.
+    pub(super) fn fill_rvas(&mut self) -> Result<()> {
+        self.atomic(|l| {
+            let rows: Vec<(i64, String, String)> = l
+                .conn
+                .prepare("SELECT id, target_sha256, params FROM extractions WHERE rva IS NULL")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, target, params) in rows {
+                let rva = serde_json::from_str(&params)
+                    .ok()
+                    .and_then(|p| param_address(&p))
+                    .and_then(rva_of);
+                let Some(rva) = rva else { continue };
+                let entity = l.entity_at(&target, rva)?;
+                l.conn.execute(
+                    "UPDATE extractions SET rva = ?1, entity_id = coalesce(entity_id, ?2) WHERE id = ?3 AND rva IS NULL",
+                    params![rva, entity, id],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Imports an REA evidence bundle: the file is copied into `<capture root>/re/` unless it is under the

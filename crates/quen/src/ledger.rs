@@ -72,8 +72,8 @@ pub fn tools() -> Vec<Value> {
                             null}. Tables: measurements (method_family lowercase: presentmon, tracy, perf_func, nsight...; \
                             tag M, O, I, U or static_re), captures (path relative to the harness's cap folder; t in UTC \
                             like 2026-10-17T13:15:00Z), saves, poses (camera [x, y, z], rotation [pitch, yaw, roll], fov, \
-                            player {position, yaw}), mod_versions, boot_mod_status, re_refs (target {\"measurement\": id} \
-                            or {\"claim\": id}, kb_path)",
+                            player {position, optional yaw}), mod_versions, boot_mod_status, re_refs (target \
+                            {\"measurement\": id} or {\"claim\": id}, kb_path)",
                     },
                     "token": {"type": "string", "description": "the token session_launch returned: rows without a boot_id key go on its boot"},
                 },

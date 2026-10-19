@@ -417,7 +417,7 @@ fn save(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let mut ledger = open_ledger(config)?;
     let player = sweep.world.player.map(|p| PlayerPose {
         position: p.pos,
-        yaw: p.yaw,
+        yaw: Some(p.yaw),
     });
     let (id, poses) = ledger
         .atomic(|l| {
