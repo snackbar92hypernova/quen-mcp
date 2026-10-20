@@ -597,7 +597,8 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         Mode::Realtime => path.duration(),
         Mode::Step => f64::from(path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0)) / 2.0,
     };
-    if let Some(notice) = notice::measuring(&cx, call, secs.ceil() as u64) {
+    // On the connection the checks opened: a second one beside it finds the ASI's pipe busy (finding 80).
+    if let Some(notice) = notice::measuring(&cx, call, secs.ceil() as u64, &mut first) {
         fields.insert("notice".into(), json!(notice));
     }
     let pause = p.mode == Mode::Step || p.sweep.world.paused;
@@ -629,7 +630,7 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         }
         // A real-time path plays from its load; step mode's frames wait in game_screenshot.
         if p.mode == Mode::Realtime {
-            notice::clear(cx.live, call);
+            notice::clear(cx.live, call)?;
         }
         let verb = Verb::CamPath {
             mode: p.mode,

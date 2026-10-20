@@ -310,7 +310,8 @@ impl Verb {
                     .all(|n| n.as_deref().is_none_or(crate::trace::plain_name))) =>
             {
                 Err(Error::Invalid(format!(
-                    "world.actors: a radius above 0 to {MAX_ACTORS_RADIUS}, a max of 1 to {MAX_ACTORS}, and a tag or                      class of 1 to 64 letters, digits and _"
+                    "world.actors: a radius above 0 to {MAX_ACTORS_RADIUS}, a max of 1 to {MAX_ACTORS}, and a tag or \
+                     class of 1 to 64 letters, digits and _"
                 )))
             }
             Verb::PhotoTime { minute } if !(0.0..1440.0).contains(minute) => Err(Error::Invalid(
@@ -640,6 +641,24 @@ mod tests {
                 class: None,
             });
         }
+        // Finding 83: the reason reads as one line, no run of spaces from a string continuation.
+        let verb = Verb::WorldActors {
+            radius: 0.0,
+            max: 1,
+            tag: None,
+            class: None,
+        };
+        let why = encode_request(&Request {
+            id: 1,
+            ttl_ms: 1,
+            verb,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !why.contains("  ") && why.contains("a tag or class"),
+            "{why}"
+        );
         for name in ["", "a b", "x'y", &"n".repeat(65)] {
             let name = Some(name.to_string());
             for (tag, class) in [(name.clone(), None), (None, name)] {

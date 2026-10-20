@@ -256,24 +256,11 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
         }
     };
 
-    // Finding 35: at the end the game's copy differed from the user's only in the keys quen forced and the game's
-    // version stamp; such a copy isn't kept beside.
-    let mut forced = vec!["LastGameVersion"];
-    if !inputs.fg {
-        forced.push("DLSSGMode");
-    }
-    if !inputs.play {
-        forced.extend(["CameraAutoRotX", "CameraAutoRotY"]);
-    }
-    if !inputs.vsync {
-        forced.push("VSync");
-    }
-    rewrite(
-        path,
-        data,
-        new,
-        forced.into_iter().map(String::from).collect(),
-    );
+    // Finding 35: at the end the game's copy differed from the user's only in what quen wrote and the game's version
+    // stamp; such a copy isn't kept beside. Finding 82: what quen wrote is the forced keys, every key the patch set
+    // (the overrides, VSync) and the headers of the sections it appended.
+    let ignore = launch_lines(&data, &new, inputs);
+    rewrite(path, data, new, ignore);
 
     if inputs.renodx.is_some() || inputs.load_from_dll_main.is_some() {
         let path = bin.join("ReShade.ini");
@@ -705,6 +692,39 @@ pub fn dx12_settings(data: &[u8], inputs: &Inputs) -> Result<Vec<u8>, String> {
         must(&out, &["VSync=false"])?;
     }
     Ok(out)
+}
+
+/// What a replay ignores when it compares the game's dx12user.settings with the user's (finding 82): LastGameVersion,
+/// the keys the launch forces, every key `new` sets that `old` lacks, and the header of each section `new` appended.
+fn launch_lines(old: &[u8], new: &[u8], inputs: &Inputs) -> Vec<String> {
+    let mut ignore = vec!["LastGameVersion"];
+    if !inputs.fg {
+        ignore.push("DLSSGMode");
+    }
+    if !inputs.play {
+        ignore.extend(["CameraAutoRotX", "CameraAutoRotY"]);
+    }
+    if !inputs.vsync {
+        ignore.push("VSync");
+    }
+    let mut ignore: Vec<String> = ignore.into_iter().map(String::from).collect();
+    for line in changed_lines(old, new) {
+        let kv = line.split_once(':').map_or(line.as_str(), |(_, kv)| kv);
+        ignore.extend(kv.split_once('=').map(|(k, _)| k.trim().to_owned()));
+    }
+    let headers = |data: &[u8]| -> Vec<String> {
+        let text = String::from_utf8_lossy(data);
+        let lines = text.lines().map(str::trim);
+        lines
+            .filter(|l| l.starts_with('['))
+            .map(String::from)
+            .collect()
+    };
+    let before = headers(old);
+    ignore.extend(headers(new).into_iter().filter(|h| !before.contains(h)));
+    let mut seen = std::collections::HashSet::new();
+    ignore.retain(|i| seen.insert(i.clone()));
+    ignore
 }
 
 /// The `Key=Value` lines of the settings `new` that `old` lacks, each as `Section:Key=Value`: what a patch writes, for a

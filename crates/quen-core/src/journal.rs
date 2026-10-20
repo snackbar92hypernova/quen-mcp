@@ -92,9 +92,10 @@ pub enum Action {
         sha_after: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime: Option<u64>,
-        /// Keys whose `Key=Value` lines don't count when the live file is compared with the one put back: a live
-        /// file that differs only in them isn't kept beside, and a note says so (dx12user.settings: the keys the
-        /// launch forced and LastGameVersion, finding 35). Journals before quen 0.1.8 have none.
+        /// Keys whose `Key=Value` lines don't count when the live file is compared with the one put back, and
+        /// `[Section]` headers that don't either: a live file that differs only in them isn't kept beside, and a note
+        /// says so (dx12user.settings: what the launch wrote and LastGameVersion, findings 35 and 82). Journals before
+        /// quen 0.1.8 have none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ignore: Vec<String>,
     },
@@ -393,8 +394,10 @@ fn undo(
                 let counted = |data: &[u8]| {
                     let mut lines = sorted_lines(data);
                     lines.retain(|l| {
-                        !l.split_once('=')
-                            .is_some_and(|(k, _)| ignore.iter().any(|i| i == k.trim()))
+                        !ignore.iter().any(|i| i.starts_with('[') && i == l.trim())
+                            && !l
+                                .split_once('=')
+                                .is_some_and(|(k, _)| ignore.iter().any(|i| i == k.trim()))
                     });
                     lines
                 };
