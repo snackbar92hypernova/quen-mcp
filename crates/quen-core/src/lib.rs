@@ -7,6 +7,7 @@ pub mod build; // the build pin: PE stamp, exe sha256, known builds, the gate, t
 pub mod cvar; // config vars found by name in a memory image, read, and their writes planned (cvar_poke's port)
 pub mod detect; // the game found in Steam's libraries and GOG's registry entries, as candidates
 pub mod disk; // the capture root on disk: usage by boot, kind and age, and a cleanup's plan
+pub mod drift; // measure_ab's drift guard: window 1 against the rest, the world fingerprint between windows
 pub mod gamedata; // the game's bundles and CR2W files (and REDkit's depot), read-only, and the data tools' questions
 pub mod hdr; // half float -> scRGB -> BT.2020 PQ, 16-bit PNG with cICP, EXR, .npy
 pub mod input; // w3ctl key tokens and input plans, console_type lines and its prompt check

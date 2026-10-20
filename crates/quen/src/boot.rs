@@ -184,52 +184,7 @@ impl Spec {
         if !exe.is_file() {
             return Err(format!("no game exe {}", exe.display()));
         }
-        // Files on this PC copied into bin for the session (quen-core's boot::stage).
-        let mut stage = Vec::new();
-        if let Some(list) = args.get("stage") {
-            for path in list.as_array().ok_or("stage must be an array of paths")? {
-                let path = Path::new(path.as_str().ok_or("stage: each entry must be a path")?);
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let why = if !path.is_absolute() {
-                    "not an absolute path"
-                } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
-                    "its name must be ASCII letters, digits, _ . and -"
-                } else if !path.is_file() {
-                    "no such file (missing, or a folder)"
-                } else {
-                    stage.push(path.to_owned());
-                    continue;
-                };
-                return Err(format!("stage {}: {why}", path.display()));
-            }
-        }
-        // Mod folders on this PC copied into Mods for the session (quen-core's boot::stage_mods; finding 38).
-        let mut stage_mods = Vec::new();
-        if let Some(list) = args.get("stage_mods") {
-            for path in list
-                .as_array()
-                .ok_or("stage_mods must be an array of paths")?
-            {
-                let path = Path::new(
-                    path.as_str()
-                        .ok_or("stage_mods: each entry must be a path")?,
-                );
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let why = if !path.is_absolute() {
-                    "not an absolute path".to_string()
-                } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
-                    "its name must be ASCII letters, digits, _ . and -".to_string()
-                } else if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-                    "no such folder (missing, a file or a link)".to_string()
-                } else if let Some(why) = link_in(path) {
-                    why
-                } else {
-                    stage_mods.push(path.to_owned());
-                    continue;
-                };
-                return Err(format!("stage_mods {}: {why}", path.display()));
-            }
-        }
+        let (stage, stage_mods) = sources(args)?;
         let canonical = |path: &Path| fs::canonicalize(path).ok();
         let inside = |dir: &Path| {
             canonical(dir)
@@ -615,6 +570,71 @@ impl Spec {
         }
         (argv, cwd)
     }
+}
+
+/// The files `stage` names, copied into bin for the session (quen-core's boot::stage), and the mod folders
+/// `stage_mods` names, copied into Mods (boot::stage_mods; finding 38): on this PC, each checked as a launch takes it.
+fn sources(args: &Map<String, Value>) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut stage = Vec::new();
+    if let Some(list) = args.get("stage") {
+        for path in list.as_array().ok_or("stage must be an array of paths")? {
+            let path = Path::new(path.as_str().ok_or("stage: each entry must be a path")?);
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let why = if !path.is_absolute() {
+                "not an absolute path"
+            } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
+                "its name must be ASCII letters, digits, _ . and -"
+            } else if !path.is_file() {
+                "no such file (missing, or a folder)"
+            } else {
+                stage.push(path.to_owned());
+                continue;
+            };
+            return Err(format!("stage {}: {why}", path.display()));
+        }
+    }
+    let mut stage_mods = Vec::new();
+    if let Some(list) = args.get("stage_mods") {
+        for path in list
+            .as_array()
+            .ok_or("stage_mods must be an array of paths")?
+        {
+            let path = Path::new(
+                path.as_str()
+                    .ok_or("stage_mods: each entry must be a path")?,
+            );
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let why = if !path.is_absolute() {
+                "not an absolute path".to_string()
+            } else if !plain(&name, &['.', '-']) || name.ends_with('.') {
+                "its name must be ASCII letters, digits, _ . and -".to_string()
+            } else if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                "no such folder (missing, a file or a link)".to_string()
+            } else if let Some(why) = link_in(path) {
+                why
+            } else {
+                stage_mods.push(path.to_owned());
+                continue;
+            };
+            return Err(format!("stage_mods {}: {why}", path.display()));
+        }
+    }
+    Ok((stage, stage_mods))
+}
+
+/// What `session_launch again` checks of the last launch's `args` while its session still runs, before it ends it
+/// (finding 61): the save and the staged files and mods are still there. The launch checks the rest once the game's
+/// files are the user's again.
+// ponytail: the save's bytes aren't compared with the last launch's; the saves guard (session.rs) ends a session in
+// which the game replaced a save other than its own autosaves.
+pub(crate) fn reproducible(config: &Config, args: &Value) -> Result<(), String> {
+    let args = args.as_object().ok_or("arguments must be an object")?;
+    sources(args)?;
+    if let (Some(save), Some(docs)) = (args.get("save").and_then(Value::as_str), &config.documents)
+    {
+        find_save(&docs.join("gamesaves"), Some(save))?;
+    }
+    Ok(())
 }
 
 /// Why quen loads no save without a file on disk (finding 34: game_listsaves lists cloud-only saves; the user loaded

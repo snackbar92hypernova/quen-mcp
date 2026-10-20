@@ -585,7 +585,7 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                 _ if listed(name) => {
                     // Refused at once what a live session refuses (another connection's, or any for a launch or plan),
                     // not after the call in progress: the session thread asks again when the call's turn comes.
-                    if let Some(why) = shared.refusal(conn.id, name) {
+                    if let Some(why) = shared.refusal(conn.id, name, &args) {
                         let done = Done::Refused(why);
                         let out = session::envelope(
                             shared,
@@ -803,7 +803,7 @@ pub(crate) fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked (settings, devkit, fg false, vsync false); no park, keep, preset, profiler, extra_env, stage or stage_mods; without save no key is sent (the user picks a save); photo defaults false; then the user has the controls (hands_take), and the session ends when the game exits"},
+                    "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked; no park, keep, preset, profiler, extra_env, stage or stage_mods; without save the user picks one; photo defaults false; the user has the controls, and the session ends when the game exits"},
                     "save": {"type": "string", "description": "a save in gamesaves: its name in any case, with or without .sav (as the game's own list names it); omitted: the newest QuickSave (mode play: none)"},
                     "settings": {
                         "type": "object",
@@ -822,7 +822,7 @@ pub(crate) fn tools() -> Value {
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
                     "fg": {"type": "boolean", "description": "keep frame generation as the user set it (default false: off)"},
                     "vsync": {"type": "boolean", "description": "default true; false turns VSync off"},
-                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row (the measure tools warn under any): renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: swaps NVIDIA's signed Streamline interposer for the patched dev build and back, both checked, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base: relative times; ngfx exits after its export, closing the game: one trace per boot); tracy:NAME (needs tracy_capture (Tracy 0.14.1's tracy-capture.exe) and kb in the config, quen-w3 0.1.3+: turns on W3Quen.asi's Tracy zones; parks the mods the KB's hooks.tsv says hook the same functions; captures from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
+                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row:renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: swaps NVIDIA's signed Streamline interposer for the patched dev build and back, both checked, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base: relative times; ngfx exits after its export, closing the game: one trace per boot); tracy:NAME (needs tracy_capture (Tracy 0.14.1's tracy-capture.exe) and kb in the config, quen-w3 0.1.3+: turns on W3Quen.asi's Tracy zones; parks the mods the KB's hooks.tsv says hook the same functions; captures from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
                     "photo": {"type": "boolean", "description": "enter photo mode after the load (default true; it can take minutes)"},
                     "debugscripts": {"type": "boolean", "description": "start the game with -debugscripts (not under ngfx; a boot condition); default false"},
                     "extra_env": {
@@ -836,8 +836,10 @@ pub(crate) fn tools() -> Value {
                         },
                         "additionalProperties": false,
                     },
-                    "allow_unknown_build": {"type": "boolean", "description": "launch an exe of a build quen doesn't know. Default false: refused, the reason naming the known_builds entry to add once verified. Only if the user wants that build tested"},
+                    "allow_unknown_build": {"type": "boolean", "description": "an exe of a build quen doesn't know: only if the user wants that build tested (default false: refused)"},
                     "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation that the game is about to launch on their PC, and they agreed. Required."},
+                    "again": {"type": "boolean", "description": "true: repeat this connection's last test launch (quen_guide)"},
+                    "token": {"type": "string", "description": "with again: the live session's token"},
                 },
                 "additionalProperties": false,
             },
@@ -873,12 +875,12 @@ pub(crate) fn tools() -> Value {
         },
     ]);
     let list = tools.as_array_mut().expect("an array");
-    // session_launch's arguments but user_ok: a plan changes nothing, so it needs no prompt and subagents may call it.
+    // session_launch's arguments but user_ok and token: a plan changes nothing, so it needs no prompt and subagents may
+    // call it; it is refused while a session is live.
     let mut plan = list[1]["inputSchema"].clone();
-    plan["properties"]
-        .as_object_mut()
-        .expect("an object")
-        .remove("user_ok");
+    let props = plan["properties"].as_object_mut().expect("an object");
+    props.remove("user_ok");
+    props.remove("token");
     list.insert(
         2,
         json!({
@@ -1139,6 +1141,7 @@ mod tests {
         let mut want = tool("session_launch")["inputSchema"]["properties"].clone();
         let want = want.as_object_mut().unwrap();
         want.remove("user_ok");
+        want.remove("token");
         want.remove("wait");
         assert_eq!(
             &tool("session_plan")["inputSchema"]["properties"],

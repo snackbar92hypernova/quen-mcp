@@ -177,7 +177,7 @@ pub struct Body {
     pub entity: String,
 }
 
-fn vec3(v: &Value) -> Option<[f64; 3]> {
+pub(crate) fn vec3(v: &Value) -> Option<[f64; 3]> {
     let a = v.as_array().filter(|a| a.len() == 3)?;
     Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?])
 }
