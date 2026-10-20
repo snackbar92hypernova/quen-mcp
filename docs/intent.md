@@ -205,6 +205,8 @@ In a play session the user plays a game quen launched with almost nothing change
 
 A test session can hand the controls to the user too, to set something up in the game, under the same rules: while the user has them, quen refuses input, writes and focus moves, and a save the user makes is theirs, listed at the end rather than ending the session. The agent's memory writes may stay applied across such a hand-over. When the controls go to the user, the game shows a short notice that they have them and hand them back in the chat.
 
+The user also sees when to keep their hands off. Before a measurement of 30 s or more the game shows a short notice that quen is measuring; quen's own screenshots and frame-time windows wait until a notice is gone, since the game draws it into its frames. When the agent has the controls and makes no call for 60 s with the game in front, it is waiting for the user: quen brings the agent's chat to the front, and the agent's next game call brings the game back. The user can turn that off; the game then shows a notice that the agent waits in the chat. The notices are the game's own notification, the one hands_give showed first: 5.01's scripts show no text that stays at one place on the screen without a Flash module of quen's own, and a window of quen's over the game would change how the game's frames reach the screen during a measurement.
+
 ### Game knowledge
 
 Reverse engineering a game binary is expensive, and its results get lost between sessions. The tool used, REA driving Ghidra, analyses the exe afresh in every session (about 17 minutes for The Witcher 3) and keeps no analysis. quen works with a reverse-engineering knowledge base kept as files in a separate repository, never in this one: tables of function names, hook sites, patches and cvar layouts, each naming the build it was made on, plus notes.
@@ -241,7 +243,7 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 ## Status
 
-- **Early access.** quen is 0.1.9; its in-game package is quen-w3 0.1.11.
+- **Early access.** quen is 0.1.10; its in-game package is quen-w3 0.1.11.
 - **One test machine.** Built and tested on one PC: The Witcher 3 5.01, Steam, DX12, on Windows, with one GPU and one display. GOG copies are untested: their exe counts as an unknown build.
 - **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex CLI works with `quen serve --stay` started in a terminal first; tested with real Codex CLI (a launch, in-game calls, closing Codex mid-session), with Codex's approvals set so only the launch asks.
 - **Not yet checked:**

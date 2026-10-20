@@ -21,6 +21,7 @@ use crate::capture;
 use crate::channel::{self, REPLY_MAX};
 use crate::doctor;
 use crate::game::{self, Ctx, Fields, schema, text};
+use crate::notice;
 use crate::session::{self, Call, Done, Session};
 
 /// How long real-time playback is given past the sweep's end before quen reads the camera back.
@@ -591,6 +592,14 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let mut fields = Map::new();
     fields.insert("sweep_id".into(), json!(p.sweep_id));
     fields.insert("mode".into(), json!(p.mode.as_str()));
+    // Step mode took about 0.5 s a frame (feature tests 2).
+    let secs = match p.mode {
+        Mode::Realtime => path.duration(),
+        Mode::Step => f64::from(path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0)) / 2.0,
+    };
+    if let Some(notice) = notice::measuring(&cx, call, secs.ceil() as u64) {
+        fields.insert("notice".into(), json!(notice));
+    }
     let pause = p.mode == Mode::Step || p.sweep.world.paused;
     let (mut paused, mut loaded) = (false, false);
     let played = (|| {
@@ -617,6 +626,10 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             channel::note_pause(cx.live, &reply);
             paused = true;
             fields.insert("pause".into(), json!(reply.text));
+        }
+        // A real-time path plays from its load; step mode's frames wait in game_screenshot.
+        if p.mode == Mode::Realtime {
+            notice::clear(cx.live, call);
         }
         let verb = Verb::CamPath {
             mode: p.mode,

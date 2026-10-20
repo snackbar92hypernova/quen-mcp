@@ -17,6 +17,8 @@
 //! presentmon = '%PRESENTMON%'                                    # optional: PresentMon's console exe; unset: on PATH
 //! known_builds = 'steam <sha256> <label>; gog <sha256> <label>'   # optional: game builds verified here, beside the
 //!                                                                # adapter's own (quen_core::build::KnownBuilds)
+//! idle_focus = 'false'                                           # optional, default 'true': quen brings the agent's
+//!                                                                # client forward when it waits (notice.rs)
 //! # Optional features, each off unless set:
 //! renodx_addon = 'renodx-thewitcher3remastered.addon64'          # RenoDX in bin: ReShade.ini and ReShadePreset.ini
 //!                                                                # patched, preset values, ReShade.log readiness
@@ -89,6 +91,9 @@ pub struct Config {
     pub presentmon: Option<PathBuf>,
     /// The game builds a launch accepts: the adapter's own ([`crate::w3::KNOWN_BUILDS`]), then `known_builds`.
     pub known_builds: KnownBuilds,
+    /// Whether quen brings the agent's client forward when the agent waits with the game in front (notice.rs); unset:
+    /// true.
+    pub idle_focus: Option<bool>,
 }
 
 impl Config {
@@ -105,6 +110,10 @@ impl Config {
     /// GB of captures before quen warns.
     pub fn capture_budget_gb(&self) -> f64 {
         self.capture_budget_gb.unwrap_or(20.0)
+    }
+
+    pub fn idle_focus(&self) -> bool {
+        self.idle_focus.unwrap_or(true)
     }
 
     /// The game's binaries: the exe, the ASIs, ReShade and its add-ons.
@@ -215,11 +224,15 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
             "renderdoc" => config.renderdoc = Some(value.into()),
             "streamline_dev_interposer" => config.streamline_dev_interposer = Some(value.into()),
             "tracy_capture" => config.tracy_capture = Some(value.into()),
-            "force_duplication" => {
-                config.force_duplication = match value {
+            "force_duplication" | "idle_focus" => {
+                let on = match value {
                     "true" => true,
                     "false" => false,
-                    _ => return Err(format!("{}: force_duplication is 'true' or 'false'", at())),
+                    _ => return Err(format!("{}: {key} is 'true' or 'false'", at())),
+                };
+                match key {
+                    "idle_focus" => config.idle_focus = Some(on),
+                    _ => config.force_duplication = on,
                 }
             }
             "kb" => config.kb = Some(value.into()),

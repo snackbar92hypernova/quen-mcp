@@ -29,7 +29,7 @@ use crate::hands::{self, Hands};
 use crate::mcp::{self, Conn, Msg};
 use crate::w3;
 use crate::win::{self, Child, Job, try_lock};
-use crate::{camera, data, disk, doctor, focus, game, measure, mem, profile, save};
+use crate::{camera, data, disk, doctor, focus, game, measure, mem, notice, profile, save};
 
 /// What an unfinished harness session leaves, relative to the harness folder (ini_session.py's own `recover` list).
 const HARNESS_LEFTOVERS: &[&str] = &[
@@ -72,6 +72,9 @@ pub struct Shared {
     lock: Mutex<Option<File>>,
     /// Who has the controls of the live session's game (hands.rs); None without one.
     hands: Mutex<Option<Hands>>,
+    /// When the connection that launched the live session last called a tool, or a call of its ended: how long the
+    /// agent has been waiting (notice.rs).
+    last_call: Mutex<Option<Instant>>,
     /// What the replay at start did ("running" until it is done), if there was one: status reports it.
     startup: Mutex<Option<Value>>,
 }
@@ -98,6 +101,7 @@ impl Shared {
             ),
             lock: Mutex::default(),
             hands: Mutex::default(),
+            last_call: Mutex::default(),
             config: RwLock::new(Arc::new(config)),
         }
     }
@@ -196,6 +200,17 @@ impl Shared {
 
     pub(crate) fn set_hands(&self, hands: Option<Hands>) {
         *locked(&self.hands) = hands;
+    }
+
+    /// Connection `conn` called a tool, or a call of its ended: noted when it launched the live session.
+    pub fn touch(&self, conn: u64) {
+        if locked(&self.boot).as_ref().is_some_and(|b| b.2 == conn) {
+            *locked(&self.last_call) = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn last_call(&self) -> Option<Instant> {
+        *locked(&self.last_call)
     }
 }
 
@@ -340,6 +355,13 @@ pub(crate) struct Live {
     /// sweep's camera path may still be loaded (its stop failed): what hands_give undoes.
     pub(crate) paused: Cell<bool>,
     pub(crate) path: Cell<bool>,
+    /// The launching connection's client with a window (`Conn::client`), which quen brings forward when the agent
+    /// waits; when quen last showed a notice in the game; whether it brought the client forward itself, so the next
+    /// game call brings the game back; the stretch without calls it last acted on (notice.rs).
+    pub(crate) client: Result<(u32, String), String>,
+    pub(crate) notice_at: Cell<Option<Instant>>,
+    pub(crate) away: Cell<bool>,
+    pub(crate) idled: Cell<Option<Instant>>,
     /// Keeps the PC and its display awake for exactly as long as the session lives.
     pub(crate) _awake: crate::win::Awake,
 }
@@ -398,6 +420,7 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
     loop {
         let msg = rx.recv_timeout(EXIT_POLL);
         session.end_if_gone();
+        notice::idle(&session);
         let msg = match msg {
             Ok(msg) => msg,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -419,40 +442,19 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                     let user = shared.hands() == Some(Hands::User);
                     (user && !hands::user_may(&name, &args)).then(|| hands::user_has(&name))
                 });
-                let done = match name.as_str() {
-                    _ if refused.is_some() => Done::Refused(refused.unwrap_or_default()),
-                    "session_launch" => session.launch(&mut call, &args, false),
-                    "session_plan" => session.launch(&mut call, &args, true),
-                    "session_end" => session.end(&mut call, &args),
-                    "capture_clean" => disk::clean(&mut session, &mut call, &args),
-                    "focus" => focus::call(&session, &mut call, &args),
-                    "hands_take" => hands::take(&session, &mut call, &args),
-                    "hands_give" => hands::give(&session, &mut call, &args),
-                    n @ ("world_get" | "world_actors") => {
-                        game::call(&mut session, &mut call, n, &args)
-                    }
-                    n @ ("game_keys" | "game_console" | "game_load") => {
-                        let done = game::call(&mut session, &mut call, n, &args);
-                        session.guard_after(&mut call, done)
-                    }
-                    "game_save" => {
-                        let done = save::call(&session, &mut call, &args);
-                        let done = done.map_or_else(|done| done, Done::Ok);
-                        session.guard_after(&mut call, done)
-                    }
-                    n if n.starts_with("game_") => game::call(&mut session, &mut call, n, &args),
-                    n if n.starts_with("sweep_") => camera::call(&session, &mut call, n, &args),
-                    n if n.starts_with("measure_") => {
-                        measure::call(&mut session, &mut call, n, &args)
-                    }
-                    n if n.starts_with("mem_") => mem::call(&mut session, &mut call, n, &args),
-                    n @ ("data_read" | "data_scan" | "script_compile") => {
-                        data::call(&mut session, &mut call, n, &args)
-                    }
-                    _ => session.recover(&mut call, true),
+                let done = match refused {
+                    Some(why) => Done::Refused(why),
+                    None => match notice::back(&session, &call, &name, &args) {
+                        Ok(back) => {
+                            let done = session.run(&mut call, &name, &args);
+                            notice::with_back(done, back)
+                        }
+                        Err(done) => done,
+                    },
                 };
                 let cancelled = call.stopped();
                 let envelope = session.envelope(&name, call, done);
+                shared.touch(conn.id);
                 locked(&shared.cancelled).retain(|c| *c != (conn.id, id.clone()));
                 // An end or a replay may have unblocked it: taken up before the answer, so the caller's next call,
                 // on any connection, runs on it.
@@ -829,6 +831,35 @@ impl<'a> Session<'a> {
             call.ledger,
             done,
         )
+    }
+
+    /// Runs session-thread tool `name`, once it isn't refused.
+    fn run(&mut self, call: &mut Call, name: &str, args: &Value) -> Done {
+        match name {
+            "session_launch" => self.launch(call, args, false),
+            "session_plan" => self.launch(call, args, true),
+            "session_end" => self.end(call, args),
+            "capture_clean" => disk::clean(self, call, args),
+            "focus" => focus::call(self, call, args),
+            "hands_take" => hands::take(self, call, args),
+            "hands_give" => hands::give(self, call, args),
+            n @ ("world_get" | "world_actors") => game::call(self, call, n, args),
+            n @ ("game_keys" | "game_console" | "game_load") => {
+                let done = game::call(self, call, n, args);
+                self.guard_after(call, done)
+            }
+            "game_save" => {
+                let done = save::call(self, call, args);
+                let done = done.map_or_else(|done| done, Done::Ok);
+                self.guard_after(call, done)
+            }
+            n if n.starts_with("game_") => game::call(self, call, n, args),
+            n if n.starts_with("sweep_") => camera::call(self, call, n, args),
+            n if n.starts_with("measure_") => measure::call(self, call, n, args),
+            n if n.starts_with("mem_") => mem::call(self, call, n, args),
+            n @ ("data_read" | "data_scan" | "script_compile") => data::call(self, call, n, args),
+            _ => self.recover(call, true),
+        }
     }
 
     /// A play session ends by itself once its game has exited (the user quit it, or it crashed), its files given
@@ -1224,6 +1255,10 @@ impl<'a> Session<'a> {
             handovers: hands::Handovers::new(saves_before),
             paused: Cell::new(false),
             path: Cell::new(false),
+            client: call.conn.client.clone(),
+            notice_at: Cell::new(None),
+            away: Cell::new(false),
+            idled: Cell::new(None),
             _awake: crate::win::Awake::hold(),
         });
         fields.insert("session".into(), json!(id));

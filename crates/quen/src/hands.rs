@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::channel::{self, REPLY_MAX};
 use crate::game::{self, Ctx, Fields, flag, hex_bytes, schema};
 use crate::session::{Call, Done, Live, Session};
-use crate::{doctor, focus, input};
+use crate::{focus, input, notice};
 
 /// What the game shows on screen when the user gets the controls (quen-w3 0.1.8's notice verb).
 const NOTICE: &str =
@@ -243,19 +243,7 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         call.lap(what);
     }
     // The user may be in the game when the controls go to them: it says so, and where to hand them back.
-    let shown =
-        match doctor::package_version(cx.config).filter(|v| doctor::BEFORE_NOTICE.contains(v)) {
-            Some(old) => Err(format!(
-                "not shown: {old} has no notice (quen-w3 0.1.8 or later)"
-            )),
-            None => cx.channel().and_then(|c| {
-                let verb = Verb::Notice {
-                    text: NOTICE.into(),
-                };
-                c.call(verb, REPLY_MAX).map_err(|e| e.why().to_string())
-            }),
-        };
-    let notice = shown.map_or_else(|why| why, |reply| reply.text);
+    let notice = notice::show(&cx, NOTICE).unwrap_or_else(|why| why);
     fields.insert("notice".into(), json!(notice));
     call.lap("notice");
     fields.insert("unexpected_saves".into(), json!(sort(cx.live, false)));

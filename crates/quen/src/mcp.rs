@@ -553,6 +553,8 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools()}),
         "tools/call" => {
+            // Any call of the launching connection's, a status read included, means its agent is at work.
+            shared.touch(conn.id);
             let name = params["name"].as_str().unwrap_or_default();
             let mut args = match &params["arguments"] {
                 Value::Null => json!({}),
