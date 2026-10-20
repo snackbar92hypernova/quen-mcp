@@ -475,11 +475,19 @@ fn a_play_session_runs_on_without_the_client_until_the_game_exits() {
     assert!(!fx.path("data/state/journal.jsonl").exists());
     assert_eq!(fx.read("game/bin/config/base/general.ini"), GENERAL);
     assert_eq!(fx.settings(), SETTINGS);
-    let log = fx.read("data/logs/serve.log");
-    assert!(
-        log.contains("the game exited") && log.contains(r#""user":["ManualSave_user.sav"]"#),
-        "{log}"
-    );
+    // The boot row lands before serve.log's line is written whole (CI's Windows runner read it cut off, 2026-10-20).
+    let done = |log: &str| {
+        log.contains("the game exited") && log.contains(r#""user":["ManualSave_user.sav"]"#)
+    };
+    let t = Instant::now();
+    let log = loop {
+        let log = fx.read("data/logs/serve.log");
+        if done(&log) || t.elapsed() > Duration::from_secs(10) {
+            break log;
+        }
+        sleep(Duration::from_millis(100));
+    };
+    assert!(done(&log), "{log}");
 }
 
 /// What the boot parked is in the mod set, as parked: it is taken after the parking. Status shows the parked mods,
