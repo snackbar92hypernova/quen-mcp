@@ -57,9 +57,9 @@ const LONG: [&str; 14] = [
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
 /// every unannotated call). Their own files there count as nothing changed: ledger_query's spill files, and the mem
-/// and data tools' results over 16 KB with their captures rows. world_get and game_listsaves read through the game's
-/// channel.
-const READ_ONLY: [&str; 19] = [
+/// and data tools' results over 16 KB with their captures rows. world_get, world_actors and game_listsaves read through
+/// the game's channel; game_scriptlog reads the game's script log.
+const READ_ONLY: [&str; 21] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -69,7 +69,9 @@ const READ_ONLY: [&str; 19] = [
     "capture_usage",
     "job_status",
     "world_get",
+    "world_actors",
     "game_listsaves",
+    "game_scriptlog",
     "mem_read",
     "mem_scan",
     "mem_follow",
@@ -807,13 +809,14 @@ pub(crate) fn tools() -> Value {
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
                     "park": {"type": "string", "description": "mods to park: comma names, or ALL (the Native Bridge and quen's package never are; the W3 Game State Bridge only with both halves named: W3GameStateBridge.asi,modW3GameStateBridge)"},
                     "keep": {"type": "string", "description": "with ALL: comma names to keep"},
-                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session; one there of that name is parked first. The end recycles the copies and each one's new <stem>.log"},
+                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session, a mod menu's .xml into bin\\config\\r4game\\user_config_matrix\\pc; one there of that name is parked first. The end recycles them and each bin copy's new <stem>.log"},
                     "stage_mods": {"type": "array", "items": {"type": "string"}, "description": "mod folders (absolute paths) copied into Mods, as stage into bin"},
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
                     "fg": {"type": "boolean", "description": "keep frame generation as the user set it (default false: off)"},
                     "vsync": {"type": "boolean", "description": "default true; false turns VSync off"},
-                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row (the measure tools warn under any): renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: checks the game's Streamline interposer is NVIDIA's signed one, swaps in the patched dev build, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on; the end puts the signed interposer back and checks it); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base, so its times are relative; ngfx exits after its export and takes the game with it: one trace per boot, then session_end); tracy:NAME (needs tracy_capture, Tracy 0.14.1's tracy-capture.exe, in the config, quen-w3 0.1.3+ in the game and kb in the config: turns on the Tracy zones in quen's own W3Quen.asi, dormant otherwise; parks the mods the KB's hooks.tsv says hook the same functions; the capture runs from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
+                    "profiler": {"type": "string", "pattern": "^(renderdoc|nsys|ngfx|tracy):[A-Za-z0-9_-]+$", "description": "launch under a tool, output in the boot's capture folder, its conditions on the boot row (the measure tools warn under any): renderdoc:NAME (needs renderdoc and streamline_dev_interposer in the config: swaps NVIDIA's signed Streamline interposer for the patched dev build and back, both checked, parks ReShade, turns DLSS RR, path and ray tracing and frame generation off and FXAA on); nsys:NAME (ReShade parked; F11 in game starts the capture range, F11 again ends it and writes the report); ngfx:NAME (ReShade parked; Nsight Graphics GPU Trace after its hotkey; GPU clocks locked to base: relative times; ngfx exits after its export, closing the game: one trace per boot); tracy:NAME (needs tracy_capture (Tracy 0.14.1's tracy-capture.exe) and kb in the config, quen-w3 0.1.3+: turns on W3Quen.asi's Tracy zones; parks the mods the KB's hooks.tsv says hook the same functions; captures from the launch to session_end, which records <NAME>.tracy). The devkit can't load with ReShade parked"},
                     "photo": {"type": "boolean", "description": "enter photo mode after the load (default true; it can take minutes)"},
+                    "debugscripts": {"type": "boolean", "description": "start the game with -debugscripts (not under ngfx; a boot condition); default false"},
                     "extra_env": {
                         "type": "object",
                         "description": "the harness's boot switches quen keeps; ngfx arguments come only from the config. PresentMon switches: the measure tools' presentmon_flags",
@@ -1162,8 +1165,11 @@ mod tests {
                     description.chars().count()
                 ));
             }
-            if tool["inputSchema"].to_string().len() > 5000 {
-                out.push(format!("{name}: an inputSchema over 5000 bytes"));
+            let bytes = tool["inputSchema"].to_string().len();
+            if bytes > 5000 {
+                out.push(format!(
+                    "{name}: an inputSchema of {bytes} bytes, over 5000"
+                ));
             }
             unportable(name, &tool["inputSchema"], &mut out);
         }

@@ -134,7 +134,7 @@ One launch of the game. `id`; `game_id` → games; `t_start`, `t_end` (NULL whil
   `{"Rendering": {"SomeCvar": "0"}}`. Native launches also record here, until they get columns of their own: `build`
   (the exe's `sha256`, PE `stamp`, Steam's `steam_buildid` and the build gate's `status`: `known` with its `label`, or
   `allowed_unknown` with `why`), `profile` (a launch profile) and `conditions` (e.g. `devkit`, a profiler's tool,
-  `unknown_build`).
+  `debugscripts`, `unknown_build`).
 - `devkit`: 1 when the RenoDX devkit was loaded; it roughly doubles frame time.
 - `rebar`: 1 when Resizable BAR was on.
 - `fg`, `vsync`: 0 when the launch forced them off, NULL when they were as the user set them.

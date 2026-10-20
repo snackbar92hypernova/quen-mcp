@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use quen_core::bridge_log::{PHOTO, VALID};
-use quen_core::protocol::{self, MAX_ITEM_COUNT, MAX_REPLY_BYTES, Reply, Request, Verb};
+use quen_core::protocol::{
+    self, MAX_ACTORS, MAX_ACTORS_RADIUS, MAX_ITEM_COUNT, MAX_REPLY_BYTES, Reply, Request, Verb,
+};
 use serde_json::{Map, Value, json};
 
 use crate::doctor;
@@ -30,6 +32,9 @@ const NO_REPLY: &str = "modQuen gave no reply";
 /// answered on the game's next tick. ponytail: 2 s over the blend for slow ticks, until a live boot times it.
 /// game_weather's `settle_s` at most: past the 45 s seen for a path-tracing constant (finding 41).
 const SETTLE_MAX_S: f64 = 120.0;
+/// world_actors' radius (metres) and count when not given.
+const ACTORS_RADIUS: f32 = 30.0;
+const ACTORS_MAX: u32 = 20;
 /// What game_weather's read-back can't show in gameplay (finding 41; the scripts read no blend weight, finding 30).
 const BLEND: &str = "the name changes at once, and the scripts read no blend weight. Seen in gameplay (2026-10-19, \
     one PC): the sky and lighting switched within about 2-3 s, rain wetness ramped for about 20 s, a path-tracing \
@@ -263,6 +268,21 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": schema(json!({}), &[]),
         }),
         json!({
+            "name": "world_actors",
+            "description": format!("Read the alive actors within radius of the player (the player left out), \
+                nearest first, at most max; found: how many are within radius. Each: pos, heading (GetHeading()), \
+                velocity ([x, y, z]: its moving agent component's GetVelocity(); null without one), distance, name \
+                (GetDisplayName()), entity (GetReadableName()), and combat (IsInCombat()), hostile (GetAttitude \
+                towards the player is AIA_Hostile), guard (GetNPCType() is ENGT_Guard), at_work (IsAtWork()), \
+                action_point (IsAPValid(GetActiveActionPoint())), scene (IsInGameplayScene()). Changes nothing: not \
+                journaled, taints no save. Runs while the user has the controls. quen-w3 0.1.10 or later. {needs}; \
+                with needs: an older package, or {game}, or no player. Failed: no reply within 5 s."),
+            "inputSchema": schema(json!({
+                "radius": {"type": "number", "minimum": 0, "maximum": MAX_ACTORS_RADIUS, "description": "metres, above 0; default 30"},
+                "max": {"type": "integer", "minimum": 1, "maximum": MAX_ACTORS, "description": "how many, nearest first, default 20"},
+            }), &[]),
+        }),
+        json!({
             "name": "game_items",
             "description": format!("Add an item to the player's inventory by its own name (spaces allowed, no \
                 quotes), count of it, as the console's additem does, and with equip equip the first; quen-w3 0.1.10 \
@@ -301,6 +321,7 @@ pub(crate) fn call(
         "game_weather" => &["name", "settle_s"],
         "game_teleport" => &["pos", "rot"],
         "game_items" => &["name", "count", "equip"],
+        "world_actors" => &["radius", "max"],
         _ => &[],
     };
     let cx = ctx(session, args, known)?;
@@ -316,6 +337,19 @@ pub(crate) fn call(
     let verb = match name {
         "game_listsaves" => Verb::ListSaves {},
         "world_get" => Verb::WorldGet {},
+        "world_actors" => Verb::WorldActors {
+            radius: match args.get("radius") {
+                None => ACTORS_RADIUS,
+                Some(v) => v
+                    .as_f64()
+                    .ok_or("radius must be a number of metres".to_string())?
+                    as f32,
+            },
+            max: match args.get("max") {
+                None => ACTORS_MAX,
+                Some(_) => whole(args, "max", MAX_ACTORS)?,
+            },
+        },
         "game_pause" => Verb::Pause {
             on: args["on"]
                 .as_bool()
@@ -352,8 +386,8 @@ pub(crate) fn call(
     if name == "world_get" {
         doctor::package_at_least(cx.config, doctor::BEFORE_WORLD, "world_get", "0.1.5")?;
     }
-    if name == "game_items" {
-        doctor::package_at_least(cx.config, doctor::BEFORE_ITEMS, "game_items", "0.1.10")?;
+    if name == "game_items" || name == "world_actors" {
+        doctor::package_at_least(cx.config, doctor::BEFORE_ITEMS, name, "0.1.10")?;
     }
     let last = cx.last_flags();
     if name != "game_listsaves" && last.is_none_or(|f| f & VALID == 0) {
@@ -425,6 +459,13 @@ pub(crate) fn call(
                 if equip && !equipped {
                     let why = "the item was added, but the game reads it back as not equipped";
                     return Err(Done::Failed(why.into(), fields));
+                }
+                return Ok(fields);
+            }
+            // Finding 51: found and actors, as the game read them.
+            if name == "world_actors" {
+                if let Some(Value::Object(data)) = reply.data {
+                    fields.extend(data);
                 }
                 return Ok(fields);
             }
@@ -940,6 +981,61 @@ pub(crate) mod tests {
         let menu = run(&mut session, "world_get", json!({"token": "tok"}));
         let why = menu["reason"].as_str().unwrap();
         assert!(why.contains("needs a loaded game"), "{menu}");
+    }
+
+    /// Finding 51: world_actors sends world.actors with the defaults or the asked radius and max, answers the game's
+    /// read-back as found and actors, journals nothing, and runs while the user has the controls. A radius or max
+    /// outside the protocol's range is refused, nothing sent.
+    #[test]
+    fn world_actors_reads_the_actors_and_changes_nothing() {
+        let fx = served("channel-actors");
+        let actor = json!({"name": "Guard", "entity": "novigrad_guard", "pos": [1.0, 2.0, 3.0], "heading": 90.0,
+            "velocity": [0.5, 0.0, 0.0], "distance": 2.5, "combat": false, "hostile": false, "guard": true,
+            "at_work": false, "action_point": true, "scene": false});
+        let data = json!({"found": 7, "actors": [actor]});
+        let answer = data.clone();
+        let server = fake_game(
+            &token(&fx),
+            2,
+            Box::new(move |r| vec![reply(r.id, true, "the actors", Some(answer.clone()))]),
+        );
+        fx.shared.set_hands(Some(crate::hands::Hands::User));
+        let mut session = fx.session();
+        let out = run(&mut session, "world_actors", json!({"token": "tok"}));
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(
+            (&out["found"], &out["actors"]),
+            (&data["found"], &data["actors"]),
+            "{out}"
+        );
+        let asked = json!({"token": "tok", "radius": 100, "max": MAX_ACTORS});
+        assert_eq!(run(&mut session, "world_actors", asked)["ok"], true);
+        for bad in [
+            json!({"radius": 0}),
+            json!({"radius": 100.5}),
+            json!({"max": 0}),
+            json!({"max": 51}),
+        ] {
+            let mut args = bad.clone();
+            args["token"] = json!("tok");
+            let out = run(&mut session, "world_actors", args);
+            assert_eq!(out["refused"], true, "{bad}: {out}");
+        }
+        assert!(journal(&fx).is_empty(), "{}", journal(&fx));
+        let verbs: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert_eq!(
+            verbs,
+            [
+                Verb::WorldActors {
+                    radius: 30.0,
+                    max: 20
+                },
+                Verb::WorldActors {
+                    radius: 100.0,
+                    max: MAX_ACTORS
+                },
+            ]
+        );
     }
 
     /// world.get's answer: the clock at day 3 hour 22, and `weather`.

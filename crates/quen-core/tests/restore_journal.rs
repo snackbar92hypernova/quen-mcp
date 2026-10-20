@@ -652,6 +652,7 @@ fn a_native_boot_killed_before_any_write_replays_back() {
             &staged,
             park::W3_NEVER_PARK,
             &bin,
+            &[],
             &changes,
         );
         changes.extend(stage.unwrap());

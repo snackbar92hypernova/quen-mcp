@@ -428,7 +428,9 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                     "focus" => focus::call(&session, &mut call, &args),
                     "hands_take" => hands::take(&session, &mut call, &args),
                     "hands_give" => hands::give(&session, &mut call, &args),
-                    "world_get" => game::call(&mut session, &mut call, "world_get", &args),
+                    n @ ("world_get" | "world_actors") => {
+                        game::call(&mut session, &mut call, n, &args)
+                    }
                     n @ ("game_keys" | "game_console" | "game_load") => {
                         let done = game::call(&mut session, &mut call, n, &args);
                         session.guard_after(&mut call, done)
@@ -1535,8 +1537,11 @@ impl<'a> Session<'a> {
                 disk::after_end(config, live.boot, &live.id),
             );
         }
-        if let Some(bin) = self.config().ok().and_then(Config::bin_dir) {
-            let kept = keep_game_logs(call, &bin, live.launched, &live.logs);
+        if let Ok(config) = self.config()
+            && let Some(bin) = config.bin_dir()
+        {
+            let docs = config.documents.clone();
+            let kept = keep_game_logs(call, &bin, docs.as_deref(), live.launched, &live.logs);
             fields.insert("game_logs".into(), kept);
         }
         let done = self.unwind(call, &live.logs.join("journal.jsonl"));
@@ -1665,7 +1670,8 @@ impl<'a> Session<'a> {
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
         let kept_logs = match (since, config.bin_dir(), journal_to.parent()) {
             (Some(since), Some(bin), Some(folder)) if fs::create_dir_all(folder).is_ok() => {
-                Some(keep_game_logs(call, &bin, since, folder))
+                let docs = config.documents.as_deref();
+                Some(keep_game_logs(call, &bin, docs, since, folder))
             }
             _ => None,
         };
@@ -1825,12 +1831,19 @@ fn kill(
     Ok(())
 }
 
-/// The game's logs from a boot: every `*.log` in its bin folder written since `since`, copied into `<logs>\game-logs\`
-/// (the next launch overwrites them; W3BoneFix's and W3Quen's were the tests' evidence). Copies only: the game's files
-/// stay as they are. Each copy goes into the result's artifacts, with its sha256; the field says where, how many, and
-/// what didn't copy. They can hold personal data (game.log holds a Steam id): they stay in the data root.
-fn keep_game_logs(call: &mut Call, bin: &Path, since: SystemTime, logs: &Path) -> Value {
-    let (copied, failed) = copy_logs(bin, since, &logs.join("game-logs"));
+/// The game's logs from a boot: every `*.log` in its bin folder and the script log in `documents` (finding 50) written
+/// since `since`, copied into `<logs>\game-logs\` (the next launch overwrites them; W3BoneFix's and W3Quen's were the
+/// tests' evidence). Copies only: the game's files stay as they are. Each copy goes into the result's artifacts, with
+/// its sha256; the field says where, how many, and what didn't copy. They can hold personal data (game.log holds a
+/// Steam id): they stay in the data root.
+fn keep_game_logs(
+    call: &mut Call,
+    bin: &Path,
+    documents: Option<&Path>,
+    since: SystemTime,
+    logs: &Path,
+) -> Value {
+    let (copied, failed) = copy_logs(bin, documents, since, &logs.join("game-logs"));
     for path in &copied {
         call.artifact(path);
     }
@@ -1838,14 +1851,21 @@ fn keep_game_logs(call: &mut Call, bin: &Path, since: SystemTime, logs: &Path) -
 }
 
 /// [`keep_game_logs`]'s copy: the copies made, and each log that didn't copy, with why.
-fn copy_logs(bin: &Path, since: SystemTime, to: &Path) -> (Vec<PathBuf>, Vec<String>) {
+fn copy_logs(
+    bin: &Path,
+    documents: Option<&Path>,
+    since: SystemTime,
+    to: &Path,
+) -> (Vec<PathBuf>, Vec<String>) {
     let (mut copied, mut failed) = (Vec::new(), Vec::new());
     let logs = fs::read_dir(bin)
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| e.path());
-    for log in logs.filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("log"))) {
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("log")));
+    let scripts = documents.map(|d| d.join(w3::SCRIPTS_LOG));
+    for log in logs.chain(scripts) {
         let written = fs::metadata(&log).and_then(|m| m.modified());
         if !written.is_ok_and(|t| t >= since) {
             continue;
@@ -2205,10 +2225,16 @@ mod tests {
         file.set_modified(launched - Duration::from_secs(3600))
             .unwrap();
         drop(file);
-        let (copied, failed) = copy_logs(&bin, launched, &dir.join(r"logs\game-logs"));
-        assert_eq!(copied, [dir.join(r"logs\game-logs\W3Quen.log")]);
+        // Finding 50: the script log in the documents folder, written this boot, is copied too.
+        let docs = dir.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join(w3::SCRIPTS_LOG), "[Quen] this boot").unwrap();
+        let to = dir.join(r"logs\game-logs");
+        let (copied, failed) = copy_logs(&bin, Some(&docs), launched, &to);
+        assert_eq!(copied, [to.join("W3Quen.log"), to.join(w3::SCRIPTS_LOG)]);
         assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(fs::read_to_string(&copied[0]).unwrap(), "this boot");
+        assert_eq!(fs::read_to_string(&copied[1]).unwrap(), "[Quen] this boot");
         assert!(bin.join("W3Quen.log").exists(), "copied, not moved");
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
     }
@@ -2517,7 +2543,7 @@ mod tests {
             };
             let mut changes = boot::plan(&JournalFs, &inputs).unwrap();
             let never = w3::never_park(false);
-            let stage = boot::stage(&JournalFs, &game, &staged, &never, &bin, &changes);
+            let stage = boot::stage(&JournalFs, &game, &staged, &never, &bin, &[], &changes);
             changes.extend(stage.unwrap());
             assert_eq!(changes.len(), 2 + 1 + 2 + 1 + 4 + 2, "{changes:?}");
             w3::make_parking(&changes).unwrap();

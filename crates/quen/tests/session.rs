@@ -558,6 +558,7 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
         "W3Fake.ini",
         "W3Quen.asi",
         "bad name.asi",
+        "modMenu.xml",
         fx.2.as_str(),
     ] {
         fs::write(pc.join(name), format!("a test {name}")).unwrap();
@@ -592,13 +593,35 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
             json!({"stage": [at("W3Test.asi")], "mode": "play"}),
             "stage isn't taken in a play session",
         ),
+        // Finding 49: no menu folder, no menu XML staged.
+        (
+            json!({"stage": [at("modMenu.xml")]}),
+            "is missing or leads out of the game folder",
+        ),
     ] {
         refused(&mut quen, &bad, why);
     }
+    // Finding 49: a mod's menu XML goes into the menu folder, the user's of that name parked; user.settings, where a
+    // menu writes its values, comes back at the end with the game's copy kept beside.
+    let menu = fx.path(r"game\bin\config\r4game\user_config_matrix\pc");
+    fs::create_dir_all(&menu).unwrap();
+    fs::write(menu.join("modMenu.xml"), "the user's menu").unwrap();
+    let user_settings = "[ModMenu]\r\nOn=true\r\n";
+    fs::write(fx.path("docs/user.settings"), user_settings).unwrap();
     assert!(!fx.path("data/state/journal.jsonl").exists());
     assert!(!bin.join("W3Test.asi").exists() && !fx.path("game/quen-parked").exists());
 
-    let stage = json!([at("W3Test.asi"), at("W3Fake.asi"), at("W3Fake.ini")]);
+    // Finding 50: debugscripts ends the game's command line with -debugscripts, a condition on the boot row.
+    let plan = quen.tool("session_plan", json!({"debugscripts": true}));
+    let argv = plan["command"]["argv"].as_array().unwrap();
+    assert_eq!(argv.last().unwrap(), "-debugscripts", "{plan}");
+    assert_eq!(plan["conditions"], json!(["debugscripts"]), "{plan}");
+    let stage = json!([
+        at("W3Test.asi"),
+        at("W3Fake.asi"),
+        at("W3Fake.ini"),
+        at("modMenu.xml")
+    ]);
     let plan = quen.tool("session_plan", json!({"stage": stage.clone()}));
     let changes: Vec<&str> = plan["changes"]
         .as_array()
@@ -617,6 +640,8 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
         ("stage ", r"bin\x64_dx12\W3Fake.asi"),
         ("park ", r"quen-parked\bin\W3Fake.ini"),
         ("stage ", r"bin\x64_dx12\W3Fake.ini"),
+        ("park ", r"quen-parked\menu\modMenu.xml"),
+        ("stage ", r"user_config_matrix\pc\modMenu.xml"),
         (
             "recycle ",
             r"W3Test.log at the end if the game writes it (game_logs keeps a copy)",
@@ -632,6 +657,14 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
     assert_eq!(fx.read("game/bin/x64_dx12/W3Test.asi"), "a test W3Test.asi");
     assert_eq!(fx.read("game/bin/x64_dx12/W3Fake.ini"), "a test W3Fake.ini");
     assert_eq!(fx.read("game/quen-parked/bin/W3Fake.asi"), "asi");
+    assert_eq!(
+        fs::read_to_string(menu.join("modMenu.xml")).unwrap(),
+        "a test modMenu.xml"
+    );
+    assert_eq!(
+        fx.read("game/quen-parked/menu/modMenu.xml"),
+        "the user's menu"
+    );
     assert!(launched.get("mod_set_error").is_none(), "{launched}");
     let rows = fx.ledger(
         "SELECT e.name, e.parked, e.content_hash FROM boots b JOIN mod_set_entries e ON e.mod_set_id = b.mod_set_id
@@ -647,8 +680,11 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
             [json!("WitcherNativeBridge"), json!(0), sha("synthetic")],
         ],
     );
-    // The staged mod writes its log; the end keeps a copy, then the folder goes back as it was.
+    // The staged mod writes its log and its menu a value; the end keeps a copy of each, then the folders go back as
+    // they were.
     fs::write(bin.join("W3Test.log"), "the staged mod's log").unwrap();
+    let menu_set = "[ModMenu]\r\nOn=false\r\n";
+    fs::write(fx.path("docs/user.settings"), menu_set).unwrap();
     let ended = quen.tool("session_end", json!({"token": launched["token"]}));
     assert_eq!(ended["ok"], true, "{ended}");
     let session = launched["session"].as_str().unwrap();
@@ -664,6 +700,12 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
         "{ended}"
     );
     fx.assert_restored();
+    assert_eq!(
+        fs::read_to_string(menu.join("modMenu.xml")).unwrap(),
+        "the user's menu"
+    );
+    assert_eq!(fx.read("docs/user.settings"), user_settings);
+    assert_eq!(fx.read("docs/user.settings.quen-current"), menu_set);
     for gone in ["W3Test.asi", "W3Test.log", "W3Fake.log"] {
         assert!(!bin.join(gone).exists(), "{gone}");
     }

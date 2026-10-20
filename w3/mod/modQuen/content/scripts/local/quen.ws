@@ -23,7 +23,8 @@
 //   quen-w3 0.1.5) reads back "x y z heading day hour rain snow skyclear weather" (rain, snow and skyclear from quen-w3
 //   0.1.9) and changes nothing. notice (from quen-w3 0.1.8) shows quen's text on screen for 8 s, as QUEN_Say does, and
 //   changes nothing. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
-//   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1.
+//   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1. world.actors (from
+//   quen-w3 0.1.10) reads back the actors near the player (QUENRPC_Actors) and changes nothing.
 // - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
 //   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
 //   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
@@ -436,6 +437,65 @@ function QUENRPC_SetCam(n : array<float>)
 	cam.UpdateWithoutInput(true);
 }
 
+// world.actors: the alive actors within radius of the player, the player left out, nearest first (SortNodesByDistance),
+// at most max: "<found>", then per actor "|x y z heading vx vy vz distance flags|<display name>|<readable name>". The
+// velocity is the moving agent component's GetVelocity (flag 64 when it has one); flags 1 IsInCombat, 2 GetAttitude
+// towards the player AIA_Hostile, 4 GetNPCType ENGT_Guard, 8 IsAtWork, 16 IsAPValid(GetActiveActionPoint), 32
+// IsInGameplayScene (4, 8 and 16 only for a CNewNPC). Names cut at 80 characters, a '|' in one made '/'.
+function QUENRPC_Actors(max : int, radius : float) : string
+{
+	var actors : array<CActor>;
+	var nodes : array<CNode>;
+	var actor : CActor;
+	var npc : CNewNPC;
+	var mac : CMovingAgentComponent;
+	var pos, vel, at : Vector;
+	var i, flags : int;
+	var text : string;
+
+	actors = GetActorsInRange(thePlayer, radius, 0, '', true);
+	for (i = 0; i < actors.Size(); i += 1)
+	{
+		if (actors[i] != thePlayer)
+			nodes.PushBack(actors[i]);
+	}
+	at = thePlayer.GetWorldPosition();
+	SortNodesByDistance(at, nodes);
+	text = IntToString(nodes.Size());
+	for (i = 0; i < Min(max, nodes.Size()); i += 1)
+	{
+		actor = (CActor)nodes[i];
+		npc = (CNewNPC)actor;
+		pos = actor.GetWorldPosition();
+		vel = Vector(0, 0, 0);
+		flags = 0;
+		mac = actor.GetMovingAgentComponent();
+		if (mac)
+		{
+			vel = mac.GetVelocity();
+			flags += 64;
+		}
+		if (actor.IsInCombat())
+			flags += 1;
+		if (actor.GetAttitude(thePlayer) == AIA_Hostile)
+			flags += 2;
+		if (npc && npc.GetNPCType() == ENGT_Guard)
+			flags += 4;
+		if (npc && npc.IsAtWork())
+			flags += 8;
+		if (npc && IsAPValid(npc.GetActiveActionPoint()))
+			flags += 16;
+		if (actor.IsInGameplayScene())
+			flags += 32;
+		text += "|" + FloatToStringPrec(pos.X, 4) + " " + FloatToStringPrec(pos.Y, 4) + " " + FloatToStringPrec(pos.Z, 4)
+			+ " " + FloatToStringPrec(actor.GetHeading(), 4) + " " + FloatToStringPrec(vel.X, 4) + " "
+			+ FloatToStringPrec(vel.Y, 4) + " " + FloatToStringPrec(vel.Z, 4) + " " + FloatToStringPrec(VecDistance(at, pos), 4)
+			+ " " + IntToString(flags) + "|" + StrLeft(StrReplaceAll(actor.GetDisplayName(), "|", "/"), 80) + "|"
+			+ StrLeft(StrReplaceAll(actor.GetReadableName(), "|", "/"), 80);
+	}
+	return text;
+}
+
 // The photo-mode camera's own pose: the read-back of a set.
 function QUENRPC_PhotoPose() : string
 {
@@ -822,6 +882,18 @@ function QUENRPC_PhotoPose() : string
 				FloatToStringPrec(pos.X, 4) + " " + FloatToStringPrec(pos.Y, 4) + " " + FloatToStringPrec(pos.Z, 4) + " "
 				+ FloatToStringPrec(thePlayer.GetHeading(), 4) + " " + IntToString(GameTimeDays(t)) + " "
 				+ IntToString(GameTimeHours(t)) + " " + QUENRPC_Env() + " " + NameToString(GetWeatherConditionName()));
+			return;
+
+		case "world.actors":
+			// Read only: "<max> <radius>", which the ASI checked.
+			if (!thePlayer)
+			{
+				QUEN_Reply(handle, false, "no player (not in a game session)", "");
+				return;
+			}
+			QUENRPC_Split(args, head, rest);
+			QUEN_Reply(handle, true, "the actors near the player, nearest first",
+				QUENRPC_Actors(StringToInt(head), StringToFloat(rest)));
 			return;
 
 		case "notice":

@@ -66,10 +66,10 @@ pub fn parked(game_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// quen's parking folders: parked Mods folders, then parked bin files.
-fn parking(game_dir: &Path) -> [PathBuf; 2] {
+/// quen's parking folders: parked Mods folders, then parked bin files, then parked menu XMLs (finding 49).
+fn parking(game_dir: &Path) -> [PathBuf; 3] {
     let parked = game_dir.join(boot::PARKED);
-    [parked.join("Mods"), parked.join("bin")]
+    [parked.join("Mods"), parked.join("bin"), parked.join("menu")]
 }
 
 /// Makes the folders the boot's moves park into.
@@ -195,6 +195,10 @@ pub const STATE_LOG: &str = "W3QuenState.log";
 
 /// The Witcher Native Bridge's log beside its ASI, which it rewrites at every launch.
 pub const NATIVE_LOG: &str = "WitcherNativeBridge.log";
+
+/// The game's script log in its documents folder, where `-debugscripts` sends the scripts' LogChannel lines (finding 50;
+/// unverified on 5.01).
+pub const SCRIPTS_LOG: &str = "scriptslog.txt";
 
 /// The script functions W3Quen.asi registers through the Native Bridge.
 const QUEN_NATIVES: [&str; 3] = ["QUEN_Next", "QUEN_Reply", "QUEN_State"];
