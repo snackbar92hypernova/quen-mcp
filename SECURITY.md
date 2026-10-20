@@ -42,7 +42,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
   - a console variable (cvar).
 
   All three are journaled, recorded on the boot's ledger row, and gone when the game closes. Saves the game writes afterwards are marked "tainted".
-- quen runs code in the game: `measure_ab` can call a loaded ASI mod's exported `*_SetMode` function, on a new thread inside the game.
+- quen runs code in the game: `measure_ab` can call a loaded ASI mod's exported `*_SetMode` function, on a new thread inside the game. From quen-w3 0.1.13, `game_exec` (and `measure_ab`'s console actions) has quen's ASI call the game's own console executor on the game's tick: an exec function by its name with its arguments, as the console runs one, only after the ASI checked the game build and the executor's first 16 bytes. Like a typed console line, it isn't journaled.
 - It touches only the game process it started, never another copy.
 
 **Keyboard and the foreground**

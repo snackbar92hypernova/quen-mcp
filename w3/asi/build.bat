@@ -57,10 +57,10 @@ cl %CFLAGS% /LD /Fo"%OUT%\test\obj\\" wnb_stub.cpp ^
   /link /Brepro /OUT:"%OUT%\test\WitcherNativeBridge.asi" /IMPLIB:"%OUT%\test\obj\WitcherNativeBridge.lib" || exit /b 1
 cl %CFLAGS% /Fo"%OUT%\test\obj\\" test.cpp /link /Brepro /OUT:"%OUT%\test\test.exe" || exit /b 1
 copy /y "%OUT%\W3Quen.asi" "%OUT%\test\" >nul || exit /b 1
-for %%m in (notoken channel badtoken wrongpid squat tracy-stamp mkhost) do (
+for %%m in (notoken channel badtoken wrongpid squat tracy-stamp exec mkhost) do (
   "%OUT%\test\test.exe" %%m || exit /b 1
 )
-for %%m in (tracy-none tracy-token tracy-notoken tracy-on) do (
+for %%m in (tracy-none tracy-token tracy-notoken tracy-on exec) do (
   "%OUT%\test\tracyhost.exe" %%m || exit /b 1
 )
 if defined TRACY_CAPTURE (

@@ -47,6 +47,8 @@ mod relocate;
 #[cfg(windows)]
 mod save;
 #[cfg(windows)]
+mod scene;
+#[cfg(windows)]
 mod session;
 #[cfg(windows)]
 mod setup;

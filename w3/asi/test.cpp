@@ -3,7 +3,11 @@
 //   channel   token + this pid: every verb to the script line and back, the refusals of protocol.rs's tests, ttl, queue
 //             cap, a missing reply, a stale handle, read-back data, an oversize reply, reconnects, server pid, the ACL;
 //             QUEN_State lines in W3QuenState.log and the poll count before the first; camera paths: cam.path's checks
-//             and QUEN_CamAt against quen-core sweep.rs's reference vectors
+//             and QUEN_CamAt against quen-core sweep.rs's reference vectors; the scene verbs (0.1.13) and their
+//             read-backs; an exec refused before any game state
+//   exec      the exec verb (0.1.13), the console executor's entry bytes and a stand-in for it planted at its RVA: in
+//             test.exe (not 5.01's PE stamp) refused; in tracyhost.exe called, with the line built from the verb, its
+//             log, not called, refused by the state, refused when the entry bytes differ
 //   notoken   no W3_QUEN_TOKEN: QUEN_Next is "", no pipe, neither log written
 //   badtoken  a token with path characters: no pipe
 //   wrongpid  W3_QUEN_PID names another process: the client is dropped
@@ -156,6 +160,17 @@ static void Refused(HANDLE h, const std::string& request, const char* reply_star
   const std::string got = ReadLine(h);
   CHECK(got.starts_with(reply_start) && Has(got, part));
   if (!got.starts_with(reply_start) || !Has(got, part)) printf("  %s\n  -> %s\n", request.substr(0, 120).c_str(), got.c_str());
+}
+
+// An exec request's reply: it never reaches the script (QUEN_Next stays ""), it runs inside QUEN_Next.
+static std::string ExecReply(HANDLE h, const std::string& request) {
+  Send(h, request + "\n");
+  for (int k = 0; k < 2000; ++k) {
+    CHECK(Next().empty());
+    std::string line = ReadLine(h, 1);
+    if (line != "<timeout>") return line;
+  }
+  return "<timeout>";
 }
 
 // QUEN_CamAt(frame) as numbers: none for "".
@@ -420,6 +435,109 @@ static void Photo(HANDLE h) {
   CHECK(Next().empty());  // none of the refused reached the script
 }
 
+// The scene verbs (0.1.13): each to the script line and its read-back to JSON, the refusals of protocol.rs's tests, and
+// read-backs that don't parse.
+static void Scene(HANDLE h) {
+  RoundTrip(h, R"({"id":60,"ttl_ms":5000,"verb":"scene.frame","radius":30,"max":16,"points":3})",
+            L"scene.frame 30.000000 16 3 0 0 0 0 0 0", true, "read",
+            "2 1 2 3 -10 90 0 40|8191 -7 0.1 -0.2 0.05 3.5 4 5 6 90 4 5 7.6 4 5 6.9|Geralt|geralt.w2ent|"
+            "8 12 0 0 0 9 1 2 3 0 0 0 0 0 0 0|Guard|",
+            R"({"id":60,"ok":true,"text":"read","data":{"found":2,"camera":{"pos":[1,2,3],"rot":[-10,90,0],"fov":40},)"
+            R"("entities":[{"id":-7,"name":"Geralt","entity":"geralt.w2ent","entity_cut":true,"player":true,"pos":[4,5,6],)"
+            R"("heading":90,"head":[4,5,7.6],"torso":[4,5,6.9],"in_front":true,"in_view":true,"x":0.1,"y":-0.2,"share":0.05,)"
+            R"("box_whole":true,"distance":3.5,"visible":{"head":true,"torso":true,"origin":true},"visible_points":3},)"
+            R"({"id":12,"name":"Guard","entity":"","entity_cut":false,"player":false,"pos":[1,2,3],"heading":0,)"
+            R"("head":[0,0,0],"torso":null,"in_front":false,"in_view":false,"x":null,"y":null,"share":0,"box_whole":false,)"
+            R"("distance":9,)"
+            R"("visible":{"head":null,"torso":null,"origin":null},"visible_points":0}]}})");
+  RoundTrip(h,
+            R"({"id":61,"ttl_ms":5000,"verb":"scene.frame","radius":2,"max":1,"points":0,"at":[604.87,2089.32,30.99],)"
+            R"("entity_id":-123456789})",
+            L"scene.frame 2.000000 1 0 1 604.869995 2089.320068 30.990000 1 -123456789", true, "read", "0 0 0 0 0 0 0 40",
+            R"({"id":61,"ok":true,"text":"read","data":{"found":0,"camera":{"pos":[0,0,0],"rot":[0,0,0],"fov":40},)"
+            R"("entities":[]}})");
+  RoundTrip(h, R"({"id":62,"ttl_ms":5000,"verb":"scene.ground","xyz":[1,2,3,-4.5,5.5,6],"range":10,"radius":0.5,"search":0})",
+            L"scene.ground 10.000000 0.500000 0.000000 1.000000 2.000000 3.000000 -4.500000 5.500000 6.000000", true, "read",
+            "2|31 3.5 1 2 3.4 0 0 1 -1000 0 1.5 2 3.5|0 0 0 0 0 0 0 0 0.25 2 0 0 0",
+            R"({"id":62,"ok":true,"text":"read","data":[{"nav_z":3.5,"ground":{"pos":[1,2,3.4],"normal":[0,0,1]},)"
+            R"("water_level":-1000,"water_depth":0,"free":true,"safe":[1.5,2,3.5]},{"nav_z":null,"ground":null,)"
+            R"("water_level":0.25,"water_depth":2,"free":null,"safe":null}]})");
+  RoundTrip(h, R"({"id":63,"ttl_ms":5000,"verb":"scene.ray","segments":[0,0,1,3,0,1.5],"radius":0.3})",
+            L"scene.ray 0.300000 0.000000 0.000000 1.000000 3.000000 0.000000 1.500000", true, "read",
+            "1|1 1.5 0 1.25 -1 0 0 1.52",
+            R"({"id":63,"ok":true,"text":"read","data":[{"hit":true,"pos":[1.5,0,1.25],"normal":[-1,0,0],"distance":1.52}]})");
+  RoundTrip(h, R"({"id":64,"ttl_ms":5000,"verb":"nav.line","segments":[0,0,1,3,0,1.5],"width":0.4})",
+            L"nav.line 0.400000 0.000000 0.000000 1.000000 3.000000 0.000000 1.500000", true, "read", "1|3 3 0 1.5 0.75",
+            R"({"id":64,"ok":true,"text":"read","data":[{"clear":true,"clear_in_direction":true,"reach":[3,0,1.5],)"
+            R"("edge_m":0.75}]})");
+  RoundTrip(h, R"({"id":65,"ttl_ms":5000,"verb":"cam.noclip","on":true})", L"cam.noclip 1", true, "no-clip on", "",
+            R"({"id":65,"ok":true,"text":"no-clip on"})");
+
+  const char* refused1 = R"({"id":1,"ok":false,"text":"refused: )";
+  for (const std::string& f : std::vector<std::string>{
+           R"("radius":0,"max":1,"points":0)", R"("radius":100.5,"max":1,"points":0)", R"("radius":30,"max":0,"points":0)",
+           R"("radius":30,"max":17,"points":0)", R"("radius":30,"max":1,"points":4)", R"("radius":30,"max":1)",
+           R"("radius":30,"max":1,"points":0,"at":[1,2])", R"("radius":30,"max":1,"points":0,"at":[1000000,0,0])",
+           R"("radius":30,"max":1,"points":0,"entity_id":1.5)", R"("radius":30,"max":1,"points":0,"entity_id":2147483648)"})
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"scene.frame",)" + f + "}", refused1, "invalid scene.frame");
+  std::string many = "[0";
+  for (int k = 1; k < 51; ++k) many += ",0";
+  many += "]";
+  for (const std::string& f : std::vector<std::string>{
+           R"("xyz":[],"range":10,"radius":0,"search":0)", R"("xyz":[1,2],"range":10,"radius":0,"search":0)",
+           R"("xyz":)" + many + R"(,"range":10,"radius":0,"search":0)", R"("xyz":[1,2,3],"range":0,"radius":0,"search":0)",
+           R"("xyz":[1,2,3],"range":10,"radius":10.5,"search":0)", R"("xyz":[1,2,3],"range":10,"radius":0,"search":50.5)",
+           R"("xyz":[1,2,3],"range":10,"radius":0)", R"("xyz":["1","2","3"],"range":10,"radius":0,"search":0)"})
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"scene.ground",)" + f + "}", refused1, "invalid scene.ground");
+  std::string segs17 = "[0";
+  for (int k = 1; k < 102; ++k) segs17 += ",0";
+  segs17 += "]";
+  for (const std::string& f : std::vector<std::string>{R"("segments":[0,0,0,1,1,1],"radius":2.5)",
+                                                       R"("segments":[0,0,0,1,1],"radius":0)",
+                                                       R"("segments":)" + segs17 + R"(,"radius":0)"})
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"scene.ray",)" + f + "}", refused1, "invalid scene.ray");
+  for (const char* f : {R"("segments":[0,0,0,1,1,1],"width":5.5)", R"("segments":[0,0,0,1,1,1],"width":-1)"})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"nav.line",)") + f + "}", refused1, "invalid nav.line");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"cam.noclip","on":1})", refused1, "invalid cam.noclip");
+  // exec: the function's name, its args (strings without quotes, printable ASCII, 8 at most, 100 bytes each), the line.
+  const std::string arg99 = "\"" + std::string(33 * 3, 'a').replace(1, 1, " ") + "\"";
+  std::string long_args = arg99;
+  for (int k = 1; k < 8; ++k) long_args += "," + arg99;
+  for (const std::string& f : std::vector<std::string>{
+           R"("function":"")", R"("function":"a b")", R"("function":")" + std::string(65, 'n') + "\"",
+           R"("line":"quit")", R"("function":"f","args":["a\"b"])", R"("function":"f","args":["a'b"])",
+           R"("function":"f","args":["\u00e9"])", R"("function":"f","args":["a\tb"])",
+           R"("function":"f","args":["1","2","3","4","5","6","7","8","9"])",
+           R"("function":"f","args":[")" + std::string(101, 'x') + "\"]", R"("function":"f","args":[1])",
+           R"("function":"f","args":null)", R"("function":"f","args":[)" + long_args + "]"})
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"exec",)" + f + "}", refused1, "invalid exec");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"exec","function":"f","args":["a",1]})", R"({"id":0,"ok":false,"text":"refused: )",
+          "malformed");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"exec","function":"f","x":1})", refused1, "unknown field");
+  CHECK(Next().empty());  // none of them reached the script
+
+  // Read-backs that don't parse: a count other than the records, flags past their bits, a number short, an id that
+  // isn't one.
+  const std::vector<std::pair<std::string, std::vector<const char*>>> bad = {
+      {R"("verb":"scene.ground","xyz":[1,2,3],"range":10,"radius":0,"search":0)",
+       {"2|31 1 2 3 4 5 6 7 8 9 10 11 12", "1|32 1 2 3 4 5 6 7 8 9 10 11 12", "1|1 1 2 3 4 5 6 7 8 9 10 11", "|"}},
+      {R"("verb":"scene.ray","segments":[0,0,0,1,1,1],"radius":0)", {"1|1 1 2 3 4 5 6", "1|2 1 2 3 4 5 6 7", "17"}},
+      {R"("verb":"nav.line","segments":[0,0,0,1,1,1],"width":0.4)", {"1|4 1 2 3 4", "1|1 1 2 3"}},
+      {R"("verb":"scene.frame","radius":30,"max":16,"points":3)",
+       {"0 1 2 3 4 5 6", "1 1 2 3 4 5 6 7|1 1 0 0 0 0 0 0 0 0 0 0 0 0 0|a|b", "1 1 2 3 4 5 6 7|1 1.5 0 0 0 0 0 0 0 0 0 0 0 0 0 0|a|b",
+        "1 1 2 3 4 5 6 7|8192 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0|a|b", "1 1 2 3 4 5 6 7|1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0|a"}}};
+  for (const auto& [request, replies] : bad) {
+    for (const char* data : replies) {
+      Send(h, R"({"id":66,"ttl_ms":5000,)" + request + "}\n");
+      CHECK(g_reply(_wtoi(NextWait().c_str()), true, "read", data) == 0);
+      const std::string got = ReadLine(h);
+      CHECK(got.starts_with(R"({"id":66,"ok":false,"text":"modQuen's read-back did not parse)"));
+      if (!got.starts_with(R"({"id":66,"ok":false,"text":"modQuen's read-back did not parse)"))
+        printf("  %s -> %s\n", data, got.c_str());
+    }
+  }
+}
+
 static void Channel() {
   Load();
   CHECK(Next().empty());
@@ -516,11 +634,16 @@ static void Channel() {
             R"({"id":18,"ok":true,"text":"loading caf)" "\xc3\xa9" R"(\u000a\u0009"})");
   Paths(h);
   Photo(h);
+  Scene(h);
+  // exec (0.1.13) runs only once QUEN_State showed a game: none was sent yet.
+  CHECK(ExecReply(h, R"({"id":70,"ttl_ms":5000,"verb":"exec","function":"npcavoid"})") ==
+        R"({"id":70,"ok":false,"text":"refused: quen's state shows no loaded game (no state yet): exec runs only with a )"
+        R"(game loaded and no fade or load"})");
 
   // Refusals (protocol.rs refuses_unknown_verbs_fields_and_shapes, refuses_non_finite_and_out_of_range_values, more).
   const char* refused1 = R"({"id":1,"ok":false,"text":"refused: )";
   const char* refused0 = R"({"id":0,"ok":false,"text":"refused: )";
-  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"exec","line":"quit"})", refused1, "unknown verb \\\"exec\\\"");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"console","line":"quit"})", refused1, "unknown verb \\\"console\\\"");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"LOAD","save":"s"})", refused1, "unknown verb");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"load","save":"s","extra":1})", refused1, "unknown field \\\"extra\\\"");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"cam.set","pos":[0,0,0],"rot":[0,0,0],"FOV":40})", refused1, "unknown field");
@@ -939,6 +1062,102 @@ static void TracyMode(const std::wstring& mode, const std::wstring& token, const
   }
 }
 
+// ---- the exec verb (0.1.13) ----
+// The executor's 16 entry bytes are planted at its RVA in g_image, then the rest of a stand-in: the 4-byte displacement
+// of the entry's last instruction (mov rcx, [rip+0]), then add rsp, 78h; pop r14; pop rbp (undoing the entry), and a jmp
+// to FakeRun with the caller's stack, rdx and r8 as they came.
+
+#define W3_CALL(NAME, RVA, BYTES) constexpr uint32_t k##NAME##Rva = RVA; constexpr const char* k##NAME##Bytes = BYTES;
+#include "hooks.inc"
+#undef W3_CALL
+
+struct EngineString {
+  const char* data;
+  uint32_t size, pad;
+};
+static std::string g_exec_line;  // the last line the stand-in got
+static uint32_t g_exec_size;
+static int g_exec_calls;
+static bool g_out_zeroed = true;
+static const char kExecLog[] = "[NpcAvoid] on";
+
+// The executor's stand-in: "nope..." isn't found (false, out untouched); anything else is called, its log kExecLog.
+static bool FakeRun(void*, const EngineString* in, EngineString* out) {
+  ++g_exec_calls;
+  g_exec_line.assign(in->data, in->size ? in->size - 1 : 0);
+  g_exec_size = in->size;
+  g_out_zeroed = g_out_zeroed && !out->data && !out->size && !out->pad;
+  if (g_exec_line.starts_with("nope")) return false;
+  out->data = kExecLog;
+  out->size = sizeof kExecLog;
+  return true;
+}
+
+static void PlantExec() {
+  uint8_t* p = At(kRemoteConsole_RunCommandRva);
+  CHECK(p != nullptr);
+  memcpy(p, kRemoteConsole_RunCommandBytes, 16);
+  uint8_t rest[] = {0, 0, 0, 0, 0x48, 0x83, 0xc4, 0x78, 0x41, 0x5e, 0x5d, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0};
+  const uint64_t target = reinterpret_cast<uint64_t>(&FakeRun);
+  memcpy(rest + 13, &target, 8);
+  memcpy(p + 16, rest, sizeof rest);
+  DWORD old;
+  CHECK(VirtualProtect(p, 64, PAGE_EXECUTE_READWRITE, &old));
+}
+
+static void ExecMode() {
+  const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  const bool host = nt->FileHeader.TimeDateStamp == kStamp501;
+  PlantExec();
+  Load();
+  const HANDLE h = Connect();
+  CHECK(h != INVALID_HANDLE_VALUE);
+  CHECK(g_state(1) == 0);
+  const std::string npcavoid = R"({"id":1,"ttl_ms":5000,"verb":"exec","function":"npcavoid"})";
+  if (!host) {
+    const std::string got = ExecReply(h, npcavoid);
+    CHECK(got.starts_with(R"({"id":1,"ok":false,"text":"refused: the exe's PE stamp is 0x)") && Has(got, "not witcher3.exe 5.01's"));
+    if (!Has(got, "PE stamp")) printf("  %s\n", got.c_str());
+    CHECK(g_exec_calls == 0);
+    return;
+  }
+  std::string got = ExecReply(h, npcavoid);
+  CHECK(got == R"x({"id":1,"ok":true,"text":"called npcavoid()","data":{"line":"npcavoid()","log":"[NpcAvoid] on"}})x");
+  if (!Has(got, "called npcavoid()")) printf("  %s\n", got.c_str());
+  CHECK(g_exec_line == "npcavoid()" && g_exec_size == 11);
+  // The line as protocol.rs's exec_line builds it: bare where the tokenizer reads it whole, else in ".
+  got = ExecReply(h, R"({"id":2,"ttl_ms":5000,"verb":"exec","function":"addset","args":["EIST_Wolf","true","a b","","1.5e-3"]})");
+  CHECK(got == R"x({"id":2,"ok":true,"text":"called addset(EIST_Wolf, true, \"a b\", \"\", 1.5e-3)","data":)x"
+               R"x({"line":"addset(EIST_Wolf, true, \"a b\", \"\", 1.5e-3)","log":"[NpcAvoid] on"}})x");
+  if (!Has(got, "addset")) printf("  %s\n", got.c_str());
+  CHECK(g_exec_line == R"(addset(EIST_Wolf, true, "a b", "", 1.5e-3))");
+  got = ExecReply(h, R"({"id":3,"ttl_ms":5000,"verb":"exec","function":"nope","args":[]})");
+  CHECK(got.starts_with(R"({"id":3,"ok":false,"text":"the game called nothing: no exec function of that name)") &&
+        got.ends_with(R"x("data":{"line":"nope()","log":""}})x"));
+  CHECK(g_exec_calls == 3 && g_out_zeroed);
+  // quen's state gate: a fade or no game.
+  for (const int flags : {257, 0}) {
+    CHECK(g_state(flags) == 0);
+    got = ExecReply(h, npcavoid);
+    CHECK(got == R"({"id":1,"ok":false,"text":"refused: quen's state shows no loaded game (flags )" + std::to_string(flags) +
+                     R"(): exec runs only with a game loaded and no fade or load"})");
+  }
+  CHECK(g_state(1) == 0);
+  // Another mod's patch at the executor: refused with the live bytes, nothing called.
+  uint8_t* entry = At(kRemoteConsole_RunCommandRva);
+  entry[0] = 0xe9;
+  got = ExecReply(h, npcavoid);
+  CHECK(Has(got, R"("ok":false,"text":"refused: the console executor's 16 entry bytes (RVA 0x24DD370) are e9 8b c4 55)"));
+  if (!Has(got, "entry bytes")) printf("  %s\n", got.c_str());
+  entry[0] = 0x48;
+  CHECK(ExecReply(h, npcavoid).starts_with(R"({"id":1,"ok":true,)"));
+  CHECK(g_exec_calls == 4);
+  const std::string log = ReadLog();
+  CHECK(Has(log, "exec npcavoid(): called") && Has(log, "exec nope(): not called") && Has(log, "exec refused: the console"));
+  CloseHandle(h);
+}
+
 int wmain(int argc, wchar_t** argv) {
   const std::wstring mode = argc > 1 ? argv[1] : L"";
   const std::wstring token = L"quentest-" + std::to_wstring(GetCurrentProcessId()) + L"-0123456789";
@@ -999,9 +1218,13 @@ int wmain(int argc, wchar_t** argv) {
     std::ofstream(Here(L"tracyhost.exe"), std::ios::binary) << pe;
   } else if (mode.starts_with(L"tracy-")) {
     TracyMode(mode, token, pid);
+  } else if (mode == L"exec") {
+    SetEnvironmentVariableW(L"W3_QUEN_TOKEN", token.c_str());
+    SetEnvironmentVariableW(L"W3_QUEN_PID", pid.c_str());
+    ExecMode();
   } else {
-    printf("usage: test.exe channel|notoken|badtoken|wrongpid|squat|tracy-stamp|mkhost; tracyhost.exe "
-           "tracy-none|tracy-token|tracy-notoken|tracy-on|tracy-capture\n");
+    printf("usage: test.exe channel|notoken|badtoken|wrongpid|squat|tracy-stamp|mkhost|exec; tracyhost.exe "
+           "tracy-none|tracy-token|tracy-notoken|tracy-on|tracy-capture|exec\n");
     return 2;
   }
   printf("%ls: %s\n", mode.c_str(), g_fail ? "FAILED" : "passed");

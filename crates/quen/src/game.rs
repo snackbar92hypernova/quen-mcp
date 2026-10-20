@@ -1,5 +1,6 @@
-//! The in-game tools: `game_load`, `game_console`, `game_cvar` and `game_keys`, and the actions `measure_ab` applies.
-//! Keys and console lines go out natively (`input`, ported from w3ctl.py and console_type.py);
+//! The in-game tools: `game_load`, `game_console`, `game_exec`, `game_cvar` and `game_keys`, and the actions `measure_ab`
+//! applies. Keys and console lines go out natively (`input`, ported from w3ctl.py and console_type.py), exec lines
+//! through quen's command channel;
 //! cvars are quen's own (quen-core's `cvar` on the game's memory, mem.rs). Every tool needs the live session's
 //! token. An ASI's `*_SetMode` export has no script, so quen calls it in the game on a thread of its own there, as
 //! W3Perf.addon64 calls it from ReShade's.
@@ -18,6 +19,7 @@ use quen_core::cvar;
 use quen_core::input::{Event, GAP_MS, GRAVE, HOLD_MS, describe};
 use quen_core::journal::{Action as Step, Journal};
 use quen_core::mem::{Module, Write};
+use quen_core::protocol::Verb;
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 use windows_sys::Win32::Foundation::{
@@ -106,6 +108,22 @@ pub fn tools() -> Vec<Value> {
             }), &["line"]),
         }),
         json!({
+            "name": "game_exec",
+            "description": "Run an exec function (a mod's or the game's) from a console line, name or name(args), \
+                without typing it: quen's command channel takes the name and arguments (bare, or in \" or ' to hold \
+                spaces or commas), and W3Quen.asi calls the game's console executor on the game's tick. quen-w3 0.1.13 \
+                or later. line: the line it ran, as built from them; log: what the engine logged on its main thread \
+                during the call (the game's words: data). Names are case-sensitive. An argument its type can't read \
+                keeps its default and the function still runs. Not journaled, as game_console's lines aren't: what it \
+                changes taints no save in quen's records. Refused, nothing run: wrong token, the user has the \
+                controls, quen's state not gameplay or photo mode, a line it can't read, an older package (with \
+                needs), the exe not 5.01 or the executor's entry bytes not 5.01's (game_text), no exec function of \
+                that name taking these arguments. Failed: no reply within 5 s.",
+            "inputSchema": schema(json!({
+                "line": {"type": "string", "description": "name or name(arg, ...), e.g. npcavoidpreset(2)"},
+            }), &["line"]),
+        }),
+        json!({
             "name": "game_scriptlog",
             "description": "Read the end of the game's script log (Documents\\The Witcher 3\\scriptslog.txt): its last \
                 lines, with channel only those starting [channel] (any case), each cut at 1 KiB, from its last 1 MiB. \
@@ -163,6 +181,9 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
     let out = match name {
         "game_load" => load(session, call, args),
         "game_console" => console(session, call, args),
+        "game_exec" => exec(session, args),
+        n @ ("world_frame" | "world_ground" | "world_ray" | "world_nav" | "game_frame"
+        | "game_place") => crate::scene::call(session, call, n, args),
         "game_scriptlog" => scriptlog(session, args),
         "game_cvar" => cvar(session, call, args),
         "game_keys" => keys(session, call, args),
@@ -570,6 +591,45 @@ impl Ctx<'_> {
             return Err(Done::Failed(why, fields));
         }
         Ok(fields)
+    }
+
+    /// game_exec's work, and a console action's with quen-w3 0.1.13: `line` read as an exec verb ([`Verb::exec`]) and
+    /// sent through the channel, in gameplay or photo mode only (quen's state). No key is sent, so neither the front nor
+    /// a menu matters. Recorded in serve.log (and the game's W3Quen.log); not journaled, as a console line isn't.
+    pub(crate) fn exec(&self, line: &str) -> Result<Fields, Done> {
+        let verb = Verb::exec(line).map_err(|e| e.to_string())?;
+        let ran = verb.exec_line().unwrap_or_default();
+        doctor::installed(&[&doctor::PACKAGE], self.config, "game_exec")?;
+        doctor::package_at_least(self.config, doctor::BEFORE_SCENE, "game_exec", "0.1.13")?;
+        let last = self.last_flags();
+        if !last.is_some_and(in_game) {
+            let why = format!(
+                "quen's state shows {}, not gameplay or photo mode: exec runs only there. Nothing sent",
+                shown(last)
+            );
+            return Err(why.into());
+        }
+        let reply = self.channel()?.call(verb, channel::REPLY_MAX);
+        eprintln!(
+            "quen: exec {ran}: {}",
+            reply.as_ref().map_or_else(|e| e.why(), |_| "called")
+        );
+        let mut fields = Map::from_iter([("line".to_string(), json!(ran))]);
+        match reply {
+            Ok(reply) => {
+                let log = reply.data.as_ref().and_then(|d| d["log"].as_str());
+                fields.insert(
+                    "log".into(),
+                    json!(channel::game_text(log.unwrap_or_default())),
+                );
+                Ok(fields)
+            }
+            Err(channel::Error::Refused(why, text)) => {
+                fields.extend(text.map(|t| ("game_text".to_string(), json!(t))));
+                Err(Done::RefusedWith(why, fields))
+            }
+            Err(e) => Err(e.done(fields)),
+        }
     }
 
     /// game_load's close: once quen's state shows gameplay or photo mode again, the console key once more (the line's own
@@ -1097,6 +1157,11 @@ fn confirm(
     }
 }
 
+fn exec(session: &Session, args: &Value) -> Result<Fields, Done> {
+    let cx = ctx(session, args, &["line"])?;
+    cx.exec(text(args, "line")?)
+}
+
 fn console(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &["line"])?;
     // quen's state says whether the game is in gameplay or photo mode, where typing is safe.
@@ -1258,11 +1323,13 @@ pub(crate) enum Action {
         export: Option<String>,
         mode: u32,
     },
-    /// A console line, as game_console types it: a toggle like keys (finding 59). `expect` (channel, text): a new
-    /// script-log line on that channel holding that text must follow it.
+    /// A console line, as game_console types it, or with `exec` as game_exec sends it (measure_ab sets it before the
+    /// first window): a toggle like keys (finding 59). `expect` (channel, text): a new script-log line on that channel
+    /// holding that text must follow it.
     Console {
         line: String,
         expect: Option<(String, String)>,
+        exec: bool,
     },
 }
 
@@ -1333,6 +1400,7 @@ impl Action {
                 Ok(Action::Console {
                     line: line.into(),
                     expect,
+                    exec: false,
                 })
             }
             _ => Err(format!(
@@ -1348,13 +1416,17 @@ impl Action {
             Action::Cvar { name, value } => cx.cvar(call, name, Cvar::Set(value)),
             Action::Keys(tokens) => cx.keys(call, tokens, false, Focus::Refuse),
             Action::SetMode { asi, export, mode } => cx.set_mode(asi, export.as_deref(), *mode),
-            Action::Console { line, expect } => {
+            Action::Console { line, expect, exec } => {
+                let send = || match exec {
+                    true => cx.exec(line),
+                    false => cx.console(call, line, Map::new(), true),
+                };
                 let Some((channel, contains)) = expect else {
-                    return cx.console(call, line, Map::new(), true);
+                    return send();
                 };
                 let log = cx.script_log()?;
                 let from = fs::metadata(&log).map_or(0, |m| m.len());
-                let fields = cx.console(call, line, Map::new(), true)?;
+                let fields = send()?;
                 let prefix = format!("[{channel}]");
                 let start = Instant::now();
                 loop {
@@ -1389,8 +1461,14 @@ impl std::fmt::Display for Action {
                 let export = export.as_deref().unwrap_or("*_SetMode");
                 write!(f, "{asi}!{export}({mode})")
             }
-            Action::Console { line, expect } => {
-                write!(f, "console {line}")?;
+            Action::Console { line, expect, exec } => {
+                match exec {
+                    true => {
+                        let ran = Verb::exec(line).ok().and_then(|v| v.exec_line());
+                        write!(f, "exec {}", ran.unwrap_or_default())?
+                    }
+                    false => write!(f, "console {line}")?,
+                }
                 match expect {
                     Some((channel, contains)) => write!(f, " expect [{channel}] {contains:?}"),
                     None => Ok(()),

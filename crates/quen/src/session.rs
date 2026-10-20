@@ -843,7 +843,7 @@ impl<'a> Session<'a> {
             "focus" => focus::call(self, call, args),
             "hands_take" => hands::take(self, call, args),
             "hands_give" => hands::give(self, call, args),
-            n @ ("world_get" | "world_actors") => game::call(self, call, n, args),
+            n if n.starts_with("world_") => game::call(self, call, n, args),
             n @ ("game_keys" | "game_console" | "game_load") => {
                 let done = game::call(self, call, n, args);
                 self.guard_after(call, done)

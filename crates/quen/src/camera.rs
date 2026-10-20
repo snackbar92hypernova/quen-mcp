@@ -211,7 +211,7 @@ pub(crate) fn camera(session: &Session, call: &mut Call, args: &Value) -> Result
 
 /// Why the camera isn't at `want`, when its read-back `got` is off by more than [`OFF_MAX`]: photo mode's camera
 /// collides with geometry (feature tests 2: a set across a railing stayed 4 m short, its rotation and fov set).
-fn short(got: &Pose, want: &Pose) -> Option<String> {
+pub(crate) fn short(got: &Pose, want: &Pose) -> Option<String> {
     let (pos, deg) = off(got, want);
     (pos > OFF_MAX.0 || deg > OFF_MAX.1).then(|| {
         format!(
@@ -261,7 +261,7 @@ fn send_on(channel: channel::Channel, verb: Verb, fields: &Fields) -> Result<Rep
 }
 
 /// The camera and pose in a reply's read-back, `{"camera", "pos", "rot", "fov"}`.
-fn read_back(reply: &Reply) -> Result<(String, Pose), String> {
+pub(crate) fn read_back(reply: &Reply) -> Result<(String, Pose), String> {
     let data = reply
         .data
         .as_ref()
@@ -284,7 +284,7 @@ fn read_back(reply: &Reply) -> Result<(String, Pose), String> {
 }
 
 /// The largest difference of `got` from `want`: metres, and degrees over the angles (modulo 360) and fov.
-fn off(got: &Pose, want: &Pose) -> (f64, f64) {
+pub(crate) fn off(got: &Pose, want: &Pose) -> (f64, f64) {
     let pos = (0..3)
         .map(|c| (got.pos[c] - want.pos[c]).abs())
         .fold(0.0, f64::max);
@@ -296,12 +296,12 @@ fn off(got: &Pose, want: &Pose) -> (f64, f64) {
     (pos, deg)
 }
 
-fn off_json((pos, deg): (f64, f64)) -> Value {
+pub(crate) fn off_json((pos, deg): (f64, f64)) -> Value {
     let r = |x: f64| (x * 1e4).round() / 1e4;
     json!({"pos_m": r(pos), "deg": r(deg)})
 }
 
-fn pose_json(p: &Pose) -> Value {
+pub(crate) fn pose_json(p: &Pose) -> Value {
     json!({"pos": p.pos, "rot": p.rot, "fov": p.fov})
 }
 
@@ -827,7 +827,7 @@ fn step(
 
 /// One frame: game_screenshot tagged `tag`, and its first capture row (the .npy of an hdr shot, else the .png). The
 /// screenshot's own timing and artifacts stay out of sweep_play's envelope: its run and frames name them.
-fn grab(session: &Session, token: &str, tag: &str, method: &str) -> Result<i64, Done> {
+pub(crate) fn grab(session: &Session, token: &str, tag: &str, method: &str) -> Result<i64, Done> {
     #[cfg(test)]
     if let Some(got) = tests::grab(tag) {
         return got;

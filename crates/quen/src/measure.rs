@@ -158,7 +158,7 @@ pub fn tools() -> Vec<Value> {
                                             "set_mode": {"type": "integer", "minimum": 0, "maximum": 255, "description": "the mode: our ASIs take 0 (off) and 1 (on), even where their ini writes another value for on"},
                                             "export": {"type": "string", "description": "with asi: which *_SetMode export, when it has several"},
                                             "keys": {"type": "array", "items": {"type": "string"}, "description": "a toggle hotkey, as game_keys tokens"},
-                                            "console": {"type": "string", "description": "a console line, typed as game_console types it (a toggle)"},
+                                            "console": {"type": "string", "description": "a console line (a toggle): with quen-w3 0.1.13 or later sent as game_exec sends it (no typing; the note says exec), else typed as game_console types it"},
                                             "expect_log": {
                                                 "type": "object",
                                                 "description": "with console: a new script-log line on channel holding contains must follow within 10 s, else the run fails",
@@ -1151,7 +1151,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
             "trace_only",
         ],
     )?;
-    let run = Run::parse(args)?;
+    let mut run = Run::parse(args)?;
     let pm = match run.presentmon {
         true => Some(PresentMon::new(&cx, args)?),
         false => None,
@@ -1173,9 +1173,11 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         None => None,
     };
     // Each action checked before any runs (feature tests 1: five *_SetMode exports failed at window 1): the
-    // ASI's export, the cvar's set without its write, the keys' plan and RenderDoc's capture key.
-    for (_, actions) in &run.states {
-        for action in actions {
+    // ASI's export, the cvar's set without its write, the keys' plan and RenderDoc's capture key. A console line goes as
+    // an exec verb when the package has it and the line reads as one (game_exec), else typed.
+    let exec = doctor::has_exec(doctor::package_version(cx.config));
+    for (_, actions) in &mut run.states {
+        for action in actions.iter_mut() {
             match action {
                 Action::SetMode { asi, export, .. } => {
                     cx.mode_export(asi, export.as_deref())?;
@@ -1187,10 +1189,15 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
                     crate::profile::capture_key(cx.live, tokens)?;
                     cx.keys(call, tokens, true, game::Focus::Refuse)?;
                 }
-                Action::Console { expect, .. } => {
+                Action::Console {
+                    line,
+                    expect,
+                    exec: via,
+                } => {
                     if expect.is_some() {
                         cx.script_log()?;
                     }
+                    *via = exec && quen_core::protocol::Verb::exec(line).is_ok();
                 }
             }
         }

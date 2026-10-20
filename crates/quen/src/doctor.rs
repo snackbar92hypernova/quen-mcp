@@ -59,6 +59,20 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.13: the scene reads (scene.frame, scene.ground, scene.ray, nav.line), cam.noclip and the exec verb (scene.rs,
+    // game_exec).
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.13",
+        sha256: "4c2438d779d41b7f9ecdf7dc9906ceebd4eaaf1281f4fa2fc9fbd31a7cfd2225",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.13",
+        sha256: "c1c456b639f5f4167b4044385b5cbb2147b8a90171f4c64d279957fea0bd725a",
+        exact: true,
+    },
     // 0.1.12: world.actors' tag and class, and each one's id and actor flag (measure_trace, measure_ab's trace).
     Pin {
         file: PACKAGE_ASI,
@@ -304,6 +318,29 @@ pub(crate) const BEFORE_ENTITIES: &[&str] = &[
     "quen-w3 0.1.11",
 ];
 
+/// The package releases from before the scene verbs, cam.noclip and exec (quen-w3 0.1.13): world_frame, world_ground,
+/// world_ray, world_nav, game_frame, game_place and game_exec refuse them with needs.
+pub(crate) const BEFORE_SCENE: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+    "quen-w3 0.1.9",
+    "quen-w3 0.1.10",
+    "quen-w3 0.1.11",
+    "quen-w3 0.1.12",
+];
+
+/// Whether measure_ab's console actions go as exec verbs: only for a pinned package with the verb (an unpinned dev
+/// build may lack it, so its lines are typed, as before).
+pub(crate) fn has_exec(version: Option<&str>) -> bool {
+    version.is_some_and(|v| !BEFORE_SCENE.contains(&v))
+}
+
 /// Refused with needs, nothing sent, while quen's package in the game is one of `before`: releases without what
 /// `tool` needs, which came in quen-w3 `since`. An unpinned package (a dev build) goes on: its ASI refuses a verb it
 /// doesn't know.
@@ -407,7 +444,9 @@ pub(crate) const PACKAGE: Dep = Dep {
         0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
         quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo; from quen-w3 0.1.10, \
         game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters; from quen-w3 \
-        0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them)",
+        0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them); from quen-w3 \
+        0.1.13, world_frame, world_ground, world_ray, world_nav, game_frame, game_place and game_exec (and \
+        measure_ab's console actions without typing)",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
