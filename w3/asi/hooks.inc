@@ -5,6 +5,17 @@
 //   before and after the call), count (no zone: a register-transparent thunk counts calls, plotted per render frame)
 // Each line cites the KB (witcher3-mods re\): its names.tsv row, and the hooks.tsv row of any other mod that changes the
 // same site, which a tracy launch parks (crates/quen/src/profile.rs reads hooks.tsv for that). quen reads this file too.
+// W3_CALL(name, RVA, its 16 entry bytes): a function W3Quen.asi calls and never changes (from quen-w3 0.1.13), its bytes
+// checked against the running exe before each call. An includer defines the macro it wants; the other one is empty.
+#ifndef W3_HOOK
+#define W3_HOOK(NAME, RVA, BYTES, SIG, KIND)
+#define W3_HOOK_EMPTY
+#endif
+#ifndef W3_CALL
+#define W3_CALL(NAME, RVA, BYTES)
+#define W3_CALL_EMPTY
+#endif
+W3_CALL(RemoteConsole_RunCommand, 0x24DD370, "\x48\x8b\xc4\x55\x41\x56\x48\x8b\xec\x48\x83\xec\x78\x48\x8b\x0d")  // incoming\console-exec-20261020.tsv 0x24DD370 RemoteConsole run command; hooks.tsv 0x24DD370 call W3Quen exec verb
 W3_HOOK(CBaseEngine_Tick, 0x2253730, "\x40\x55\x53\x56\x57\x41\x56\x41\x57\x48\x8b\xec\x48\x83\xec\x58", F1, custom)  // names.tsv 0x2253730 CBaseEngine_Tick
 W3_HOOK(CGame_Tick, 0x227D1F0, "\x40\x55\x57\x48\x8d\xac\x24\x98\x08\xff\xff\xb8\x68\xf8\x00\x00", F1, plain)  // names.tsv 0x227D1F0 CGame_Tick
 W3_HOOK(RenderThread_ProcessCommands, 0x1C69AE0, "\x48\x89\x5c\x24\x18\x55\x56\x57\x41\x56\x41\x57\x48\x83\xec\x20", I, plain)  // names.tsv 0x1C69AE0 RenderThread_ProcessCommands
@@ -80,3 +91,11 @@ W3_HOOK(RTMat_SlotPush, 0x1F21950, "\x40\x57\x48\x83\xec\x50\x8b\xc2\x41\x8b\xf9
 W3_HOOK(RTSkin_ChunkDispatch, 0x1D12190, "\x44\x88\x4c\x24\x20\x44\x89\x44\x24\x18\x55\x57\x41\x55\x41\x57", I, count)  // names.tsv 0x1D12190 RTSkin_ChunkDispatch
 W3_HOOK(RTCollect_MeshProxy, 0x1D2A810, "\x48\x89\x5c\x24\x08\x57\x48\x83\xec\x30\xf6\x81\x20\x01\x00\x00", I, count)  // names.tsv 0x1D2A810 RTCollect_MeshProxy
 W3_HOOK(Barrier_Add, 0x1EDDAA0, "\x40\x53\x41\x56\x48\x83\xec\x38\x83\x3a\x00\x48\x8b\xda\x4c\x8b", I, count)  // names.tsv 0x1EDDAA0 Barrier_Add
+#ifdef W3_HOOK_EMPTY
+#undef W3_HOOK
+#undef W3_HOOK_EMPTY
+#endif
+#ifdef W3_CALL_EMPTY
+#undef W3_CALL
+#undef W3_CALL_EMPTY
+#endif

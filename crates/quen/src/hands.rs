@@ -77,8 +77,9 @@ pub(crate) fn tools() -> Vec<Value> {
                 session (session_launch mode play), where the user has them from the launch, or in a test session \
                 after hands_give. The client asks the user on every call (user_ok is only your word): never route \
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
-                moves the focus (game_keys, game_console, game_load, game_pause, game_settime, game_weather, \
-                game_teleport, game_items, game_save, game_camera with a pose, game_cvar set or restore, mem_patch, \
+                moves the focus (game_keys, game_console, game_exec, game_load, game_pause, game_settime, \
+                game_weather, game_teleport, game_place, game_items, game_save, game_camera with a pose, game_frame, \
+                game_cvar set or restore, mem_patch, \
                 mem_unpatch, mem_patch_instances, mem_unpatch_instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
                 are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
@@ -119,9 +120,10 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_photo" => matches!(args["action"].as_str(), Some("get" | "list")),
-        "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "game_scriptlog"
-        | "measure_presentmon" | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk"
-        | "mem_find" | "mem_regions" | "sweep_save" | "capture_clean" => true,
+        "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
+        | "world_ground" | "world_ray" | "world_nav" | "game_scriptlog" | "measure_presentmon"
+        | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk" | "mem_find" | "mem_regions"
+        | "sweep_save" | "capture_clean" => true,
         tool => tool.starts_with("session_") || tool.starts_with("hands_"),
     }
 }

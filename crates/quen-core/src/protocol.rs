@@ -3,8 +3,9 @@
 //! Game-neutral: the Witcher 3 end is `W3Quen.asi` + `modQuen` (quen's package, `w3/`), and CET, BG3SE or UE4SS ends
 //! can reuse this side.
 //! One message per line, newline-terminated. A request is one flat object, the verb's fields beside `id` and `ttl_ms`:
-//! `{"id":7,"ttl_ms":2000,"verb":"load","save":"..."}`. Verbs are typed; there is no raw `exec`. Unknown verbs and
-//! fields, oversize lines and non-finite floats are refused both ways.
+//! `{"id":7,"ttl_ms":2000,"verb":"load","save":"..."}`. Verbs are typed: `exec` names an exec function and its
+//! arguments, never a raw console line. Unknown verbs and fields, oversize lines and non-finite floats are refused
+//! both ways.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
@@ -162,6 +163,51 @@ pub enum Verb {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         class: Option<String>,
     },
+    /// Read what the rendered camera sees (quen-w3 0.1.13): the alive actors within `radius` of the camera, or of `at`,
+    /// the player among them, nearest first, at most `max`; with `entity_id` only the entity of that id (`world.actors`'
+    /// `id`; the request's own `id` is taken).
+    /// Each one projected for the rendered camera, its box's share of the frame, and its first `points` of head, torso
+    /// and origin each tested by a ray from the camera. `radius` above 0 to [`MAX_ACTORS_RADIUS`], `max` 1 to
+    /// [`MAX_FRAME`], `points` 0 to 3. Changes nothing.
+    #[serde(rename = "scene.frame")]
+    SceneFrame {
+        radius: f32,
+        max: u32,
+        points: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<[f32; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entity_id: Option<i32>,
+    },
+    /// Read the ground at points, `xyz` flat (x, y, z per point, 1 to [`MAX_QUERIES`] points): the navmesh z within
+    /// `range` of each z, a ray down through that range, the water; with `radius` above 0 whether a navmesh circle of
+    /// that radius is free there, with `search` above 0 the nearest safe spot within it. Changes nothing.
+    #[serde(rename = "scene.ground")]
+    SceneGround {
+        xyz: Vec<f32>,
+        range: f32,
+        radius: f32,
+        search: f32,
+    },
+    /// Cast a ray from a to b per segment (`segments` flat: ax, ay, az, bx, by, bz; 1 to [`MAX_QUERIES`]), or with
+    /// `radius` above 0 sweep a sphere of that radius: the first hit. Changes nothing.
+    #[serde(rename = "scene.ray")]
+    SceneRay { segments: Vec<f32>, radius: f32 },
+    /// Test a navmesh lane `width` wide from a to b per segment (as scene.ray's): clear or not, the furthest point
+    /// reached towards b, the distance to the nearest obstacle. Changes nothing.
+    #[serde(rename = "nav.line")]
+    NavLine { segments: Vec<f32>, width: f32 },
+    /// Turn the photo-mode camera's no-clip on, or back to what photo mode's menu has.
+    #[serde(rename = "cam.noclip")]
+    CamNoclip { on: bool },
+    /// Run the global `exec function` named `function` with `args`, as the console runs `function(args)` (quen-w3
+    /// 0.1.13): W3Quen.asi calls the game's console executor, no console is typed. [`Verb::exec_line`] is the line.
+    #[serde(rename = "exec")]
+    Exec {
+        function: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
 }
 
 /// What `photo.reset` puts back.
@@ -198,6 +244,43 @@ pub const MAX_ACTORS_RADIUS: f32 = 100.0;
 /// UTF-8 bytes), under [`MAX_REPLY_BYTES`]. Names full of control characters (6 bytes each, escaped) would exceed it:
 /// the ASI then answers that the reply is too long.
 pub const MAX_ACTORS: u32 = 50;
+/// The most entities one `scene.frame` reads: with 3 points, 48 rays in the tick, under the runner design's cap of 64
+/// rays a tick (until measured).
+pub const MAX_FRAME: u32 = 16;
+/// The most points, segments or lanes one `scene.ground`, `scene.ray` or `nav.line` takes: the design's 16 queries a
+/// tick.
+pub const MAX_QUERIES: usize = 16;
+/// `scene.ground`'s widest `range` and `search`, `radius` (metres), and `scene.ray`'s and `nav.line`'s widest.
+pub const MAX_GROUND_RANGE: f32 = 100.0;
+pub const MAX_GROUND_SEARCH: f32 = 50.0;
+pub const MAX_GROUND_RADIUS: f32 = 10.0;
+pub const MAX_SWEEP_RADIUS: f32 = 2.0;
+pub const MAX_NAV_WIDTH: f32 = 5.0;
+/// `exec`: at most this many arguments, each at most `MAX_EXEC_ARG_BYTES`, the whole line at most `MAX_EXEC_LINE_BYTES`.
+pub const MAX_EXEC_ARGS: usize = 8;
+pub const MAX_EXEC_ARG_BYTES: usize = 100;
+pub const MAX_EXEC_LINE_BYTES: usize = 512;
+
+/// An `exec` argument the console's tokenizer reads: printable ASCII without `"` or `'` (it ends a quoted token at
+/// either, with no escapes: witcher3-mods re notes/console_exec.md).
+fn exec_arg(a: &str) -> bool {
+    a.len() <= MAX_EXEC_ARG_BYTES
+        && a.bytes()
+            .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\'')
+}
+
+/// An argument passed bare: one the tokenizer reads whole (no space, comma or parenthesis); the rest go in `"`.
+fn bare(a: &str) -> bool {
+    !a.is_empty()
+        && a.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))
+}
+
+/// The coordinates a scene verb passes: finite, inside sweep's world.
+fn coords(v: &[f32]) -> bool {
+    v.iter()
+        .all(|x| x.is_finite() && f64::from(x.abs()) < sweep::MAX_COORD)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,9 +454,152 @@ impl Verb {
                     }
                 })
                 .map_err(|e| Error::Invalid(format!("cam.path: {e}"))),
+            Verb::SceneFrame {
+                radius,
+                max,
+                points,
+                at,
+                ..
+            } if !(*radius > 0.0
+                && *radius <= MAX_ACTORS_RADIUS
+                && (1..=MAX_FRAME).contains(max)
+                && *points <= 3
+                && at.is_none_or(|a| coords(&a))) =>
+            {
+                Err(Error::Invalid(format!(
+                    "scene.frame: a radius above 0 to {MAX_ACTORS_RADIUS}, a max of 1 to {MAX_FRAME}, points 0 to 3, \
+                     an at of finite coordinates"
+                )))
+            }
+            Verb::SceneGround {
+                xyz,
+                range,
+                radius,
+                search,
+            } if !(per(xyz, 3)
+                && *range > 0.0
+                && *range <= MAX_GROUND_RANGE
+                && (0.0..=MAX_GROUND_RADIUS).contains(radius)
+                && (0.0..=MAX_GROUND_SEARCH).contains(search)) =>
+            {
+                Err(Error::Invalid(format!(
+                    "scene.ground: 1 to {MAX_QUERIES} points of finite x, y, z, a range above 0 to \
+                     {MAX_GROUND_RANGE}, a radius 0 to {MAX_GROUND_RADIUS}, a search 0 to {MAX_GROUND_SEARCH}"
+                )))
+            }
+            Verb::SceneRay { segments, radius }
+                if !(per(segments, 6) && (0.0..=MAX_SWEEP_RADIUS).contains(radius)) =>
+            {
+                Err(Error::Invalid(format!(
+                    "scene.ray: 1 to {MAX_QUERIES} segments of finite a and b, a radius 0 to {MAX_SWEEP_RADIUS}"
+                )))
+            }
+            Verb::NavLine { segments, width }
+                if !(per(segments, 6) && (0.0..=MAX_NAV_WIDTH).contains(width)) =>
+            {
+                Err(Error::Invalid(format!(
+                    "nav.line: 1 to {MAX_QUERIES} segments of finite a and b, a width 0 to {MAX_NAV_WIDTH}"
+                )))
+            }
+            Verb::Exec { function, args } => {
+                let line = self.exec_line().unwrap_or_default();
+                if !crate::trace::plain_name(function)
+                    || args.len() > MAX_EXEC_ARGS
+                    || !args.iter().all(|a| exec_arg(a))
+                    || line.len() > MAX_EXEC_LINE_BYTES
+                {
+                    return Err(Error::Invalid(format!(
+                        "exec: a function name of 1 to 64 letters, digits and _, at most {MAX_EXEC_ARGS} arguments \
+                         of at most {MAX_EXEC_ARG_BYTES} bytes of printable ASCII without quotes, a line of at most \
+                         {MAX_EXEC_LINE_BYTES} bytes"
+                    )));
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
+
+    /// An `exec` verb's console line, as W3Quen.asi builds it from the verb: `function(a, b)`, an argument bare when the
+    /// console's tokenizer reads it whole (letters, digits and `_ . + -`), else in `"`. None for another verb.
+    pub fn exec_line(&self) -> Option<String> {
+        let Verb::Exec { function, args } = self else {
+            return None;
+        };
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| match bare(a) {
+                true => a.clone(),
+                false => format!("\"{a}\""),
+            })
+            .collect();
+        Some(format!("{function}({})", args.join(", ")))
+    }
+
+    /// The `exec` verb for a console line `function` or `function(a, b, ...)`: each argument bare or in `"` or `'`,
+    /// spaces around it dropped. The verb's own checks follow.
+    pub fn exec(line: &str) -> Result<Verb, Error> {
+        let bad = |why: &str| Error::Invalid(format!("exec line {line:?}: {why}"));
+        let line_t = line.trim();
+        let name_end = line_t
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(line_t.len());
+        let (function, rest) = line_t.split_at(name_end);
+        let rest = rest.trim();
+        let mut args = Vec::new();
+        if !rest.is_empty() {
+            let inner = rest
+                .strip_prefix('(')
+                .and_then(|r| r.strip_suffix(')'))
+                .ok_or_else(|| bad("after the name, only (arguments)"))?;
+            if !inner.trim().is_empty() {
+                for piece in split_args(inner).ok_or_else(|| bad("a quote that doesn't close"))? {
+                    let p = piece.trim();
+                    let quoted = p.len() >= 2
+                        && matches!(p.as_bytes()[0], b'"' | b'\'')
+                        && matches!(p.as_bytes()[p.len() - 1], b'"' | b'\'');
+                    let arg = if quoted { &p[1..p.len() - 1] } else { p };
+                    if !quoted && (arg.is_empty() || arg.contains(['(', ')', '"', '\''])) {
+                        return Err(bad(
+                            "an empty argument, or one with a parenthesis or quote outside quotes",
+                        ));
+                    }
+                    args.push(arg.to_string());
+                }
+            }
+        }
+        let verb = Verb::Exec {
+            function: function.into(),
+            args,
+        };
+        verb.check()?;
+        Ok(verb)
+    }
+}
+
+/// `v` holds whole groups of `n` coordinates, 1 to [`MAX_QUERIES`] of them.
+fn per(v: &[f32], n: usize) -> bool {
+    !v.is_empty() && v.len().is_multiple_of(n) && v.len() / n <= MAX_QUERIES && coords(v)
+}
+
+/// The pieces of an argument list between commas outside quotes (a quote runs to the next `"` or `'`, as the
+/// console's tokenizer reads it); None if a quote doesn't close.
+fn split_args(s: &str) -> Option<Vec<&str>> {
+    let (mut out, mut start, mut quote) = (Vec::new(), 0, false);
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'"' | b'\'' => quote = !quote,
+            b',' if !quote => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    (!quote).then(|| {
+        out.push(&s[start..]);
+        out
+    })
 }
 
 /// One request line, newline included.
@@ -529,7 +755,191 @@ mod tests {
                 tag: Some("q104_ciri".into()),
                 class: Some("CNewNPC".into()),
             },
+            Verb::SceneFrame {
+                radius: 30.0,
+                max: 16,
+                points: 3,
+                at: None,
+                entity_id: None,
+            },
+            Verb::SceneFrame {
+                radius: 2.0,
+                max: 1,
+                points: 0,
+                at: Some([604.87, 2089.32, 30.99]),
+                entity_id: Some(-123_456_789),
+            },
+            Verb::SceneGround {
+                xyz: vec![1.0, 2.0, 3.0, -4.5, 5.5, 6.0],
+                range: 10.0,
+                radius: 0.5,
+                search: 0.0,
+            },
+            Verb::SceneRay {
+                segments: vec![0.0, 0.0, 1.0, 3.0, 0.0, 1.5],
+                radius: 0.0,
+            },
+            Verb::NavLine {
+                segments: vec![0.0, 0.0, 1.0, 3.0, 0.0, 1.5],
+                width: 0.4,
+            },
+            Verb::CamNoclip { on: true },
+            Verb::Exec {
+                function: "npcavoid".into(),
+                args: Vec::new(),
+            },
+            Verb::Exec {
+                function: "addset".into(),
+                args: vec![
+                    "EIST_Wolf".into(),
+                    "true".into(),
+                    "a b".into(),
+                    String::new(),
+                ],
+            },
         ]
+    }
+
+    /// The exec verb's line, as W3Quen.asi builds it (test.cpp checks the same lines), and the verb read from a console
+    /// line: arguments bare or quoted, spaces dropped.
+    #[test]
+    fn exec_lines_round_trip_between_console_text_and_the_verb() {
+        let exec = |f: &str, args: &[&str]| Verb::Exec {
+            function: f.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        };
+        assert_eq!(exec("npcavoid", &[]).exec_line().unwrap(), "npcavoid()");
+        assert_eq!(
+            exec("addset", &["EIST_Wolf", "true", "a b", "", "1.5e-3", "x,y"])
+                .exec_line()
+                .unwrap(),
+            r#"addset(EIST_Wolf, true, "a b", "", 1.5e-3, "x,y")"#
+        );
+        assert_eq!(Verb::CamGet {}.exec_line(), None);
+        for (line, want) in [
+            ("npcavoid()", exec("npcavoid", &[])),
+            ("  npcavoid  ", exec("npcavoid", &[])),
+            ("settime(1,22)", exec("settime", &["1", "22"])),
+            (
+                "addset( EIST_Wolf , true )",
+                exec("addset", &["EIST_Wolf", "true"]),
+            ),
+            (
+                r#"say("hello, world", 'x y', "")"#,
+                exec("say", &["hello, world", "x y", ""]),
+            ),
+            ("f(  )", exec("f", &[])),
+        ] {
+            assert_eq!(Verb::exec(line).unwrap(), want, "{line}");
+        }
+        for line in [
+            "",
+            "(1)",
+            "f(1",
+            "f 1",
+            "f(1) x",
+            "f(,1)",
+            "f(1,)",
+            r#"f("a)"#,
+            r#"f("a'b")"#,
+            r#"f("a"b)"#,
+            "f(a(b))",
+            "f(\u{e9})",
+            "f(a\tb)",
+            "two words",
+            &"n".repeat(65),
+            &format!("f({})", ["1"; MAX_EXEC_ARGS + 1].join(",")),
+            &format!("f({})", "x".repeat(MAX_EXEC_ARG_BYTES + 1)),
+        ] {
+            assert!(
+                matches!(Verb::exec(line), Err(Error::Invalid(_))),
+                "{line:?}: {:?}",
+                Verb::exec(line)
+            );
+        }
+        // Every argument within its cap, the line over its own: 8 quoted arguments of 99 bytes make 825.
+        let arg = "a b".repeat(33);
+        let long = exec("f", &[arg.as_str(); MAX_EXEC_ARGS]);
+        assert!(matches!(
+            encode_request(&request(long)),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    /// The scene verbs' caps: the runner design's 16 queries and 64 rays a tick.
+    #[test]
+    fn scene_verbs_refuse_past_their_caps() {
+        let invalid = |verb: Verb| {
+            let req = request(verb);
+            assert!(
+                matches!(encode_request(&req), Err(Error::Invalid(_))),
+                "{req:?}"
+            );
+        };
+        let frame = |radius: f32, max: u32, points: u32, at: Option<[f32; 3]>| Verb::SceneFrame {
+            radius,
+            max,
+            points,
+            at,
+            entity_id: None,
+        };
+        for verb in [
+            frame(0.0, 1, 0, None),
+            frame(100.5, 1, 0, None),
+            frame(f32::NAN, 1, 0, None),
+            frame(10.0, 0, 0, None),
+            frame(10.0, MAX_FRAME + 1, 0, None),
+            frame(10.0, 1, 4, None),
+            frame(10.0, 1, 0, Some([f32::INFINITY, 0.0, 0.0])),
+            frame(10.0, 1, 0, Some([1e6, 0.0, 0.0])),
+        ] {
+            invalid(verb);
+        }
+        const { assert!(MAX_FRAME * 3 <= 64, "rays a tick") };
+        let ground = |xyz: Vec<f32>, range: f32, radius: f32, search: f32| Verb::SceneGround {
+            xyz,
+            range,
+            radius,
+            search,
+        };
+        for verb in [
+            ground(vec![], 10.0, 0.0, 0.0),
+            ground(vec![1.0, 2.0], 10.0, 0.0, 0.0),
+            ground(vec![0.0; 3 * (MAX_QUERIES + 1)], 10.0, 0.0, 0.0),
+            ground(vec![0.0, 0.0, f32::NAN], 10.0, 0.0, 0.0),
+            ground(vec![0.0; 3], 0.0, 0.0, 0.0),
+            ground(vec![0.0; 3], 100.5, 0.0, 0.0),
+            ground(vec![0.0; 3], 10.0, -0.1, 0.0),
+            ground(vec![0.0; 3], 10.0, 10.5, 0.0),
+            ground(vec![0.0; 3], 10.0, 0.5, 50.5),
+        ] {
+            invalid(verb);
+        }
+        for segments in [vec![], vec![0.0; 5], vec![0.0; 6 * (MAX_QUERIES + 1)]] {
+            invalid(Verb::SceneRay {
+                segments: segments.clone(),
+                radius: 0.0,
+            });
+            invalid(Verb::NavLine {
+                segments,
+                width: 0.5,
+            });
+        }
+        invalid(Verb::SceneRay {
+            segments: vec![0.0; 6],
+            radius: 2.5,
+        });
+        invalid(Verb::NavLine {
+            segments: vec![0.0; 6],
+            width: -1.0,
+        });
+        let full = Verb::SceneGround {
+            xyz: vec![-99_999.99; 3 * MAX_QUERIES],
+            range: 10.0,
+            radius: 0.5,
+            search: 50.0,
+        };
+        assert!(encode_request(&request(full)).is_ok());
     }
 
     /// A photo.grade of exposure and temperature only.
@@ -880,6 +1290,7 @@ mod tests {
     #[test]
     fn refuses_unknown_verbs_fields_and_shapes() {
         for line in [
+            r#"{"id":1,"ttl_ms":1,"verb":"console","line":"quit"}"#,
             r#"{"id":1,"ttl_ms":1,"verb":"exec","line":"quit"}"#,
             r#"{"id":1,"ttl_ms":1,"verb":"LOAD","save":"s"}"#,
             r#"{"id":1,"ttl_ms":1,"verb":"load","save":"s","extra":1}"#,
@@ -903,10 +1314,10 @@ mod tests {
                 "{line:?}"
             );
         }
-        let err = decode_request(r#"{"id":1,"ttl_ms":1,"verb":"exec"}"#)
+        let err = decode_request(r#"{"id":1,"ttl_ms":1,"verb":"console"}"#)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown variant `exec`"), "{err}");
+        assert!(err.contains("unknown variant `console`"), "{err}");
     }
 
     #[test]

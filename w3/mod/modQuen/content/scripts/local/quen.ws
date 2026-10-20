@@ -25,7 +25,11 @@
 //   changes nothing. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
 //   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1. world.actors (from
 //   quen-w3 0.1.10) reads back the actors near the player (QUENRPC_Actors) and changes nothing; from quen-w3 0.1.12 by
-//   tag or class, each with its id.
+//   tag or class, each with its id. From quen-w3 0.1.13 four more reads that change nothing: scene.frame, what the
+//   rendered camera sees (QUENRPC_Frame); scene.ground, the ground at points (QUENRPC_Ground); scene.ray, rays and
+//   sphere sweeps (QUENRPC_Ray); nav.line, navmesh lanes (QUENRPC_Nav); and cam.noclip, the photo-mode camera's no-clip
+//   (put back as photo mode's menu has it when the menu closes). The exec verb (0.1.13) never reaches the script:
+//   W3Quen.asi runs it.
 // - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
 //   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
 //   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
@@ -61,6 +65,7 @@ import function QUEN_CamAt(frame : int) : string;
 @addField(CR4Game) var quenCamFrames : int;  // frame step: how many frames the path has
 @addField(CR4Game) var quenPhotoMenu : CR4PhotomodeMenu;  // photo mode's menu while it is open, else NULL
 @addField(CR4Game) var quenGradeOpen : array<float>;     // the grading sliders (QUEN_Grade) as that menu opened
+@addField(CR4Game) var quenNoclip : bool;  // cam.noclip turned the photo-mode camera's no-clip on
 
 @wrapMethod(CR4Game) function OnTick()
 {
@@ -106,8 +111,28 @@ import function QUEN_CamAt(frame : int) : string;
 @wrapMethod(CR4PhotomodeMenu) function OnClosingMenu()
 {
 	wrappedMethod();
+	theGame.QUEN_NoclipBack();
 	theGame.QUEN_PhotoMenu(NULL);
 	theGame.QUEN_PollState(true);
+}
+
+// Photo mode's menu's own Noclip setting (its Camera tab): what OnParameterChanged gives SetNoclip.
+@addMethod(CR4PhotomodeMenu) function QUEN_Noclip() : bool
+{
+	return m_UIValues.Contains(PM_Camera_Noclip) && m_UIValues[PM_Camera_Noclip] == 1;
+}
+
+// After cam.noclip on: the photo-mode camera's no-clip back to the menu's setting (off without the menu: its default
+// as it opens, photomodeMenu.ws OnConfigUI). Nothing otherwise.
+@addMethod(CR4Game) function QUEN_NoclipBack()
+{
+	if (!quenNoclip)
+		return;
+	quenNoclip = false;
+	if (quenPhotoMenu)
+		GetPhotomodeCamera().SetNoclip(quenPhotoMenu.QUEN_Noclip());
+	else
+		GetPhotomodeCamera().SetNoclip(false);
 }
 
 // ---- photo mode ----
@@ -528,6 +553,291 @@ function QUENRPC_Actors(max : int, radius : float, tag : name, cls : name) : str
 	return text;
 }
 
+// ---- scene reads (from quen-w3 0.1.13): read only, numbers 4 decimals, W3Quen.cpp turns them into JSON ----
+
+// "x y z", 4 decimals.
+function QUEN_V(v : Vector) : string
+{
+	return FloatToStringPrec(v.X, 4) + " " + FloatToStringPrec(v.Y, 4) + " " + FloatToStringPrec(v.Z, 4);
+}
+
+// The collision groups quen's rays and sweeps test: photo mode's own raycast list (photomodeMenu.ws
+// InitCollisionGroups) without Phantom, Water and Debris, with Foliage. No Character: a ray to a body's point isn't
+// stopped by that body, nor by anyone else.
+function QUEN_Groups() : array<name>
+{
+	var g : array<name>;
+
+	g.PushBack('Static');
+	g.PushBack('Terrain');
+	g.PushBack('Foliage');
+	g.PushBack('RigidBody');
+	g.PushBack('Dynamic');
+	g.PushBack('Destructible');
+	g.PushBack('Door');
+	g.PushBack('Platforms');
+	g.PushBack('Fence');
+	g.PushBack('Boat');
+	g.PushBack('BoatDocking');
+	return g;
+}
+
+// scene.frame: the alive actors within radius of the rendered camera, or of `at` (FindGameplayEntitiesInSphere,
+// FLAG_OnlyAliveActors, the player added if missing), with an id only the one whose GetGuidHash it is, nearest that
+// centre first (SortNodesByDistance), at most max: "<found> <camera x y z> <pitch yaw roll> <fov>" (theCamera's), then per
+// entity "|<flags> <id> <x> <y> <share> <distance> <x y z> <heading> <head x y z> <torso x y z>|<display name>|<readable
+// name>" as W3Quen.cpp's FrameJson reads it. x, y: theCamera.WorldVectorToViewRatio of the box's centre (flag 1 when in
+// front). share: CalcBoundingBox's 8 corners projected, those in front of the camera only (flag 2 when all 8), their
+// rectangle clipped to the frame (-1 to 1), its area over the frame's (4). distance: from the camera. head and torso:
+// GetBoneWorldPositionByIndex of GetHeadBoneIndex and GetTorsoBoneIndex (flags 8, 16), actors only. The first `points`
+// of head, torso and origin each get a StaticTrace from the camera over QUEN_Groups (flags 256, 512, 1024), clear when
+// it hits nothing (32, 64, 128). Names as QUENRPC_Actors cuts them (2048: the readable name cut). 4096: the actor's
+// IsInView() (actor.ws; vanilla never calls it, its meaning unverified).
+function QUENRPC_Frame(n : array<float>, id : int) : string
+{
+	var entities : array<CGameplayEntity>;
+	var nodes : array<CNode>;
+	var corner : array<Vector>;
+	var groups : array<name>;
+	var thing : CGameplayEntity;
+	var actor : CActor;
+	var world : CWorld;
+	var box : Box;
+	var rot : EulerAngles;
+	var cam, centre, pos, head, torso, mid, hit, normal : Vector;
+	var x, y, minX, minY, maxX, maxY, share : float;
+	var i, k, flags, front, bone, points : int;
+	var text, entity : string;
+
+	world = theGame.GetWorld();
+	groups = QUEN_Groups();
+	cam = theCamera.GetCameraPosition();
+	rot = theCamera.GetCameraRotation();
+	centre = cam;
+	if (n[3] > 0.5)
+		centre = Vector(n[4], n[5], n[6], 1.0);
+	points = (int)n[2];
+	FindGameplayEntitiesInSphere(entities, centre, n[0], 1000000, '', FLAG_OnlyAliveActors);
+	if (thePlayer && !entities.Contains(thePlayer) && VecDistance(centre, thePlayer.GetWorldPosition()) <= n[0])
+		entities.PushBack(thePlayer);
+	for (i = 0; i < entities.Size(); i += 1)
+	{
+		if (n[7] < 0.5 || entities[i].GetGuidHash() == id)
+			nodes.PushBack(entities[i]);
+	}
+	SortNodesByDistance(centre, nodes);
+	text = IntToString(nodes.Size()) + " " + QUEN_V(cam) + " " + FloatToStringPrec(rot.Pitch, 4) + " "
+		+ FloatToStringPrec(rot.Yaw, 4) + " " + FloatToStringPrec(rot.Roll, 4) + " " + FloatToStringPrec(theCamera.GetFov(), 4);
+	for (i = 0; i < Min((int)n[1], nodes.Size()); i += 1)
+	{
+		thing = (CGameplayEntity)nodes[i];
+		actor = (CActor)thing;
+		pos = thing.GetWorldPosition();
+		flags = 0;
+		if (thing == thePlayer)
+			flags += 4;
+		thing.CalcBoundingBox(box);
+		corner.Clear();
+		corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Min.Z, 1.0));
+		corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Min.Z, 1.0));
+		corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Min.Z, 1.0));
+		corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Min.Z, 1.0));
+		corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Max.Z, 1.0));
+		corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Max.Z, 1.0));
+		corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Max.Z, 1.0));
+		corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Max.Z, 1.0));
+		front = 0;
+		minX = 1000000;
+		minY = 1000000;
+		maxX = -1000000;
+		maxY = -1000000;
+		for (k = 0; k < 8; k += 1)
+		{
+			if (theCamera.WorldVectorToViewRatio(corner[k], x, y))
+			{
+				front += 1;
+				minX = MinF(minX, x);
+				maxX = MaxF(maxX, x);
+				minY = MinF(minY, y);
+				maxY = MaxF(maxY, y);
+			}
+		}
+		share = 0;
+		if (front > 0)
+			share = MaxF(0, MinF(maxX, 1) - MaxF(minX, -1)) * MaxF(0, MinF(maxY, 1) - MaxF(minY, -1)) / 4;
+		if (front == 8)
+			flags += 2;
+		mid = Vector((box.Min.X + box.Max.X) / 2, (box.Min.Y + box.Max.Y) / 2, (box.Min.Z + box.Max.Z) / 2, 1.0);
+		x = 0;
+		y = 0;
+		if (theCamera.WorldVectorToViewRatio(mid, x, y))
+			flags += 1;
+		head = Vector(0, 0, 0, 1.0);
+		torso = Vector(0, 0, 0, 1.0);
+		if (actor)
+		{
+			bone = actor.GetHeadBoneIndex();
+			if (bone != -1)
+			{
+				head = actor.GetBoneWorldPositionByIndex(bone);
+				flags += 8;
+			}
+			bone = actor.GetTorsoBoneIndex();
+			if (bone != -1)
+			{
+				torso = actor.GetBoneWorldPositionByIndex(bone);
+				flags += 16;
+			}
+			if (actor.IsInView())
+				flags += 4096;
+		}
+		if (points > 0 && flags % 16 >= 8)
+		{
+			flags += 256;
+			if (!world.StaticTrace(cam, head, hit, normal, groups))
+				flags += 32;
+		}
+		if (points > 1 && flags % 32 >= 16)
+		{
+			flags += 512;
+			if (!world.StaticTrace(cam, torso, hit, normal, groups))
+				flags += 64;
+		}
+		if (points > 2)
+		{
+			flags += 1024;
+			if (!world.StaticTrace(cam, pos, hit, normal, groups))
+				flags += 128;
+		}
+		entity = StrReplaceAll(thing.GetReadableName(), "|", "/");
+		if (StrLen(entity) > 255)
+		{
+			flags += 2048;
+			entity = StrLeft(entity, 255);
+		}
+		text += "|" + IntToString(flags) + " " + IntToString(thing.GetGuidHash()) + " " + FloatToStringPrec(x, 4) + " "
+			+ FloatToStringPrec(y, 4) + " " + FloatToStringPrec(share, 4) + " " + FloatToStringPrec(VecDistance(cam, pos), 4) + " "
+			+ QUEN_V(pos) + " " + FloatToStringPrec(thing.GetHeading(), 4) + " " + QUEN_V(head) + " " + QUEN_V(torso) + "|"
+			+ StrLeft(StrReplaceAll(thing.GetDisplayName(), "|", "/"), 80) + "|" + entity;
+	}
+	return text;
+}
+
+// scene.ground, n = range radius search, then x y z per point: the navmesh z within range of z (NavigationComputeZ, flag
+// 1), a StaticTrace down from z + range to z - range over QUEN_Groups (flag 2: its hit and normal), GetWaterLevel and
+// GetWaterDepth at the point, then from the navmesh z with radius above 0 NavigationCircleTest (flag 8, free 4) and with
+// search above 0 NavigationFindSafeSpot with radius as its personal space (flag 16): "<n>", then per point "|<flags>
+// <navmesh z> <hit x y z> <normal x y z> <water level> <water depth> <safe spot x y z>".
+function QUENRPC_Ground(n : array<float>) : string
+{
+	var world : CWorld;
+	var groups : array<name>;
+	var p, a, b, on, hit, normal, safe : Vector;
+	var navZ, level, depth : float;
+	var i, flags : int;
+	var text : string;
+
+	world = theGame.GetWorld();
+	groups = QUEN_Groups();
+	text = IntToString((n.Size() - 3) / 3);
+	for (i = 3; i + 2 < n.Size(); i += 3)
+	{
+		p = Vector(n[i], n[i + 1], n[i + 2], 1.0);
+		flags = 0;
+		navZ = 0;
+		if (world.NavigationComputeZ(p, p.Z - n[0], p.Z + n[0], navZ))
+			flags += 1;
+		a = p;
+		a.Z += n[0];
+		b = p;
+		b.Z -= n[0];
+		hit = Vector(0, 0, 0, 1.0);
+		normal = Vector(0, 0, 0, 0);
+		if (world.StaticTrace(a, b, hit, normal, groups))
+			flags += 2;
+		level = world.GetWaterLevel(p);
+		depth = world.GetWaterDepth(p);
+		on = p;
+		if (flags % 2 == 1)
+			on.Z = navZ;
+		if (n[1] > 0 && flags % 2 == 1)
+		{
+			flags += 8;
+			if (world.NavigationCircleTest(on, n[1]))
+				flags += 4;
+		}
+		safe = Vector(0, 0, 0, 1.0);
+		if (n[2] > 0 && world.NavigationFindSafeSpot(on, n[1], n[2], safe))
+			flags += 16;
+		text += "|" + IntToString(flags) + " " + FloatToStringPrec(navZ, 4) + " " + QUEN_V(hit) + " " + QUEN_V(normal) + " "
+			+ FloatToStringPrec(level, 4) + " " + FloatToStringPrec(depth, 4) + " " + QUEN_V(safe);
+	}
+	return text;
+}
+
+// scene.ray, n = radius then ax ay az bx by bz per segment: a StaticTrace from a to b over QUEN_Groups, or with radius
+// above 0 a SweepTest of that radius: "<n>", then per segment "|<flags> <hit x y z> <normal x y z> <distance from a>",
+// flag 1 a hit.
+function QUENRPC_Ray(n : array<float>) : string
+{
+	var world : CWorld;
+	var groups : array<name>;
+	var a, b, hit, normal : Vector;
+	var i : int;
+	var hitOk : bool;
+	var text : string;
+
+	world = theGame.GetWorld();
+	groups = QUEN_Groups();
+	text = IntToString((n.Size() - 1) / 6);
+	for (i = 1; i + 5 < n.Size(); i += 6)
+	{
+		a = Vector(n[i], n[i + 1], n[i + 2], 1.0);
+		b = Vector(n[i + 3], n[i + 4], n[i + 5], 1.0);
+		hit = Vector(0, 0, 0, 1.0);
+		normal = Vector(0, 0, 0, 0);
+		if (n[0] > 0)
+			hitOk = world.SweepTest(a, b, n[0], hit, normal, groups);
+		else
+			hitOk = world.StaticTrace(a, b, hit, normal, groups);
+		if (hitOk)
+			text += "|1 ";
+		else
+			text += "|0 ";
+		text += QUEN_V(hit) + " " + QUEN_V(normal) + " " + FloatToStringPrec(VecDistance(a, hit), 4);
+	}
+	return text;
+}
+
+// nav.line, n = width then ax ay az bx by bz per segment: NavigationLineTest (flag 1), NavigationClearLineInDirection
+// (flag 2: it returned true; its point either way) and NavigationClosestObstacleToLine, each with width as its radius:
+// "<n>", then per segment "|<flags> <point x y z> <obstacle distance>".
+function QUENRPC_Nav(n : array<float>) : string
+{
+	var world : CWorld;
+	var a, b, reach, onLine, onGeometry : Vector;
+	var i, flags : int;
+	var edge : float;
+	var text : string;
+
+	world = theGame.GetWorld();
+	text = IntToString((n.Size() - 1) / 6);
+	for (i = 1; i + 5 < n.Size(); i += 6)
+	{
+		a = Vector(n[i], n[i + 1], n[i + 2], 1.0);
+		b = Vector(n[i + 3], n[i + 4], n[i + 5], 1.0);
+		flags = 0;
+		if (world.NavigationLineTest(a, b, n[0]))
+			flags += 1;
+		reach = a;
+		if (world.NavigationClearLineInDirection(a, b, n[0], reach))
+			flags += 2;
+		edge = world.NavigationClosestObstacleToLine(a, b, n[0], onLine, onGeometry);
+		text += "|" + IntToString(flags) + " " + QUEN_V(reach) + " " + FloatToStringPrec(edge, 4);
+	}
+	return text;
+}
+
 // The photo-mode camera's own pose: the read-back of a set.
 function QUENRPC_PhotoPose() : string
 {
@@ -935,6 +1245,47 @@ function QUENRPC_PhotoPose() : string
 				cls = WNB_StringToName(args);
 			QUEN_Reply(handle, true, "the actors near the player, nearest first",
 				QUENRPC_Actors(count, StringToFloat(head), item, cls));
+			return;
+
+		case "scene.frame":
+		case "scene.ground":
+		case "scene.ray":
+		case "nav.line":
+			// Read only, from quen-w3 0.1.13; the ASI checked the numbers' count and range. scene.frame's id is its last
+			// number, read whole (a float holds no 32-bit int).
+			if (!thePlayer)
+			{
+				QUEN_Reply(handle, false, "no player (not in a game session)", "");
+				return;
+			}
+			QUENRPC_Numbers(args, n);
+			if (verb == "scene.frame")
+				text = QUENRPC_Frame(n, StringToInt(StrAfterLast(args, " ")));
+			else if (verb == "scene.ground")
+				text = QUENRPC_Ground(n);
+			else if (verb == "scene.ray")
+				text = QUENRPC_Ray(n);
+			else
+				text = QUENRPC_Nav(n);
+			QUEN_Reply(handle, true, verb + " read", text);
+			return;
+
+		case "cam.noclip":
+			// 1: no-clip on until photo mode's menu closes (QUEN_NoclipBack); 0: back to the menu's setting now.
+			if (!photo)
+			{
+				QUEN_Reply(handle, false, "cam.noclip needs photo mode: it sets the photo-mode camera", "");
+				return;
+			}
+			if (args == "1")
+			{
+				GetPhotomodeCamera().SetNoclip(true);
+				quenNoclip = true;
+				QUEN_Reply(handle, true, "no-clip on until photo mode closes; its menu's Noclip doesn't show it", "");
+				return;
+			}
+			QUEN_NoclipBack();
+			QUEN_Reply(handle, true, "no-clip as photo mode's menu has it", "");
 			return;
 
 		case "notice":

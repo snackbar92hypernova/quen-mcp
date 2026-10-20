@@ -4,8 +4,10 @@
 // W3_QUEN_TOKEN in its environment: W3Quen.log, and W3QuenState.log with the game state modQuen sends. It serves a pipe
 // only with a valid W3_QUEN_TOKEN and W3_QUEN_PID (quen's own pid): \\.\pipe\quen-w3-<token>, JSON lines as in
 // quen-core's protocol.rs, one client at a time, that pid and the current user only. Otherwise QUEN_Next always returns
-// "". Outside a tracy launch it reads no exe address: the WNB API version is the only gate. In a tracy launch (quen sets
-// W3_QUEN_TRACY=1 beside the token) it also hooks witcher3.exe 5.01's functions for Tracy (trace.h).
+// "". Outside a tracy launch it changes no exe code and reads no exe address but for the exec verb (from 0.1.13): before
+// each one it checks the exe's PE stamp and the console executor's 16 entry bytes (hooks.inc's W3_CALL row), then calls
+// it from QUEN_Next on the game thread. In a tracy launch (quen sets W3_QUEN_TRACY=1 beside the token) it also hooks
+// witcher3.exe 5.01's functions for Tracy (trace.h).
 // The static import of WitcherNativeBridge.asi makes Windows load and initialise it before this module.
 #define NOMINMAX
 #include <windows.h>
@@ -32,7 +34,7 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.12";
+constexpr char kVersion[] = "0.1.13";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -50,10 +52,39 @@ constexpr uint64_t kMaxItemCount = 1000;
 constexpr float kMaxActorsRadius = 100;
 constexpr uint64_t kMaxActors = 50;
 
+// protocol.rs's MAX_FRAME, MAX_QUERIES, MAX_GROUND_*, MAX_SWEEP_RADIUS, MAX_NAV_WIDTH and sweep.rs's MAX_COORD: the scene
+// verbs' caps, from quen-w3 0.1.13 (16 entities with 3 rays each, 16 points or segments: the runner design's 64 rays and
+// 16 queries a tick).
+constexpr uint64_t kMaxFrame = 16;
+constexpr size_t kMaxQueries = 16;
+constexpr float kMaxGroundRange = 100, kMaxGroundSearch = 50, kMaxGroundRadius = 10, kMaxSweepRadius = 2,
+                kMaxNavWidth = 5, kMaxCoord = 100000;
+// protocol.rs's MAX_EXEC_ARGS, MAX_EXEC_ARG_BYTES and MAX_EXEC_LINE_BYTES, from quen-w3 0.1.13.
+constexpr size_t kMaxExecArgs = 8, kMaxExecArg = 100, kMaxExecLine = 512;
+
 // trace.rs's plain_name: world.actors' tag and class, from quen-w3 0.1.12: 1 to 64 letters, digits and _.
 static bool PlainName(std::string_view s) {
   return !s.empty() && s.size() <= 64 &&
          std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
+}
+
+// protocol.rs's exec_arg and exec_line: an argument is printable ASCII without a quote (the console's tokenizer ends a
+// quoted token at either), passed bare when the tokenizer reads it whole, else in "; the line is function(a, b).
+static bool ExecArg(std::string_view a) {
+  return a.size() <= kMaxExecArg &&
+         std::all_of(a.begin(), a.end(), [](unsigned char c) { return c >= 0x20 && c < 0x7f && c != '"' && c != '\''; });
+}
+static std::string ExecLine(std::string_view function, const std::vector<std::string>& args) {
+  std::string line(function);
+  line += '(';
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    const bool bare = !a.empty() && std::all_of(a.begin(), a.end(), [](unsigned char c) {
+      return std::isalnum(c) || c == '_' || c == '.' || c == '+' || c == '-';
+    });
+    line += (i ? ", " : "") + (bare ? a : '"' + a + '"');
+  }
+  return line + ')';
 }
 // photo.grade's sliders, in modQuen's QUEN_Grade order, as protocol.rs names them.
 constexpr const char* kGrade[] = {"exposure", "contrast", "highlights", "saturation", "temperature", "vignette", "grain",
@@ -83,6 +114,7 @@ static uint64_t g_polls;  // QUEN_Next calls so far
 static ULONGLONG g_first_poll;  // the GetTickCount64 of the first
 static HANDLE g_wake;     // auto-reset: the outbox has lines
 static bool g_queued;
+static int g_flags = -1;          // the last QUEN_State flags (-1: none yet): the exec verb's gate
 static bool g_token;              // W3_QUEN_TOKEN is set: the two logs are written
 static std::atomic<FILE*> g_log;  // W3Quen.log next to witcher3.exe
 // The game thread's only (QUEN_Next, QUEN_CamAt): the path of the last cam.path handed to the script, which plays the
@@ -466,14 +498,14 @@ static void SendLocked(std::string line) {
 // ---- requests: a flat JSON object, checked as quen-core's decode_request checks it ----
 
 struct Value {
-  enum Kind { kString, kNumber, kBool, kNull, kArray } kind = kNull;
+  enum Kind { kString, kNumber, kBool, kNull, kArray, kTexts } kind = kNull;
   std::string text;                // a string, or a number's JSON text
   bool flag = false;               // a bool
-  std::vector<std::string> items;  // an array's numbers, or flat objects (cam.path's keys), as JSON text
+  std::vector<std::string> items;  // an array's numbers or flat objects (cam.path's keys) as JSON text; kTexts: strings
 };
 
-// A request's flat object holds strings, numbers, bools, null and arrays of numbers; only an array may hold objects,
-// themselves flat, and no deeper.
+// A request's flat object holds strings, numbers, bools, null and arrays of numbers or of strings (exec's args, from
+// 0.1.13: kTexts); only an array may hold objects, themselves flat, and no deeper.
 struct Parser {
   std::string_view s;
   size_t i = 0;
@@ -590,6 +622,14 @@ struct Parser {
     if (Eat('[')) {
       v.kind = Value::kArray;
       if (Eat(']')) return true;
+      Ws();
+      if (i < s.size() && s[i] == '"') {  // strings only, none of another kind
+        v.kind = Value::kTexts;
+        do {
+          if (!String(v.items.emplace_back())) return false;
+        } while (Eat(','));
+        return Eat(']');
+      }
       do {
         Ws();
         const size_t start = i;
@@ -727,6 +767,24 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     }
     return true;
   };
+  // A number field from lo to hi.
+  const auto number = [&](const char* key, float lo, float hi, float& out) {
+    Value v;
+    return take(key, Value::kNumber, v) && ParseFloat(v.text, out) && out >= lo && out <= hi;
+  };
+  // An array of numbers in whole groups of `per`, 1 to `groups` of them, each below kMaxCoord in size: " x y z ...".
+  const auto coords = [&](const char* key, size_t per, size_t groups, std::string& out) {
+    Value v;
+    if (!take(key, Value::kArray, v) || v.items.empty() || v.items.size() % per || v.items.size() / per > groups)
+      return false;
+    out.clear();
+    for (const std::string& t : v.items) {
+      float x;
+      if (!ParseFloat(t, x) || !(std::abs(x) < kMaxCoord)) return false;
+      out += ' ' + Fixed(x);
+    }
+    return true;
+  };
   const auto name = [&](const char* key) {
     Value v;
     if (!take(key, Value::kString, v) || v.text.empty()) return false;
@@ -798,6 +856,48 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
       names += ' ' + (given.text.empty() ? std::string("-") : given.text);
     }
     cmd.args = ' ' + std::to_string(n) + ' ' + Fixed(radius) + (names == " - -" ? "" : names);
+  } else if (v == "scene.frame") {
+    // "<radius> <max> <points> <at 0|1> <ax> <ay> <az> <id 0|1> <id>": the id as a whole number, last (the script reads
+    // it with StringToInt: a float can't hold every int).
+    float radius = 0;
+    uint64_t max = 0, points = 0;
+    std::string at = " 0 0 0 0", id = " 0 0";
+    ok = number("radius", 0, kMaxActorsRadius, radius) && radius > 0 && whole("max", kMaxFrame, max) && max > 0 &&
+         whole("points", 3, points);
+    if (ok && fields.contains("at")) ok = coords("at", 3, 1, at) && (at = " 1" + at, true);
+    Value e;
+    int32_t entity = 0;
+    if (ok && fields.contains("entity_id")) {
+      ok = take("entity_id", Value::kNumber, e);
+      const auto [end, ec] = std::from_chars(e.text.data(), e.text.data() + e.text.size(), entity);
+      ok = ok && ec == std::errc() && end == e.text.data() + e.text.size();
+      id = " 1 " + std::to_string(entity);
+    }
+    cmd.args = ' ' + Fixed(radius) + ' ' + std::to_string(max) + ' ' + std::to_string(points) + at + id;
+  } else if (v == "scene.ground") {
+    // "<range> <radius> <search>", then x y z per point.
+    float range = 0, radius = 0, search = 0;
+    std::string xyz;
+    ok = number("range", 0, kMaxGroundRange, range) && range > 0 && number("radius", 0, kMaxGroundRadius, radius) &&
+         number("search", 0, kMaxGroundSearch, search) && coords("xyz", 3, kMaxQueries, xyz);
+    cmd.args = ' ' + Fixed(range) + ' ' + Fixed(radius) + ' ' + Fixed(search) + xyz;
+  } else if (v == "scene.ray" || v == "nav.line") {
+    // "<radius|width>", then ax ay az bx by bz per segment.
+    const bool ray = v == "scene.ray";
+    float r = 0;
+    std::string segments;
+    ok = number(ray ? "radius" : "width", 0, ray ? kMaxSweepRadius : kMaxNavWidth, r) &&
+         coords("segments", 6, kMaxQueries, segments);
+    cmd.args = ' ' + Fixed(r) + segments;
+  } else if (v == "exec") {
+    // Never to the script: QUEN_Next runs it (RunExec). args holds the line.
+    Value function, args;
+    ok = take("function", Value::kString, function) && PlainName(function.text);
+    if (ok && fields.contains("args") && !take("args", Value::kTexts, args))
+      ok = take("args", Value::kArray, args) && args.items.empty();
+    ok = ok && args.items.size() <= kMaxExecArgs && std::all_of(args.items.begin(), args.items.end(), ExecArg);
+    cmd.args = ExecLine(function.text, args.items);
+    ok = ok && cmd.args.size() <= kMaxExecLine;
   } else if (v == "photo.reset") {
     const char* parts[] = {"weather", "env", "grading"};
     int part = -1;
@@ -830,7 +930,7 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     // ponytail: day capped at the script's int range, a stricter limit than protocol.rs's u32
     ok = whole("day", INT32_MAX, n) && whole("hour", 23, hour);
     cmd.args = ' ' + std::to_string(n) + ' ' + std::to_string(hour);
-  } else if (v == "pause" || v == "photo.mode") {
+  } else if (v == "pause" || v == "photo.mode" || v == "cam.noclip") {
     Value on;
     ok = take("on", Value::kBool, on);
     cmd.args = on.flag ? " 1" : " 0";
@@ -843,7 +943,12 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
             "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
             "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes, an "
             "items.add name over 200 bytes or count outside 1 to 1000, a world.actors radius outside 0 (excluded) to 100, "
-            "max outside 1 to 50, or a tag or class other than 1 to 64 letters, digits and _)";
+            "max outside 1 to 50, a tag or class other than 1 to 64 letters, digits and _, a scene.frame radius outside 0 "
+            "(excluded) to 100, max outside 1 to 16, points outside 0 to 3 or entity_id not a whole number in int's range, "
+            "a scene.ground, scene.ray or nav.line without 1 to 16 points or segments of coordinates below 100000, a range "
+            "outside 0 (excluded) to 100, a radius outside 0 to 10 (scene.ray's: 0 to 2), a search outside 0 to 50, a width "
+            "outside 0 to 5, or an exec function other than 1 to 64 letters, digits and _, over 8 args, an arg over 100 "
+            "bytes or with a quote or a byte outside printable ASCII, or a line over 512 bytes)";
     return false;
   }
   if (!fields.empty()) {
@@ -882,9 +987,90 @@ static std::string ReadString(void* frame) {
   return {reinterpret_cast<const char*>(s.data), s.size - 1};
 }
 
-// import function QUEN_Next() : string;  "" or "<handle> <verb><args>"
+// ---- the exec verb (from 0.1.13): the game's console executor, called, never changed ----
+
+#define W3_CALL(NAME, RVA, BYTES) constexpr uint32_t k##NAME##Rva = RVA; constexpr char k##NAME##Bytes[] = BYTES;
+#include "hooks.inc"
+#undef W3_CALL
+
+// The engine's narrow string as the executor takes it: {char* data; u32 size counting the NUL} (witcher3-mods re
+// notes/console_exec.md); the second u32 is padding the struct has anyway, zeroed.
+struct EngineString {
+  const char* data;
+  uint32_t size, pad;
+};
+// RemoteConsole_RunCommand(rcx unused, rdx the line, r8 out: the main thread's log lines during the call, engine
+// allocated): true when it found the exec function and called it.
+using RunCommand = bool (*)(void*, const EngineString*, EngineString*);
+
+// Why the executor can't be called now, or "": quen's state shows no game loaded, a fade or a load (a function using
+// thePlayer would find none), the exe isn't 5.01 (its PE stamp), or its 16 entry bytes aren't 5.01's (another mod
+// patched it). Reads the exe's headers and the 16 bytes only.
+static std::string ExecGate(int flags) {
+  if (flags < 0 || !(flags & 1) || (flags & 256))
+    return "quen's state shows no loaded game (" + (flags < 0 ? std::string("no state yet") : "flags " + std::to_string(flags)) +
+           "): exec runs only with a game loaded and no fade or load";
+  const auto base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  char hex[64];
+  if (nt->FileHeader.TimeDateStamp != trace::kTimeDateStamp) {
+    snprintf(hex, sizeof hex, "0x%08lX", static_cast<unsigned long>(nt->FileHeader.TimeDateStamp));
+    return std::string("the exe's PE stamp is ") + hex + ", not witcher3.exe 5.01's: the executor's address is 5.01's";
+  }
+  if (kRemoteConsole_RunCommandRva + 16 > nt->OptionalHeader.SizeOfImage) return "the executor's RVA is outside the image";
+  const uint8_t* live = base + kRemoteConsole_RunCommandRva;
+  if (memcmp(live, kRemoteConsole_RunCommandBytes, 16)) {
+    std::string got;
+    for (int k = 0; k < 16; ++k) {
+      snprintf(hex, sizeof hex, "%s%02x", k ? " " : "", live[k]);
+      got += hex;
+    }
+    return "the console executor's 16 entry bytes (RVA 0x24DD370) are " + got +
+           ", not witcher3.exe 5.01's: another mod changed it, nothing called";
+  }
+  return "";
+}
+
+// Runs an exec command on the game thread, from QUEN_Next (the script VM is re-entrant: natives raise script events):
+// the reply says whether the executor called the function, with the line and the log it captured (at most 4 KiB here;
+// the engine's capture stops at 2000 characters).
+static void RunExec(const Command& cmd) {
+  int flags;
+  {
+    std::lock_guard lock(g_mutex);
+    flags = g_flags;
+  }
+  if (const std::string why = ExecGate(flags); !why.empty()) {
+    Log("id %llu: exec refused: %s", cmd.id, why.c_str());
+    std::lock_guard lock(g_mutex);
+    SendLocked(ReplyLine(cmd.id, false, "refused: " + why));
+    return;
+  }
+  const EngineString in{cmd.args.c_str(), uint32_t(cmd.args.size() + 1), 0};
+  EngineString out{};
+  const auto run = reinterpret_cast<RunCommand>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) +
+                                                kRemoteConsole_RunCommandRva);
+  const bool called = run(nullptr, &in, &out);
+  // ponytail: the engine's string is leaked (its free function isn't pinned), as WNB's reply strings are: <= 2 KB a call.
+  std::string log = out.data && out.size > 1 ? std::string(out.data, std::min<size_t>(out.size - 1, 4096)) : "";
+  if (!ValidUtf8(log))
+    for (char& c : log)
+      if (static_cast<unsigned char>(c) >= 0x80) c = '?';
+  Log("id %llu: exec %s: %s", cmd.id, cmd.args.c_str(), called ? "called" : "not called");
+  const std::string data = "{\"line\":" + Quote(cmd.args) + ",\"log\":" + Quote(log) + '}';
+  const std::string text = called ? "called " + cmd.args
+                                  : "the game called nothing: no exec function of that name (names are case-sensitive), "
+                                    "or more arguments than it takes, or a required one missing";
+  std::lock_guard lock(g_mutex);
+  SendLocked(ReplyLine(cmd.id, called, text, data));
+}
+
+// import function QUEN_Next() : string;  "" or "<handle> <verb><args>". An exec command never reaches the script: it
+// runs here, outside the lock, and the script gets "" this tick.
 static void Next(void*, void* frame, void* result) {
   std::string line;
+  Command exec;
+  bool has_exec = false;
   {
     std::lock_guard lock(g_mutex);
     if (++g_polls == 1) g_first_poll = GetTickCount64();
@@ -894,7 +1080,7 @@ static void Next(void*, void* frame, void* result) {
       g_current = {};
     }
     const ULONGLONG now = GetTickCount64();
-    while (!g_inbox.empty() && line.empty()) {
+    while (!g_inbox.empty() && line.empty() && !has_exec) {
       Command cmd = std::move(g_inbox.front());
       g_inbox.pop_front();
       if (now - cmd.arrived > cmd.ttl_ms) {
@@ -902,6 +1088,11 @@ static void Next(void*, void* frame, void* result) {
         SendLocked(ReplyLine(cmd.id, false, "expired: waited " + std::to_string(now - cmd.arrived) + " ms, ttl " +
                                                 std::to_string(cmd.ttl_ms) +
                                                 " ms (the game doesn't poll at the main menu)"));
+        continue;
+      }
+      if (cmd.verb == "exec") {
+        exec = std::move(cmd);
+        has_exec = true;
         continue;
       }
       cmd.handle = g_next_handle;
@@ -915,9 +1106,77 @@ static void Next(void*, void* frame, void* result) {
       g_current = std::move(cmd);
     }
   }
+  if (has_exec) RunExec(exec);
   std::wstring wide(line.size(), L'\0');  // UTF-8 never takes more UTF-16 units than bytes
   wide.resize(line.empty() ? 0 : MultiByteToWideChar(CP_UTF8, 0, line.data(), int(line.size()), wide.data(), int(wide.size())));
   WNB_ReturnString(frame, result, wide.c_str(), uint32_t(wide.size()));
+}
+
+static std::string Vec3(const float* v) { return '[' + Number(v[0]) + ',' + Number(v[1]) + ',' + Number(v[2]) + ']'; }
+
+// "<n>" then n records "|<flags> <k numbers>", flags at most max_flags and n at most kMaxQueries: each record's flags and
+// numbers, or false.
+static bool Records(std::string_view data, size_t k, uint64_t max_flags,
+                    std::vector<std::pair<uint64_t, std::vector<float>>>& out) {
+  const std::vector<std::string_view> part = Split(data, '|');
+  uint64_t n = 0;
+  if (!Whole(part[0], kMaxQueries, n) || part.size() != n + 1) return false;
+  for (size_t r = 1; r < part.size(); ++r) {
+    const std::vector<std::string_view> t = Split(part[r], ' ');
+    auto& [flags, v] = out.emplace_back();
+    if (t.size() != k + 1 || !Whole(t[0], max_flags, flags)) return false;
+    v.resize(k);
+    for (size_t i = 0; i < k; ++i)
+      if (!ParseFloat(t[i + 1], v[i])) return false;
+  }
+  return true;
+}
+
+// scene.frame's read-back (modQuen's QUENRPC_Frame): "<found> <camera x y z pitch yaw roll fov>", then per entity
+// "|<flags> <id> <x> <y> <share> <distance> <pos x y z> <heading> <head x y z> <torso x y z>|<name>|<entity>", flags 1
+// its centre in front of the camera (x, y valid), 2 its whole box in front, 4 the player, 8 a head bone, 16 a torso
+// bone, 32/64/128 a clear ray to the head/torso/origin, 256/512/1024 that ray cast, 2048 the entity name cut, 4096 the
+// actor's IsInView() ->
+// {"found":..,"camera":{"pos":[..],"rot":[..],"fov":..},"entities":[{"id":..,"name":..,"entity":..,"entity_cut":..,
+// "player":..,"pos":[..],"heading":..,"head":[..] or null,"torso":[..] or null,"in_front":..,"in_view":..,"x":.. or null,"y":.. or
+// null,"share":..,"box_whole":..,"distance":..,"visible":{"head":..,"torso":..,"origin":..},"visible_points":..}]},
+// each visible one null where its ray wasn't cast.
+static bool FrameJson(std::string_view data, std::string& json) {
+  const std::vector<std::string_view> part = Split(data, '|');
+  const std::vector<std::string_view> head = Split(part[0], ' ');
+  uint64_t found = 0;
+  float c[7];
+  if (head.size() != 8 || !Whole(head[0], INT32_MAX, found) || (part.size() - 1) % 3 || (part.size() - 1) / 3 > kMaxFrame)
+    return false;
+  for (int k = 0; k < 7; ++k)
+    if (!ParseFloat(head[k + 1], c[k])) return false;
+  std::string out = "{\"found\":" + std::to_string(found) + ",\"camera\":{\"pos\":" + Vec3(c) + ",\"rot\":" + Vec3(c + 3) +
+                    ",\"fov\":" + Number(c[6]) + "},\"entities\":[";
+  for (size_t a = 1; a < part.size(); a += 3) {
+    const std::vector<std::string_view> t = Split(part[a], ' ');
+    uint64_t flags = 0;
+    int32_t id = 0;
+    float f[14];
+    if (t.size() != 16 || !Whole(t[0], 8191, flags)) return false;
+    if (const auto [end, ec] = std::from_chars(t[1].data(), t[1].data() + t[1].size(), id);
+        ec != std::errc() || end != t[1].data() + t[1].size())
+      return false;
+    for (int k = 0; k < 14; ++k)
+      if (!ParseFloat(t[k + 2], f[k])) return false;
+    const auto flag = [&](uint64_t bit) { return std::string(flags & bit ? "true" : "false"); };
+    const auto seen = [&](uint64_t cast, uint64_t clear) { return flags & cast ? flag(clear) : std::string("null"); };
+    const int points = ((flags & 32) != 0) + ((flags & 64) != 0) + ((flags & 128) != 0);
+    out += std::string(a > 1 ? "," : "") + "{\"id\":" + std::to_string(id) + ",\"name\":" + Quote(part[a + 1]) +
+           ",\"entity\":" + Quote(part[a + 2]) + ",\"entity_cut\":" + flag(2048) + ",\"player\":" + flag(4) +
+           ",\"pos\":" + Vec3(f + 4) + ",\"heading\":" + Number(f[7]) + ",\"head\":" + (flags & 8 ? Vec3(f + 8) : "null") +
+           ",\"torso\":" + (flags & 16 ? Vec3(f + 11) : "null") + ",\"in_front\":" + flag(1) + ",\"in_view\":" + flag(4096) +
+           ",\"x\":" + (flags & 1 ? Number(f[0]) : "null") + ",\"y\":" + (flags & 1 ? Number(f[1]) : "null") +
+           ",\"share\":" + Number(f[2]) + ",\"box_whole\":" + flag(2) + ",\"distance\":" + Number(f[3]) +
+           ",\"visible\":{\"head\":" + seen(256, 32) + ",\"torso\":" + seen(512, 64) + ",\"origin\":" + seen(1024, 128) +
+           "},\"visible_points\":" + std::to_string(points) + '}';
+  }
+  json = out + "]}";
+  return true;
 }
 
 // The script's read-back as reply data: listsaves and photo.list "a|b|c" (no file name, weather name or env path holds a
@@ -933,7 +1192,11 @@ static void Next(void*, void* frame, void* result) {
 // "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..,"entity_cut":..,"id":..,"actor":..}]};
 // the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
 // {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
-// "world_weather":..}.
+// "world_weather":..}; scene.frame as FrameJson says; scene.ground, scene.ray and nav.line (from 0.1.13; modQuen's
+// QUENRPC_Ground, QUENRPC_Ray, QUENRPC_Nav) "<n>" then per point or segment "|<flags> <numbers>" -> an array, null where
+// the flags say none: [{"nav_z":..,"ground":{"pos":[..],"normal":[..]},"water_level":..,"water_depth":..,"free":..,
+// "safe":[..]}] (flags 1 nav_z, 2 ground, 4 free, 8 circle tested, 16 safe), [{"hit":..,"pos":[..],"normal":[..],
+// "distance":..}] (1 hit), [{"clear":..,"clear_in_direction":..,"reach":[..],"edge_m":..}] (1 clear, 2 in direction).
 static bool DataJson(const std::string& verb, std::string_view data, std::string& json) {
   if (verb == "listsaves" || verb == "photo.list") {
     json = "[";
@@ -971,6 +1234,34 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
               ",\"actor\":" + (flags & 256 ? "false" : "true") + '}';
     }
     json = out + "]}";
+    return true;
+  }
+  if (verb == "scene.frame") return FrameJson(data, json);
+  if (verb == "scene.ground" || verb == "scene.ray" || verb == "nav.line") {
+    const bool ground = verb == "scene.ground", ray = verb == "scene.ray";
+    std::vector<std::pair<uint64_t, std::vector<float>>> rec;
+    if (!Records(data, ground ? 12 : ray ? 7 : 4, ground ? 31 : ray ? 1 : 3, rec)) return false;
+    std::string out = "[";
+    for (const auto& [flags, f] : rec) {
+      out += out.size() > 1 ? ",{" : "{";
+      if (ground) {
+        out += "\"nav_z\":" + (flags & 1 ? Number(f[0]) : "null") + ",\"ground\":" +
+               (flags & 2 ? "{\"pos\":" + Vec3(&f[1]) + ",\"normal\":" + Vec3(&f[4]) + '}' : "null") +
+               ",\"water_level\":" + Number(f[7]) + ",\"water_depth\":" + Number(f[8]) +
+               ",\"free\":" + (flags & 8 ? (flags & 4 ? "true" : "false") : "null") +
+               ",\"safe\":" + (flags & 16 ? Vec3(&f[9]) : "null");
+      } else if (ray) {
+        const bool hit = (flags & 1) != 0;
+        out += "\"hit\":" + std::string(hit ? "true" : "false") + ",\"pos\":" + (hit ? Vec3(&f[0]) : "null") +
+               ",\"normal\":" + (hit ? Vec3(&f[3]) : "null") + ",\"distance\":" + (hit ? Number(f[6]) : "null");
+      } else {
+        out += "\"clear\":" + std::string(flags & 1 ? "true" : "false") +
+               ",\"clear_in_direction\":" + (flags & 2 ? "true" : "false") + ",\"reach\":" + Vec3(&f[0]) +
+               ",\"edge_m\":" + Number(f[3]);
+      }
+      out += '}';
+    }
+    json = out + ']';
     return true;
   }
   const std::vector<std::string_view> t = Split(data, ' ');
@@ -1095,6 +1386,7 @@ static void State(void*, void* frame, void*) {
   WNB_ReturnVoid(frame);
   if (!g_token) return;
   std::lock_guard lock(g_mutex);
+  g_flags = flags;
   static FILE* const log = OpenBesideExe(L"W3QuenState.log");
   static unsigned pushes = 0;
   if (++pushes == 1)

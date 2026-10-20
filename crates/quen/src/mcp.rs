@@ -25,7 +25,7 @@ use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
     camera, capture, channel, config, data, disk, doctor, focus, game, hands, ledger, measure, mem,
-    photo, save, setup,
+    photo, save, scene, setup,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -38,7 +38,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// sets another for its client; 0 waits for every call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 16] = [
+const LONG: [&str; 17] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -53,15 +53,17 @@ const LONG: [&str; 16] = [
     "mem_find",
     "mem_patch_instances",
     "sweep_play",
+    "game_frame",
     "data_scan",
     "script_compile",
 ];
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
 /// every unannotated call). Their own files there count as nothing changed: ledger_query's and mem_diff's spill files,
-/// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors and
-/// game_listsaves read through the game's channel; game_scriptlog reads the game's script log.
-const READ_ONLY: [&str; 22] = [
+/// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors,
+/// world_frame, world_ground, world_ray, world_nav and game_listsaves read through the game's channel; game_scriptlog
+/// reads the game's script log.
+const READ_ONLY: [&str; 26] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -72,6 +74,10 @@ const READ_ONLY: [&str; 22] = [
     "job_status",
     "world_get",
     "world_actors",
+    "world_frame",
+    "world_ground",
+    "world_ray",
+    "world_nav",
     "game_listsaves",
     "game_scriptlog",
     "mem_read",
@@ -920,6 +926,7 @@ pub(crate) fn tools() -> Value {
     list.extend(channel::tools());
     list.push(capture::tool());
     list.extend(camera::tools());
+    list.extend(scene::tools());
     list.push(photo::tool());
     list.extend(measure::tools());
     list.extend(mem::tools());

@@ -19,6 +19,7 @@ pub mod park; // park planner and never-park list
 pub mod protocol; // command-channel JSON lines
 pub mod reshade; // ReShade-style ini edits, byte-identical to the harness's ini_writer
 pub mod saves; // gamesaves snapshots, the guard, the quiet wait and the backup copy
+pub mod scene; // placement: the camera pose that frames a subject from a side, the yaw that faces a point
 pub mod seeds; // names.tsv -> REA seed file
 pub mod settings; // dx12user.settings overrides (W3_SETTINGS / W3_SECTION_SETTINGS semantics)
 pub mod stats; // PresentMon command line, CSV stats and the A/B verdict

@@ -397,12 +397,14 @@ impl Live {
 /// The calls `session_launch again` replays after its launch (finding 61), each as it succeeded: the agent's writes to
 /// the game that a fresh load undoes. Not keys (they act on whatever is in front), saves, pauses, memory patches (each
 /// the user's OK), sweeps, or reads ([`hands::user_may`]).
-const SETUP: [&str; 9] = [
+const SETUP: [&str; 11] = [
     "game_load",
     "game_teleport",
+    "game_place",
     "game_settime",
     "game_weather",
     "game_console",
+    "game_exec",
     "game_items",
     "game_cvar",
     "game_photo",
@@ -889,7 +891,7 @@ impl<'a> Session<'a> {
             "focus" => focus::call(self, call, args),
             "hands_take" => hands::take(self, call, args),
             "hands_give" => hands::give(self, call, args),
-            n @ ("world_get" | "world_actors") => game::call(self, call, n, args),
+            n if n.starts_with("world_") => game::call(self, call, n, args),
             n @ ("game_keys" | "game_console" | "game_load") => {
                 let done = game::call(self, call, n, args);
                 self.guard_after(call, done)
