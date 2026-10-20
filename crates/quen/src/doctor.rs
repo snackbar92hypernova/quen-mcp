@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.11: world.actors' entity up to 255 characters (0.1.10 cut it at 80), and entity_cut (finding 54).
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.11",
+        sha256: "7a54ad149cb4c339c6795798d3ca6a1b157f09954ce57327ddbd40e75fb08627",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.11",
+        sha256: "fd9622f088568ef45f1809773bd51a8b7a728ba7b0cd88de14ef0040a45fc957",
+        exact: true,
+    },
     // 0.1.10 adds the items.add and world.actors verbs (game_items, world_actors, channel.rs) to both files. Re-pinned
     // in place for world.actors: 0.1.10 was never published before this.
     Pin {
@@ -364,7 +377,7 @@ pub(crate) const PACKAGE: Dep = Dep {
         and (from quen-w3 0.1.2) sweep_play; from quen-w3 0.1.3, session_launch profiler tracy:NAME; from quen-w3 \
         0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
         quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo; from quen-w3 0.1.10, \
-        game_items and world_actors",
+        game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

@@ -1503,6 +1503,22 @@ impl<'a> Session<'a> {
         // The game is gone, so gamesaves is final: what it wrote since the launch, tainted saves first. The last
         // changes are the user's or unexpected, as the controls were at the end.
         let (changed, last) = live.unexpected();
+        // Findings 56, 62: a save the game deleted (its autosave rotation reaches the user's other playthroughs) has
+        // its own list, with quen's pre-launch copy; quen never writes it back.
+        let (gone, changed): (Vec<String>, Vec<String>) = changed
+            .into_iter()
+            .partition(|name| !live.saves.join(name).exists());
+        let copies = self.config().ok().map(|c| c.data_root.join("gamesaves"));
+        let deleted: Vec<Value> = gone
+            .iter()
+            .map(|name| {
+                let copy = copies
+                    .as_ref()
+                    .map(|d| d.join(name))
+                    .filter(|p| p.is_file());
+                json!({"file": name, "copy": copy})
+            })
+            .collect();
         let h = &live.handovers;
         let to = match self.shared.hands() {
             Some(Hands::User) => &h.user,
@@ -1527,8 +1543,8 @@ impl<'a> Session<'a> {
             })
             .collect();
         let quen: Vec<String> = live.quen_saves.borrow().keys().cloned().collect();
-        let saves = json!({"tainted": tainted, "changed": changed, "unexpected": unexpected, "quen": quen,
-            "user": user});
+        let saves = json!({"tainted": tainted, "changed": changed, "deleted": deleted, "unexpected": unexpected,
+            "quen": quen, "user": user});
         fields.insert("saves".into(), saves);
         // What the session left in the capture root, against the budget.
         if let Ok(config) = self.config() {
@@ -2259,6 +2275,41 @@ mod tests {
         assert_eq!(saves["unexpected"], json!(["ManualSave_m.sav"]), "{out}");
         let both = json!(["ManualSave_m.sav", "ManualSave_q.sav"]);
         assert_eq!(saves["changed"], both, "{out}");
+        assert_eq!(saves["deleted"], json!([]), "{out}");
+    }
+
+    /// Findings 56, 62: a save the game deleted during the boot is listed under deleted, not changed, with quen's
+    /// pre-launch copy when there is one; quen writes nothing back.
+    #[test]
+    fn the_end_lists_a_save_the_game_deleted_with_quens_copy() {
+        let fx = crate::game::tests::Fake::new("end-deleted");
+        let mut session = fx.session();
+        let dir = fx.dir.join("gamesaves");
+        let copies = fx.dir.join("data").join("gamesaves");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&copies).unwrap();
+        for name in ["AutoSave_old.sav", "AutoSave_nocopy.sav"] {
+            fs::write(dir.join(name), "the user's").unwrap();
+        }
+        fs::write(copies.join("AutoSave_old.sav"), "the user's").unwrap();
+        session.live.as_mut().unwrap().saves_before = saves::snapshot(&dir);
+        for name in ["AutoSave_old.sav", "AutoSave_nocopy.sav"] {
+            fs::remove_file(dir.join(name)).unwrap();
+        }
+        fs::write(dir.join("AutoSave_new.sav"), "this boot's").unwrap();
+        let mut call = session.call(Conn::nobody(), Value::Null, None);
+        let done = session.end(&mut call, &json!({"token": "tok"}));
+        let out = session.envelope("session_end", call, done);
+        let saves = &out["saves"];
+        assert_eq!(saves["changed"], json!(["AutoSave_new.sav"]), "{out}");
+        let copy = copies.join("AutoSave_old.sav");
+        let want = json!([{"file": "AutoSave_nocopy.sav", "copy": null}, {"file": "AutoSave_old.sav", "copy": copy}]);
+        assert_eq!(saves["deleted"], want, "{out}");
+        assert_eq!(saves["unexpected"], json!([]), "{out}");
+        assert!(
+            !dir.join("AutoSave_old.sav").exists(),
+            "quen wrote a save back"
+        );
     }
 
     /// In a play session the user's saves are allowed (the guard passes while they have the controls, and a hand-over

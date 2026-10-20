@@ -162,6 +162,7 @@ fn settings_overrides() {
     let lit = "Key=1\nKeyX=2\n Indented=3\nkey=4\nA.B=5\nSpaced = 6\nA*=7\n";
     let bom = b"\xef\xbb\xbfAllowFG=true\r\nX=1\r\n";
     let template = "Python's section replace reads the value as a regex template";
+    let appended = "the harness refuses a missing section, quen appends it (finding 63)";
     let c = |name, data: &[u8], flat: &str, sections: &str, known| Case {
         name,
         input: json!({"data": latin1(data), "flat": flat, "sections": sections}),
@@ -261,7 +262,7 @@ fn settings_overrides() {
         ),
         c("sec_insert_header_only", b"[B]\r\n", "", "B:Y=2", None),
         c("sec_last_line_no_eol", b"[S]\nA=1", "", "S:A=2", None),
-        c("sec_missing", lf, "", "Missing:A=1", None),
+        c("sec_missing", lf, "", "Missing:A=1", Some(appended)),
         c("sec_other_case", lf, "", "rendering:A=1", None),
         c(
             "sec_header_trailing_space",
@@ -352,7 +353,7 @@ fn settings_overrides() {
             crlf,
             "AllowFG=false",
             "Nope:A=1",
-            None,
+            Some(appended),
         ),
         c(
             "flat_bad_sections_ok",
@@ -362,7 +363,7 @@ fn settings_overrides() {
             None,
         ),
         c("empty_file_flat", b"", "A=1", "", None),
-        c("empty_file_section", b"", "", "A:B=1", None),
+        c("empty_file_section", b"", "", "A:B=1", Some(appended)),
     ];
     parity(
         "settings",

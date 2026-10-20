@@ -1,6 +1,7 @@
 //! Byte-exact overrides of a Witcher 3 `dx12user.settings` (an INI-like file, CRLF or LF), with the semantics of
-//! the harness's `W3_SETTINGS` (flat) and `W3_SECTION_SETTINGS` (per section) switches. Every byte an override doesn't
-//! name stays identical. [`validate`] runs both on an in-memory copy: it is what runs before any backup.
+//! the harness's `W3_SETTINGS` (flat) and `W3_SECTION_SETTINGS` (per section) switches, except that a missing section
+//! is appended (the harness refuses it). Every byte an override doesn't name stays identical. [`validate`] runs both
+//! on an in-memory copy: it is what runs before any backup.
 
 use std::fmt;
 use std::ops::Range;
@@ -13,7 +14,8 @@ pub enum SettingsError {
     BadItem(String),
     /// A flat key must start exactly one line, as `Key=`.
     KeyCount { key: String, found: usize },
-    /// A section's header line `[Section]` must occur exactly once.
+    /// A section's header line `[Section]` must occur at most once; with none, no line may be the header but for case,
+    /// spaces, a BOM or its line break (`found` 0), since the game may read that one as the section.
     SectionCount { section: String, found: usize },
     /// A key may start at most one line of its section.
     KeyInSection {
@@ -36,7 +38,11 @@ impl fmt::Display for SettingsError {
                     "key {key:?} starts {found} lines, an override needs exactly 1"
                 )
             }
-            Self::SectionCount { section, found: 0 } => write!(f, "no section header [{section}]"),
+            Self::SectionCount { section, found: 0 } => write!(
+                f,
+                "no exact section header [{section}], only a near one (case, spaces, a BOM, no line break): \
+                 not added beside it"
+            ),
             Self::SectionCount { section, found } => {
                 write!(
                     f,
@@ -80,9 +86,10 @@ pub fn apply_flat(data: &[u8], spec: &str) -> Result<Vec<u8>, SettingsError> {
 }
 
 /// Applies a per-section spec `Section:Key=Value[;...]` in order. The header line `[Section]`, followed by its line
-/// break, must occur once; the section's body runs to the next line starting with `[`, or the end. A key already in the
-/// body (at most once) gets the new value; otherwise `Key=Value` goes on a new line right after the header, ending in
-/// CRLF if the file holds any CRLF, else LF.
+/// break, may occur once; the section's body runs to the next line starting with `[`, or the end. A key already in the
+/// body (at most once) gets the new value; otherwise `Key=Value` goes on a new line right after the header. A section
+/// the file lacks (a mod's menu group before its first run) is appended, header and key, unless a line is its header
+/// but for case, spaces, a BOM or its line break. New lines end in CRLF if the file holds any CRLF, else LF.
 pub fn apply_sections(data: &[u8], spec: &str) -> Result<Vec<u8>, SettingsError> {
     let mut out = data.to_vec();
     for item in items(spec, ';') {
@@ -93,15 +100,37 @@ pub fn apply_sections(data: &[u8], spec: &str) -> Result<Vec<u8>, SettingsError>
         }
         let (key, value) = key_value(item, kv)?;
         let header = format!("[{section}]");
+        let eol = if out.windows(2).any(|w| w == b"\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
         let all: Vec<Line> = lines(&out).collect();
         let heads: Vec<usize> = (0..all.len())
             .filter(|&i| all[i].eol && out[all[i].start..all[i].end] == *header.as_bytes())
             .collect();
-        let [head] = heads[..] else {
-            return Err(SettingsError::SectionCount {
-                section: section.into(),
-                found: heads.len(),
-            });
+        let head = match heads[..] {
+            [head] => head,
+            [] if !all.iter().any(|l| {
+                let text = &out[l.start..l.end];
+                text.strip_prefix(b"\xef\xbb\xbf")
+                    .unwrap_or(text)
+                    .trim_ascii()
+                    .eq_ignore_ascii_case(header.as_bytes())
+            }) =>
+            {
+                if !out.is_empty() && out.last() != Some(&b'\n') {
+                    out.extend_from_slice(eol.as_bytes());
+                }
+                out.extend_from_slice(format!("{header}{eol}{key}={value}{eol}").as_bytes());
+                continue;
+            }
+            _ => {
+                return Err(SettingsError::SectionCount {
+                    section: section.into(),
+                    found: heads.len(),
+                });
+            }
         };
         let hits: Vec<Range<usize>> = all[head + 1..]
             .iter()
@@ -110,11 +139,6 @@ pub fn apply_sections(data: &[u8], spec: &str) -> Result<Vec<u8>, SettingsError>
             .collect();
         match hits.as_slice() {
             [] => {
-                let eol = if out.windows(2).any(|w| w == b"\r\n") {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
                 let at = all[head].next;
                 out.splice(at..at, format!("{key}={value}{eol}").into_bytes());
             }
@@ -334,19 +358,41 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_section_is_appended() {
+        // Finding 63: a mod's menu group before its first run.
+        assert_eq!(
+            sections(LF, "NpcAvoid:Radius=8").unwrap(),
+            format!("{LF}[NpcAvoid]\nRadius=8\n")
+        );
+        assert_eq!(
+            sections(&crlf(LF), "NpcAvoid:Radius=8;NpcAvoid:On=1").unwrap(),
+            crlf(&format!("{LF}[NpcAvoid]\nOn=1\nRadius=8\n"))
+        );
+        // A last line without a break gets the file's break first; an empty file gets just the section.
+        assert_eq!(
+            sections("[A]\r\nX=1", "B:Y=2").unwrap(),
+            "[A]\r\nX=1\r\n[B]\r\nY=2\r\n"
+        );
+        assert_eq!(sections("", "A:B=1").unwrap(), "[A]\nB=1\n");
+    }
+
+    #[test]
     fn section_header_must_occur_once() {
         let none = |section: &str| SettingsError::SectionCount {
             section: section.into(),
             found: 0,
         };
-        assert_eq!(sections(LF, "Missing:A=1").unwrap_err(), none("Missing"));
+        // A header but for case, spaces, a BOM or its line break: the game may read it as the section.
         assert_eq!(
             sections(LF, "rendering:A=1").unwrap_err(),
             none("rendering")
         );
-        // The header must be the whole line and end in a line break.
         assert_eq!(sections("[A] \nX=1\n", "A:X=2").unwrap_err(), none("A"));
         assert_eq!(sections("X=1\n[A]", "A:X=2").unwrap_err(), none("A"));
+        assert_eq!(
+            sections("\u{feff}[A]\r\nX=1\r\n", "A:X=2").unwrap_err(),
+            none("A")
+        );
         let twice = sections("[A]\nX=1\n[A]\nY=1\n", "A:X=2").unwrap_err();
         assert_eq!(
             twice,
@@ -355,7 +401,7 @@ mod tests {
                 found: 2
             }
         );
-        assert!(none("Missing").to_string().contains("[Missing]"));
+        assert!(none("A").to_string().contains("[A]"));
     }
 
     #[test]
@@ -440,11 +486,11 @@ mod tests {
             .replace("[Gameplay]\n", "[Gameplay]\nHdr=1\n");
         assert_eq!(out.unwrap(), crlf(&want).into_bytes());
         // Either half refuses the whole override.
-        let err = validate(data.as_bytes(), "AllowFG=false", "Nope:A=1").unwrap_err();
+        let err = validate(data.as_bytes(), "AllowFG=false", "gameplay:A=1").unwrap_err();
         assert_eq!(
             err,
             SettingsError::SectionCount {
-                section: "Nope".into(),
+                section: "gameplay".into(),
                 found: 0
             }
         );

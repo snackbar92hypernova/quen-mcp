@@ -103,7 +103,8 @@ pub enum Change {
     /// Back `path` up to `backup` and record its write time: the game rewrites it during the session (its compiled
     /// scripts, once a mod is parked; input.settings, user.settings and dx12user.settings.bak, at every launch), and the
     /// replay puts both back. `keep`: a live file whose lines changed beyond their order is kept beside first
-    /// (input.settings: the user may rebind a key in the game's menu meanwhile; user.settings: a mod menu's values).
+    /// (input.settings: the user may rebind a key in the game's menu meanwhile; user.settings: what a script's
+    /// SaveUserSettings may write).
     Rebuilt {
         path: PathBuf,
         sha: String,
@@ -220,9 +221,9 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
     let new = dx12_settings(&data, inputs)?;
     // The game rewrites input.settings at every launch, its lines reordered within sections (live boot 1), and
     // dx12user.settings.bak from the settings it starts with, quen's patched ones (feature tests 1): both kept like the
-    // compiled scripts, so their bytes come back. A key the user rebound meanwhile is kept beside. user.settings holds
-    // mod menus' values, which a menu or a script's SaveUserSettings writes during a test (finding 49): kept the same
-    // way, a changed value kept beside. A play session that changes no setting leaves all three to the game, as a
+    // compiled scripts, so their bytes come back. A key the user rebound meanwhile is kept beside. user.settings is
+    // kept the same way (finding 49), a changed value kept beside; 5.01 wrote a mod menu's values into
+    // dx12user.settings, not there (boot 175, finding 53). A play session that changes no setting leaves all three to the game, as a
     // launch without quen does.
     for (name, keep) in [
         ("input.settings", true),
@@ -1177,7 +1178,7 @@ mod tests {
     }
 
     /// Live boot 1: the game rewrites input.settings at every launch with lines reordered; feature tests 1: and
-    /// dx12user.settings.bak from quen's patched settings; finding 49: a mod menu writes its values into user.settings.
+    /// dx12user.settings.bak from quen's patched settings; finding 49: user.settings, journaled the same way.
     /// Whatever it wrote, the replay puts the user's bytes and write times back; without the files there is nothing to
     /// keep.
     #[test]
@@ -1212,7 +1213,7 @@ mod tests {
         let report = replay(&fs.read(path).unwrap(), &fs);
         assert!(report.clean() && report.kept.is_empty(), "{report:#?}");
         assert_eq!((now(input), now(user), now(bak)), before);
-        // A key the user rebound in the game's menu, and a value a mod menu wrote, are kept beside before the restore;
+        // A key the user rebound in the game's menu, and a value the game wrote into user.settings, are kept beside;
         // the .bak isn't.
         fs.recycle(path).unwrap();
         let mut journal = Journal::create(&fs, path).unwrap();

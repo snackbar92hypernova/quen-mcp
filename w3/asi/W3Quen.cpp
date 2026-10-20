@@ -31,7 +31,7 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.10";
+constexpr char kVersion[] = "0.1.11";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -914,9 +914,10 @@ static void Next(void*, void* frame, void* result) {
 // items.add "before after equipped" (the item's count before and after, equipped 0 or 1) ->
 // {"before":..,"after":..,"equipped":..};
 // world.actors "<found>" then per actor "|x y z heading vx vy vz distance flags|<name>|<entity>" (modQuen's
-// QUENRPC_Actors: flags 1 combat, 2 hostile, 4 guard, 8 at work, 16 action point, 32 scene, 64 velocity known) ->
+// QUENRPC_Actors: flags 1 combat, 2 hostile, 4 guard, 8 at work, 16 action point, 32 scene, 64 velocity known, 128
+// entity cut, from quen-w3 0.1.11) ->
 // {"found":..,"actors":[{"name":..,"entity":..,"pos":[..],"heading":..,"velocity":[..] or null,"distance":..,
-// "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..}]};
+// "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..,"entity_cut":..}]};
 // the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
 // {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
 // "world_weather":..}.
@@ -938,7 +939,7 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
       const std::vector<std::string_view> t = Split(part[a], ' ');
       float f[8];
       uint64_t flags = 0;
-      if (t.size() != 9 || !Whole(t[8], 127, flags)) return false;
+      if (t.size() != 9 || !Whole(t[8], 255, flags)) return false;
       for (int k = 0; k < 8; ++k)
         if (!ParseFloat(t[k], f[k])) return false;
       const auto flag = [&](uint64_t bit) { return std::string(flags & bit ? "true" : "false"); };
@@ -948,7 +949,8 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
               ",\"pos\":[" + Number(f[0]) + ',' + Number(f[1]) + ',' + Number(f[2]) + "],\"heading\":" + Number(f[3]) +
               ",\"velocity\":" + velocity + ",\"distance\":" + Number(f[7]) + ",\"combat\":" + flag(1) +
               ",\"hostile\":" + flag(2) + ",\"guard\":" + flag(4) + ",\"at_work\":" + flag(8) +
-              ",\"action_point\":" + flag(16) + ",\"scene\":" + flag(32) + '}';
+              ",\"action_point\":" + flag(16) + ",\"scene\":" + flag(32) +
+              ",\"entity_cut\":" + flag(128) + '}';
     }
     json = out + "]}";
     return true;

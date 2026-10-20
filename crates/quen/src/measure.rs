@@ -78,9 +78,10 @@ pub fn tools() -> Vec<Value> {
             "description": "Within-boot A/B/A/B (a second method on these windows: quen_guide). Per \
                 window: apply its state's actions, settle, one PresentMon window (PresentMon 2.x, else refused with \
                 needs). Every action is checked before any runs. cvar and asi actions run before each of their \
-                state's windows; keys (a toggle hotkey) only on a switch of state. Window 1 measures the game as it \
-                is: with toggles, the first state must be the current one. Both states name the same cvars and ASIs, \
-                and both or neither have keys. Returns per window frame time median / mean / p95, GPU and CPU busy, \
+                state's windows; keys and console lines (toggles) only on a switch of state. Window 1 measures the \
+                game as it is: with toggles, the first state must be the current one. Both states name the same cvars \
+                and ASIs, and both or neither toggle. Returns per window frame time median / mean / p95, GPU and CPU \
+                busy, \
                 PresentMode, utc (apply, settled, presentmon_start, presentmon_stop); drift per state (the spread of \
                 its windows' means), diff = mean(second state) - mean(first), verdict 'outside drift' only if |diff| \
                 exceeds every drift. Another PresentMode than window 1's stops the run. At the end, and on any \
@@ -100,7 +101,7 @@ pub fn tools() -> Vec<Value> {
                                 "label": {"type": "string", "description": "letters, digits, _ and -"},
                                 "actions": {
                                     "type": "array",
-                                    "description": "what puts the game in this state, each {cvar, set}, {asi, set_mode} or {keys}",
+                                    "description": "what puts the game in this state, each {cvar, set}, {asi, set_mode}, {keys} or {console}",
                                     "items": {
                                         "type": "object",
                                         "properties": {
@@ -110,6 +111,17 @@ pub fn tools() -> Vec<Value> {
                                             "set_mode": {"type": "integer", "minimum": 0, "maximum": 255, "description": "the mode: our ASIs take 0 (off) and 1 (on), even where their ini writes another value for on"},
                                             "export": {"type": "string", "description": "with asi: which *_SetMode export, when it has several"},
                                             "keys": {"type": "array", "items": {"type": "string"}, "description": "a toggle hotkey, as game_keys tokens"},
+                                            "console": {"type": "string", "description": "a console line, typed as game_console types it (a toggle)"},
+                                            "expect_log": {
+                                                "type": "object",
+                                                "description": "with console: a new script-log line on channel holding contains must follow within 10 s, else the run fails",
+                                                "properties": {
+                                                    "channel": {"type": "string", "description": "its [channel]: letters, digits and _"},
+                                                    "contains": {"type": "string", "description": "text the line holds"},
+                                                },
+                                                "required": ["channel", "contains"],
+                                                "additionalProperties": false,
+                                            },
                                         },
                                         "additionalProperties": false,
                                     },
@@ -557,7 +569,7 @@ impl Run {
                         asi.to_lowercase(),
                         export.as_deref().unwrap_or("*_SetMode")
                     )),
-                    Action::Keys(_) => None,
+                    Action::Keys(_) | Action::Console { .. } => None,
                 })
                 .collect();
             names.sort();
@@ -570,10 +582,10 @@ impl Run {
                 names(b_actions)
             ));
         }
-        let toggles = |actions: &[Action]| actions.iter().any(|a| matches!(a, Action::Keys(_)));
+        let toggles = |actions: &[Action]| actions.iter().any(Action::toggles);
         if toggles(a_actions) != toggles(b_actions) {
             return Err(
-                "keys toggle, so both states need them (the keys that switch into each) or neither"
+                "keys and console lines toggle, so both states need them (what switches into each) or neither"
                     .into(),
             );
         }
@@ -691,6 +703,11 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
                     crate::profile::capture_key(cx.live, tokens)?;
                     cx.keys(call, tokens, true, game::Focus::Refuse)?;
                 }
+                Action::Console { expect, .. } => {
+                    if expect.is_some() {
+                        cx.script_log()?;
+                    }
+                }
             }
         }
     }
@@ -793,10 +810,7 @@ fn windows_of(
         // Toggles run only on a switch; the first window measures the game as it is.
         let switch = i > 0 && *entered != s;
         let apply = SystemTime::now();
-        for action in actions
-            .iter()
-            .filter(|a| switch || !matches!(a, Action::Keys(_)))
-        {
+        for action in actions.iter().filter(|a| switch || !a.toggles()) {
             action
                 .run(cx, call)
                 .map_err(|d| format!("{at}: {}", why(d)))?;
@@ -871,7 +885,10 @@ fn restore(
                 format!("keys {tokens:?}"),
                 cx.keys(call, tokens, false, game::Focus::Refuse),
             ),
-            Action::Keys(_) => continue,
+            Action::Console { .. } if entered != first => {
+                (action.to_string(), action.run(cx, call))
+            }
+            Action::Keys(_) | Action::Console { .. } => continue,
         };
         out.push(match done {
             Ok(_) => json!({"what": what, "ok": true}),
@@ -1166,6 +1183,96 @@ fn main() {
             json!({"token": "tok", "name": "QuenTest/FrameMs"}),
         );
         assert_eq!(now["var"]["live"], 20.0, "{now}");
+    }
+
+    /// Finding 59: console lines toggle like keys, each followed by its script-log line; one that doesn't show (only
+    /// an older line holds the text) fails the run.
+    #[test]
+    fn ab_switches_by_console_line_and_checks_the_script_log() {
+        let fx = Fake::new("abconsole");
+        fake_presentmon(&fx);
+        fs::write(
+            fx.dir.join("game/bin/x64_dx12/W3QuenState.log"),
+            "push flags=1\n",
+        )
+        .unwrap();
+        let log = fx.dir.join("docs").join(crate::w3::SCRIPTS_LOG);
+        fs::write(&log, "[NpcAvoid] on\r\n").unwrap();
+        let (to, mut on) = (log.clone(), false);
+        fx.on_input(move |what| {
+            assert_eq!(what, "console npcavoid()");
+            on = !on;
+            let mut f = fs::OpenOptions::new().append(true).open(&to).unwrap();
+            use std::io::Write as _;
+            write!(f, "[npcavoid] aura {}\r\n", if on { "on" } else { "off" }).unwrap();
+            Ok(())
+        });
+        let state = |label, word| {
+            json!({"label": label, "actions": [
+                {"console": "npcavoid()", "expect_log": {"channel": "NpcAvoid", "contains": format!("aura {word}")}}
+            ]})
+        };
+        let args = json!({"token": "tok", "tag": "con", "settle": 0, "secs": 1,
+                          "states": [state("A", "off"), state("B", "on")]});
+        let out = fx.run("measure_ab", args.clone());
+        assert_eq!(out["ok"], true, "{out}");
+        // On each switch, and once more at the end to leave the first state's.
+        let console = "console npcavoid()";
+        let want = [
+            "presentmon con_1A.csv 1",
+            console,
+            "presentmon con_2B.csv 1",
+            console,
+        ];
+        let want = [
+            &want[..],
+            &[
+                "presentmon con_3A.csv 1",
+                console,
+                "presentmon con_4B.csv 1",
+                console,
+            ],
+        ]
+        .concat();
+        assert_eq!(fx.calls(), want);
+        let db = Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
+        let sql = "SELECT note FROM measurements WHERE metric = 'frame_ms_mean' ORDER BY id";
+        let notes = db.query(sql, &[], Duration::from_secs(5)).unwrap().rows;
+        let note = notes[0][0].as_str().unwrap();
+        assert!(
+            note.contains("A: console npcavoid() expect [NpcAvoid] \"aura off\"; B: "),
+            "{note}"
+        );
+        // A line that doesn't reach the log: window 2 fails, the old lines don't count, nothing to toggle back.
+        fx.on_input(|_| Ok(()));
+        let mut args = args;
+        args["tag"] = json!("none");
+        let out = fx.run("measure_ab", args);
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["ok"] == false
+                && reason.contains(
+                    "window 2 (B): console npcavoid(): no new [NpcAvoid] line holding \"aura on\""
+                ),
+            "{out}"
+        );
+        assert_eq!(fx.calls().len(), want.len() + 2, "{:?}", fx.calls());
+        // Refused before anything: a bad line, a bad expect_log, a console line in one state only.
+        let bad = |actions_a: Value| {
+            json!({"token": "tok", "tag": "bad", "settle": 0, "secs": 1,
+                   "states": [{"label": "A", "actions": actions_a}, state("B", "on")]})
+        };
+        for actions in [
+            json!([{"console": "say(\"hi\")"}]),
+            json!([{"console": "npcavoid()", "expect_log": {"channel": "Npc Avoid", "contains": "x"}}]),
+            json!([{"console": "npcavoid()", "expect_log": {"channel": "NpcAvoid", "contains": ""}}]),
+            json!([{"console": "npcavoid()", "expect_log": {"channel": "NpcAvoid", "contains": "x", "more": 1}}]),
+            json!([]),
+        ] {
+            let out = fx.run("measure_ab", bad(actions.clone()));
+            assert_eq!(out["refused"], true, "{actions}: {out}");
+        }
+        assert_eq!(fx.calls().len(), want.len() + 2, "ran for a refusal");
     }
 
     #[test]
