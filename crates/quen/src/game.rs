@@ -859,7 +859,7 @@ fn check_closed(pid: u32, fields: &mut Fields) -> Result<(), String> {
 
 /// Plain gameplay or photo mode: where keys and the console reach the game itself (the first experiment boot: the
 /// console works in both).
-fn in_game(flags: i64) -> bool {
+pub(crate) fn in_game(flags: i64) -> bool {
     bridge_log::plain(flags) || bridge_log::in_photo(flags)
 }
 
@@ -1809,6 +1809,10 @@ if os.path.exists(act): exec(open(act).read())
                 handovers: crate::hands::Handovers::new(Default::default()),
                 paused: Default::default(),
                 path: Default::default(),
+                client: Err("a test session has no client".into()),
+                notice_at: Default::default(),
+                away: Default::default(),
+                idled: Default::default(),
                 _awake: crate::win::Awake::hold(),
             });
             session

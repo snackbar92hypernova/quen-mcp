@@ -187,6 +187,7 @@ pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Re
     let ledger =
         Ledger::open(cx.config.state_dir().join("quen.db")).map_err(|e| format!("ledger: {e}"))?;
     call.lap("check");
+    crate::notice::clear(cx.live, call);
     let display = display_state(window);
     if shot.hdr {
         hdr_on(&display)?;

@@ -19,7 +19,7 @@ use crate::game::{self, Action, Ctx, Cvar, Fields, ctx, flag};
 use crate::hands::Hands;
 use crate::session::{Call, Done, Session, last_line, utc_ms};
 use crate::win::Job;
-use crate::{doctor, input};
+use crate::{doctor, input, notice};
 
 /// Images that skew a CPU-bound measurement: builds, and RE analysis (Ghidra's analyzeHeadless
 /// runs as java.exe).
@@ -281,6 +281,7 @@ impl PresentMon {
         secs: u32,
         front: Option<HWND>,
     ) -> Result<(Stats, Fields), Done> {
+        notice::clear(cx.live, call);
         let pid = cx.game_pid()?;
         let exe = self.exe.to_string_lossy();
         let argv = stats::presentmon_args(&exe, pid, secs, &dest.to_string_lossy(), &self.flags)?;
@@ -500,6 +501,7 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let pm = PresentMon::new(&cx, args)?;
     let quiet = quiet(flag(args, "strict")?, skewed(&cx))?;
     call.lap("check");
+    let notice = notice::measuring(&cx, call, secs.into());
     let front = match cx.hands {
         Some(Hands::User) => Some(in_front(&cx, call)?),
         _ => None,
@@ -510,6 +512,9 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let mut fields = Map::new();
     fields.insert("presentmon".into(), json!(pm.exe));
     fields.insert("window".into(), shown(1, &window));
+    if let Some(notice) = notice {
+        fields.insert("notice".into(), json!(notice));
+    }
     ledger(&mut fields, &cx, &run_id(&cx, tag), &[window], &quiet, "");
     fields.insert("quiet".into(), quiet);
     Ok(fields)
@@ -712,6 +717,9 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         }
     }
     call.lap("check");
+    // About as long as the tool's description says a run takes.
+    let secs = run.order.len() as u64 * (run.settle.as_secs() + u64::from(run.secs) + 5);
+    let notice = notice::measuring(&cx, call, secs);
     // From the first action on, every exit path restores (step 4).
     let mut windows = Vec::new();
     let mut entered = run.order[0];
@@ -731,6 +739,9 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
 
     let mut fields = Map::new();
     fields.insert("presentmon".into(), json!(pm.exe));
+    if let Some(notice) = notice {
+        fields.insert("notice".into(), json!(notice));
+    }
     let shown: Vec<Value> = windows
         .iter()
         .enumerate()

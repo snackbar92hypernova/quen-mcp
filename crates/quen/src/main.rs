@@ -35,6 +35,8 @@ mod measure;
 #[cfg(windows)]
 mod mem;
 #[cfg(windows)]
+mod notice;
+#[cfg(windows)]
 mod photo;
 #[cfg(windows)]
 mod profile;

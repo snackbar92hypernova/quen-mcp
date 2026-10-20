@@ -176,6 +176,11 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # Optional: GB of captures before quen warns you (quen_doctor, session_plan, session_launch, session_end). Default 20.
 # capture_budget_gb = '20'
 
+# Optional: when the agent has the game's controls and makes no call to quen for 60 s while the game is in front, quen
+# brings the agent's chat window to the front (the game pauses into its menu), and the game back at the agent's next
+# game call. 'false' turns that off: the game then shows a notice that the agent waits for you in the chat. Default 'true'.
+# idle_focus = 'false'
+
 # Optional: game builds you have verified, beside the ones quen knows (Steam 5.01). Each entry is
 # <platform> <sha256 of witcher3.exe> <label>, platform steam or gog, ';' between entries. A refused launch's reason
 # gives the entry to add. Listing a build quen already knows under another label is refused.

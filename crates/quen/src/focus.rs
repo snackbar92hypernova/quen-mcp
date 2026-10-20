@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetWindowLongW, IsIconic, SW_RESTORE, ShowWindow, WS_EX_TOOLWINDOW,
 };
 
-use crate::game::{self, Fields, Focus};
+use crate::game::{self, Ctx, Fields, Focus};
 use crate::session::{Call, Done, Session};
 use crate::{capture, doctor, input, win};
 
@@ -54,28 +54,33 @@ fn to(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
                 ("game".into(), json!(PAUSED)),
             ])
         }
-        Some("game") => {
-            // Bringing it back waits for quen's state, which also shows the menu to close (feature tests 4: the user
-            // may have clicked into the game already, and its pause menu stays open then too).
-            doctor::installed(&[&doctor::PACKAGE], cx.config, "focus to game")?;
-            let (_, window) = cx.window()?;
-            let already = input::in_front(window);
-            let menu = match already {
-                false => cx.bring(call, window, Focus::BringToGame)?,
-                true => Some(
-                    cx.close_menu(call, game::MENU_WAIT)
-                        .map_err(|why| Done::Failed(why, Map::new()))?,
-                ),
-            };
-            Map::from_iter([
-                ("already_in_front".into(), json!(already)),
-                ("menu".into(), json!(menu)),
-            ])
-        }
+        Some("game") => to_game(&cx, call)?,
         _ => return Err("to must be \"client\" or \"game\"".to_string().into()),
     };
+    // The agent moved the focus itself: the next game call leaves it where it is (notice.rs).
+    cx.live.away.set(false);
     call.lap("focus");
     Ok(fields)
+}
+
+/// `to: game`, and the game call after quen brought the client forward (notice.rs): brings the game back and closes
+/// its menu. Bringing it back waits for quen's state, which also shows the menu to close (feature tests 4: the user may
+/// have clicked into the game already, and its pause menu stays open then too).
+pub(crate) fn to_game(cx: &Ctx, call: &Call) -> Result<Fields, Done> {
+    doctor::installed(&[&doctor::PACKAGE], cx.config, "focus to game")?;
+    let (_, window) = cx.window()?;
+    let already = input::in_front(window);
+    let menu = match already {
+        false => cx.bring(call, window, Focus::BringToGame)?,
+        true => Some(
+            cx.close_menu(call, game::MENU_WAIT)
+                .map_err(|why| Done::Failed(why, Map::new()))?,
+        ),
+    };
+    Ok(Map::from_iter([
+        ("already_in_front".into(), json!(already)),
+        ("menu".into(), json!(menu)),
+    ]))
 }
 
 /// Brings process `pid`'s window ([`window_of`]) to the front, a minimized one restored first; whether it was there

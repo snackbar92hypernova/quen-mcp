@@ -766,6 +766,7 @@ pub(crate) fn capture(cx: &Ctx, call: &mut Call, tag: &str) -> Result<Fields, Do
         sleep(wait);
     }
     call.lap("check");
+    crate::notice::clear(cx.live, call);
     cx.keys(call, &[format!("{CAPTURE_KEY}:300")], false, Focus::Refuse)?;
     let at = session::now() as i64;
     // From the key on, nothing is sent and nothing returns, a cancel included, until the capture is written: the game
