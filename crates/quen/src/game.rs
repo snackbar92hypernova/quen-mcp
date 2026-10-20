@@ -52,6 +52,10 @@ const POLL: Duration = Duration::from_millis(250);
 /// game_keys with `focus`: how long quen's state may take to show gameplay or photo mode once the game is in front, and
 /// then no menu once escape went to an open one.
 pub(crate) const READY_MAX: Duration = Duration::from_secs(10);
+/// Closing that menu: at most this many escapes, each followed by up to `MENU_WAIT` for quen's state to show none.
+// ponytail: when one escape closed the focus-loss menu, it did within the old 10 s wait; 3 s each is a guess.
+const MENU_ESCAPES: usize = 3;
+pub(crate) const MENU_WAIT: Duration = Duration::from_secs(3);
 /// How long an ASI's `*_SetMode` may run in the game.
 const CALL_MAX: Duration = Duration::from_secs(10);
 /// game_scriptlog: the most lines it returns, the end of the log it reads, and the longest line it returns.
@@ -89,10 +93,10 @@ pub fn tools() -> Vec<Value> {
             "name": "game_console",
             "description": "Type one line into the game's developer console: opens it, types, checks the line \
                 shows on the prompt row, Enter, closes it, checks its prompt is gone. Call form only: name(args), e.g. settime(1,22). Letters, digits, space and \
-                , . - ( ) _ only: each goes as its US key, sent as the key the game's keyboard layout has for it (the \
-                console reads keys through a US table). The game must be in front and in gameplay or photo mode: \
-                refused otherwise, nothing typed (an unfocused game sits in its pause menu; at the main menu typed \
-                letters act on the menu). Refused too: a character the game's layout has no key for; with needs: \
+                , . - ( ) _ only: each goes as its US key, sent as the key the game's keyboard layout has for it. The \
+                game must be in front and in gameplay or photo mode, with no menu in quen's state: refused otherwise, \
+                nothing typed (an unfocused game sits in its pause menu; at the main menu typed letters act on the \
+                menu). Refused too: a character the game's layout has no key for; with needs: \
                 quen's in-game package not installed (its state tells gameplay from the menus). Failed: the game \
                 lost the front part-way (no key is left down), the typed line didn't show on the prompt (keys \
                 dropped: Enter is not pressed, nothing runs, what arrived is erased and the console closed), or the \
@@ -148,8 +152,8 @@ pub fn tools() -> Vec<Value> {
                 "dry_run": {"type": "boolean", "description": "return the planned events, send nothing"},
                 "focus": {"type": "boolean", "description": "if the game isn't in front: bring it there, wait up \
                     to 10 s for quen's state to show gameplay or photo mode, then close the menu the game opened when \
-                    it lost the front (one escape when quen's state shows a menu outside photo mode, quen-w3 0.1.6 or \
-                    later; then up to 10 s for it to close). menu in the result says which"},
+                    it lost the front (while quen's state shows a menu outside photo mode, quen-w3 0.1.6 or later: \
+                    an escape, then up to 3 s for it to close; at most 3 escapes). menu in the result says which"},
             }), &["tokens"]),
         }),
     ]
@@ -232,6 +236,14 @@ pub(crate) fn flag(args: &Value, key: &str) -> Result<bool, String> {
 }
 
 impl Ctx<'_> {
+    /// The game's script log, `scriptslog.txt` in its documents folder.
+    pub(crate) fn script_log(&self) -> Result<PathBuf, String> {
+        let documents = self.config.documents.as_ref();
+        Ok(documents
+            .ok_or("no documents in the local config")?
+            .join(crate::w3::SCRIPTS_LOG))
+    }
+
     /// The next numbered log in the session's logs, for one step's output: `<n>-<what>.log`.
     pub(crate) fn log(&self, what: &str) -> PathBuf {
         let n = fs::read_dir(&self.live.logs).map_or(0, Iterator::count);
@@ -391,7 +403,7 @@ impl Ctx<'_> {
             return Ok(None);
         }
         self.ready(call, READY_MAX).map_err(moved)?;
-        self.close_menu(call, READY_MAX).map(Some).map_err(moved)
+        self.close_menu(call, MENU_WAIT).map(Some).map_err(moved)
     }
 
     /// After `focus` brought the game to the front: waits up to `max` for quen's last state flags to show plain
@@ -429,10 +441,11 @@ impl Ctx<'_> {
     }
 
     /// The last step of bringing the game back (`focus` to game, game_keys `focus`; feature tests 4): the game opens its
-    /// pause menu when it loses the front, and the menu stays open when the game comes back. When quen's state shows a
-    /// menu outside photo mode (bit 2048, from quen-w3 0.1.6), one escape through quen's input path, then up to `max`
-    /// for gameplay or photo mode without a menu. What it did, for the result's `menu`. Photo mode has no focus-loss
-    /// menu (seen in the first experiment boot), and escape there would leave photo mode.
+    /// pause menu when it loses the front, and the menu stays open when the game comes back. While quen's state shows a
+    /// menu outside photo mode (bit 2048, from quen-w3 0.1.6), an escape through quen's input path, then up to `max`
+    /// for gameplay or photo mode without a menu; at most [`MENU_ESCAPES`] (boot 177: one escape left a menu open).
+    /// What it did, for the result's `menu`. Photo mode has no focus-loss menu (seen in the first experiment boot), and
+    /// escape there would leave photo mode.
     pub(crate) fn close_menu(&self, call: &Call, max: Duration) -> Result<String, String> {
         if !self.last_flags().is_some_and(menu_to_close) {
             let old =
@@ -444,24 +457,41 @@ impl Ctx<'_> {
                 None => "no menu to close in quen's state".into(),
             });
         }
-        let sent = match self.stand_in(&["keys", "escape"]) {
-            Some(done) => done.map_err(|_| "the test stand-in refused the escape".to_string()),
-            None => {
-                let (_, window) = self.window()?;
-                let plan = quen_core::input::plan(&["escape"], HOLD_MS, GAP_MS, GRAVE)?;
-                input::send(window, &plan, &|| call.stopped()).map_err(|s| s.why)
-            }
-        };
-        sent.map_err(|why| format!("quen's state showed a menu; closing it with escape: {why}"))?;
         let closed = |f: i64| in_game(f) && !menu_to_close(f);
-        self.wait_for(call, max, closed).map_err(|last| {
-            format!(
-                "escape went to the game's menu, but quen's state still showed {} after {} s: a menu may still be open",
-                shown(last),
-                max.as_secs_f32()
-            )
-        })?;
-        Ok("closed: quen's state showed a menu, and one escape closed it".into())
+        let mut last = None;
+        for n in 1..=MENU_ESCAPES {
+            let sent = match self.stand_in(&["keys", "escape"]) {
+                Some(done) => done.map_err(|_| "the test stand-in refused the escape".to_string()),
+                None => {
+                    let (_, window) = self.window()?;
+                    let plan = quen_core::input::plan(&["escape"], HOLD_MS, GAP_MS, GRAVE)?;
+                    input::send(window, &plan, &|| call.stopped()).map_err(|s| s.why)
+                }
+            };
+            sent.map_err(|why| {
+                format!("quen's state showed a menu; closing it with escape {n}: {why}")
+            })?;
+            match self.wait_for(call, max, closed) {
+                Ok(()) => {
+                    return Ok(format!(
+                        "closed: quen's state showed a menu, and {n} escape(s) closed it"
+                    ));
+                }
+                Err(flags) if call.stopped() => {
+                    return Err(format!(
+                        "cancelled after escape {n}: quen's state showed {}",
+                        shown(flags)
+                    ));
+                }
+                Err(flags) => last = flags,
+            }
+        }
+        Err(format!(
+            "a menu stays open: quen's state still showed {} after {MENU_ESCAPES} escapes, each followed by {} s \
+             (it doesn't say which menu). game_console is refused while it shows one; game_keys reaches the menu",
+            shown(last),
+            max.as_secs_f32()
+        ))
     }
 
     /// console_type.py: types `line` into the developer console of the game, which must be in front (an unfocused game
@@ -482,6 +512,14 @@ impl Ctx<'_> {
             let why = format!(
                 "quen's state shows {}, not gameplay or photo mode: the console is typed only there (at the main menu \
                  the letters also reach the menu, and a command's `e` selects CONTINUE). Nothing typed",
+                shown(last)
+            );
+            return Err(why.into());
+        }
+        // Boot 177: with a menu left open, the console key never opened the prompt and the letters may have acted.
+        if last.is_some_and(menu_to_close) {
+            let why = format!(
+                "quen's state shows a menu ({}): the letters would act on it. Nothing typed; focus to game closes it",
                 shown(last)
             );
             return Err(why.into());
@@ -1093,10 +1131,7 @@ fn scriptlog(session: &Session, args: &Value) -> Result<Fields, Done> {
                 .ok_or("channel must be letters, digits and _".to_string())?,
         ),
     };
-    let documents = cx.config.documents.as_ref();
-    let path = documents
-        .ok_or("no documents in the local config".to_string())?
-        .join(crate::w3::SCRIPTS_LOG);
+    let path = cx.script_log()?;
     let mut fields = Map::new();
     fields.insert("log".into(), json!(path));
     let Ok(meta) = fs::metadata(&path) else {
@@ -1104,17 +1139,13 @@ fn scriptlog(session: &Session, args: &Value) -> Result<Fields, Done> {
         return Ok(fields);
     };
     let (text, cut_first) =
-        tail(&path, meta.len()).map_err(|e| format!("{}: {e}", path.display()))?;
+        read_log(&path, None).map_err(|e| format!("{}: {e}", path.display()))?;
     let prefix = channel.map(|c| format!("[{c}]"));
     let lines: Vec<&str> = text
         .lines()
         .skip(usize::from(cut_first))
         .map(|l| l.trim_start_matches('\u{feff}'))
-        .filter(|l| {
-            prefix
-                .as_ref()
-                .is_none_or(|p| l.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))
-        })
+        .filter(|l| prefix.as_ref().is_none_or(|p| on_channel(l, p)))
         .collect();
     let cut = |l: &&str| match l.char_indices().nth(SCRIPT_LOG_LINE) {
         Some((at, _)) => l[..at].to_string(),
@@ -1137,14 +1168,26 @@ fn scriptlog(session: &Session, args: &Value) -> Result<Fields, Done> {
     Ok(fields)
 }
 
-/// The last [`SCRIPT_LOG_TAIL`] bytes of the `len`-byte file `path` as text: UTF-16 LE from an even offset when the
-/// file starts with that BOM, else UTF-8 (lossy); and whether it starts mid-file, its first line cut.
-fn tail(path: &Path, len: u64) -> io::Result<(String, bool)> {
+/// Whether a script-log line is on the channel whose `[Channel]` prefix is `prefix`, in any case.
+fn on_channel(line: &str, prefix: &str) -> bool {
+    line.get(..prefix.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(prefix))
+}
+
+/// The script log as text from byte `from` (from the start if the file is shorter now), or its last
+/// [`SCRIPT_LOG_TAIL`] bytes with `None`: UTF-16 LE from an even offset when the file starts with that BOM, else UTF-8
+/// (lossy); and whether it starts mid-file, its first line cut.
+fn read_log(path: &Path, from: Option<u64>) -> io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
     let mut bom = [0; 2];
     let wide = file.read_exact(&mut bom).is_ok() && bom == [0xFF, 0xFE];
-    let start = len.saturating_sub(SCRIPT_LOG_TAIL) & !u64::from(wide);
+    let start = match from {
+        Some(at) if at <= len => at,
+        Some(_) => 0,
+        None => len.saturating_sub(SCRIPT_LOG_TAIL),
+    } & !u64::from(wide);
     let mut bytes = Vec::new();
     file.seek(SeekFrom::Start(start))?;
     file.read_to_end(&mut bytes)?;
@@ -1215,11 +1258,26 @@ pub(crate) enum Action {
         export: Option<String>,
         mode: u32,
     },
+    /// A console line, as game_console types it: a toggle like keys (finding 59). `expect` (channel, text): a new
+    /// script-log line on that channel holding that text must follow it.
+    Console {
+        line: String,
+        expect: Option<(String, String)>,
+    },
 }
 
+/// A console action's `expect_log`: how long its line may take to reach the script log.
+const EXPECT_MAX: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+
 impl Action {
-    /// `{"cvar": name, "set": value}`, `{"keys": [tokens]}` or `{"asi": "X.asi", "set_mode": n}`, the last with an
-    /// optional `"export"`. Each value is checked again when it runs.
+    /// Keys and console lines switch the state they lead into, so they run only on a switch.
+    pub(crate) fn toggles(&self) -> bool {
+        matches!(self, Action::Keys(_) | Action::Console { .. })
+    }
+
+    /// `{"cvar": name, "set": value}`, `{"keys": [tokens]}`, `{"asi": "X.asi", "set_mode": n}` with an optional
+    /// `"export"`, or `{"console": line}` with an optional `"expect_log": {channel, contains}`. Each value is checked
+    /// again when it runs.
     pub(crate) fn parse(v: &Value) -> Result<Action, String> {
         let map = v.as_object().ok_or("an action is an object")?;
         let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
@@ -1253,8 +1311,33 @@ impl Action {
                     .filter(|m| *m <= 255)
                     .ok_or("set_mode must be a whole number 0-255")?,
             }),
+            ["console"] | ["console", "expect_log"] => {
+                let line = text(v, "console")?;
+                quen_core::input::console_line(line, GRAVE, &quen_core::input::us_scancode, true)?;
+                let expect = match v.get("expect_log") {
+                    None => None,
+                    Some(e) => {
+                        let bad = "expect_log is {channel, contains}: channel letters, digits and _, contains \
+                                   a non-empty string";
+                        let map = e.as_object().ok_or(bad)?;
+                        let channel = e["channel"].as_str().filter(|c| crate::boot::plain(c, &[]));
+                        let contains = e["contains"].as_str().filter(|c| !c.is_empty());
+                        match (channel, contains, map.len()) {
+                            (Some(channel), Some(contains), 2) => {
+                                Some((channel.into(), contains.into()))
+                            }
+                            _ => return Err(bad.into()),
+                        }
+                    }
+                };
+                Ok(Action::Console {
+                    line: line.into(),
+                    expect,
+                })
+            }
             _ => Err(format!(
-                "an action is {{cvar, set}}, {{keys}} or {{asi, set_mode}} (export optional), not {{{}}}",
+                "an action is {{cvar, set}}, {{keys}}, {{asi, set_mode}} (export optional) or {{console}} \
+                 (expect_log optional), not {{{}}}",
                 keys.join(", ")
             )),
         }
@@ -1265,6 +1348,33 @@ impl Action {
             Action::Cvar { name, value } => cx.cvar(call, name, Cvar::Set(value)),
             Action::Keys(tokens) => cx.keys(call, tokens, false, Focus::Refuse),
             Action::SetMode { asi, export, mode } => cx.set_mode(asi, export.as_deref(), *mode),
+            Action::Console { line, expect } => {
+                let Some((channel, contains)) = expect else {
+                    return cx.console(call, line, Map::new(), true);
+                };
+                let log = cx.script_log()?;
+                let from = fs::metadata(&log).map_or(0, |m| m.len());
+                let fields = cx.console(call, line, Map::new(), true)?;
+                let prefix = format!("[{channel}]");
+                let start = Instant::now();
+                loop {
+                    let new = read_log(&log, Some(from)).map_or_else(|_| String::new(), |(t, _)| t);
+                    if new.lines().any(|l| {
+                        let l = l.trim_start_matches('\u{feff}');
+                        on_channel(l, &prefix) && l.contains(contains.as_str())
+                    }) {
+                        return Ok(fields);
+                    }
+                    if start.elapsed() > EXPECT_MAX || call.stopped() {
+                        let why = format!(
+                            "console {line}: no new {prefix} line holding {contains:?} in the script log within {} s",
+                            EXPECT_MAX.as_secs()
+                        );
+                        return Err(Done::Failed(why, fields));
+                    }
+                    sleep(POLL);
+                }
+            }
         }
     }
 }
@@ -1278,6 +1388,13 @@ impl std::fmt::Display for Action {
             Action::SetMode { asi, export, mode } => {
                 let export = export.as_deref().unwrap_or("*_SetMode");
                 write!(f, "{asi}!{export}({mode})")
+            }
+            Action::Console { line, expect } => {
+                write!(f, "console {line}")?;
+                match expect {
+                    Some((channel, contains)) => write!(f, " expect [{channel}] {contains:?}"),
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -2120,12 +2237,39 @@ if os.path.exists(act): exec(open(act).read())
         let said = cx.close_menu(&call, quick).unwrap();
         assert!(said.starts_with("closed"), "{said}");
         assert_eq!(fx.calls(), ["keys escape"]);
-        // A menu that stays open after the escape: why, and what quen's state showed.
+        // Boot 177: a menu the first escape leaves open gets another.
+        let (state, mut n) = (log.clone(), 0);
+        fx.on_input(move |_| {
+            n += 1;
+            if n == 2 {
+                let mut f = fs::OpenOptions::new().append(true).open(&state).unwrap();
+                writeln!(f, "push flags=1").unwrap();
+            }
+            Ok(())
+        });
+        fs::write(&log, format!("push flags={}\n", VALID | MENU)).unwrap();
+        let said = cx.close_menu(&call, quick).unwrap();
+        assert!(said.contains("2 escape(s)"), "{said}");
+        assert_eq!(fx.calls().len(), 3);
+        // A menu that stays open after three: why, and what quen's state showed; game_console then types nothing.
         fx.on_input(|_| Ok(()));
         fs::write(&log, format!("push flags={}\n", VALID | MENU)).unwrap();
         let why = cx.close_menu(&call, quick).unwrap_err();
-        assert!(why.contains("still showed flags 2049"), "{why}");
-        assert_eq!(fx.calls(), ["keys escape", "keys escape"]);
+        assert!(
+            why.contains("still showed flags 2049 [\"valid\", \"menu\"] after 3 escapes"),
+            "{why}"
+        );
+        assert_eq!(fx.calls().len(), 6);
+        let out = fx.run(
+            "game_console",
+            json!({"token": "tok", "line": "settime(1,22)"}),
+        );
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["refused"] == true && reason.contains("shows a menu"),
+            "{out}"
+        );
+        assert_eq!(fx.calls().len(), 6, "typed into the menu");
     }
 
     /// Feature tests 4: at a play boot's main menu, quen's state log is the previous boot's until the first push of

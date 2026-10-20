@@ -2,7 +2,7 @@
 //! question in the agent's chat goes unseen. The driving agent brings its client's window to the front to ask, then
 //! the game back. Each connection's client is found once, at connect: the first process up the parent chain of its
 //! `quen mcp` that shows a window, so any client with a window works (Claude Desktop, VS Code, a terminal). Only
-//! windows move, and on the way back one escape closes the menu the game opened when it lost the front: no file
+//! windows move, and on the way back up to 3 escapes close the menu the game opened when it lost the front: no file
 //! changes, nothing is journaled.
 
 use serde_json::{Map, Value, json};
@@ -26,7 +26,7 @@ pub fn tool() -> Value {
             with a visible window that isn't a tool window), a minimized one restored; client names its image. \
             Witcher 3 pauses into its menu while it isn't in front. to game: brings the game back, waits up to 10 s \
             for gameplay or photo mode in quen's state, then closes that menu as game_keys focus does, even if the \
-            game was in front already (menu: what it did). Only windows move, and that escape: no file, not \
+            game was in front already (menu: what it did). Only windows move, and those escapes: no file, not \
             journaled. Refused, \
             nothing moved: no live session, a wrong token, another connection's session, to client when no window \
             was found for this client at connect or it shows none now, to game while quen's state shows neither \
@@ -63,7 +63,7 @@ fn to(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
             let menu = match already {
                 false => cx.bring(call, window, Focus::BringToGame)?,
                 true => Some(
-                    cx.close_menu(call, game::READY_MAX)
+                    cx.close_menu(call, game::MENU_WAIT)
                         .map_err(|why| Done::Failed(why, Map::new()))?,
                 ),
             };

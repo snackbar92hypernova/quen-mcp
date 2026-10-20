@@ -270,12 +270,12 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "world_actors",
             "description": format!("Read the alive actors within radius of the player (the player left out), \
-                nearest first, at most max; found: how many are within radius. Each: pos, heading (GetHeading()), \
-                velocity ([x, y, z]: its moving agent component's GetVelocity(); null without one), distance, name \
-                (GetDisplayName()), entity (GetReadableName()), and combat (IsInCombat()), hostile (GetAttitude \
-                towards the player is AIA_Hostile), guard (GetNPCType() is ENGT_Guard), at_work (IsAtWork()), \
-                action_point (IsAPValid(GetActiveActionPoint())), scene (IsInGameplayScene()). Changes nothing: not \
-                journaled, taints no save. Runs while the user has the controls. quen-w3 0.1.10 or later. {needs}; \
+                nearest first, at most max; found: all within radius. Each: pos, heading, velocity (its moving agent \
+                component's GetVelocity(), [x, y, z] or null), distance, name (GetDisplayName(), at most 80 \
+                characters), entity (GetReadableName(), at most 255; entity_cut: longer), and combat (IsInCombat()), \
+                hostile (GetAttitude towards the player is AIA_Hostile), guard (GetNPCType() is ENGT_Guard), at_work \
+                (IsAtWork()), action_point (IsAPValid(GetActiveActionPoint())), scene (IsInGameplayScene()). Changes \
+                nothing, taints no save. Runs while the user has the controls. quen-w3 0.1.10 or later. {needs}; \
                 with needs: an older package, or {game}, or no player. Failed: no reply within 5 s."),
             "inputSchema": schema(json!({
                 "radius": {"type": "number", "minimum": 0, "maximum": MAX_ACTORS_RADIUS, "description": "metres, above 0; default 30"},

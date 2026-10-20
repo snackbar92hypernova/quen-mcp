@@ -441,7 +441,9 @@ function QUENRPC_SetCam(n : array<float>)
 // at most max: "<found>", then per actor "|x y z heading vx vy vz distance flags|<display name>|<readable name>". The
 // velocity is the moving agent component's GetVelocity (flag 64 when it has one); flags 1 IsInCombat, 2 GetAttitude
 // towards the player AIA_Hostile, 4 GetNPCType ENGT_Guard, 8 IsAtWork, 16 IsAPValid(GetActiveActionPoint), 32
-// IsInGameplayScene (4, 8 and 16 only for a CNewNPC). Names cut at 80 characters, a '|' in one made '/'.
+// IsInGameplayScene (4, 8 and 16 only for a CNewNPC), 128 the readable name cut. A '|' in a name made '/'; the display
+// name cut at 80 characters, the readable name (GetReadableName: entity.ws, the text after the last "::" of ToString)
+// at 255 (from quen-w3 0.1.11; 0.1.10 cut it at 80 without saying so).
 function QUENRPC_Actors(max : int, radius : float) : string
 {
 	var actors : array<CActor>;
@@ -451,7 +453,7 @@ function QUENRPC_Actors(max : int, radius : float) : string
 	var mac : CMovingAgentComponent;
 	var pos, vel, at : Vector;
 	var i, flags : int;
-	var text : string;
+	var text, entity : string;
 
 	actors = GetActorsInRange(thePlayer, radius, 0, '', true);
 	for (i = 0; i < actors.Size(); i += 1)
@@ -487,11 +489,16 @@ function QUENRPC_Actors(max : int, radius : float) : string
 			flags += 16;
 		if (actor.IsInGameplayScene())
 			flags += 32;
+		entity = StrReplaceAll(actor.GetReadableName(), "|", "/");
+		if (StrLen(entity) > 255)
+		{
+			flags += 128;
+			entity = StrLeft(entity, 255);
+		}
 		text += "|" + FloatToStringPrec(pos.X, 4) + " " + FloatToStringPrec(pos.Y, 4) + " " + FloatToStringPrec(pos.Z, 4)
 			+ " " + FloatToStringPrec(actor.GetHeading(), 4) + " " + FloatToStringPrec(vel.X, 4) + " "
 			+ FloatToStringPrec(vel.Y, 4) + " " + FloatToStringPrec(vel.Z, 4) + " " + FloatToStringPrec(VecDistance(at, pos), 4)
-			+ " " + IntToString(flags) + "|" + StrLeft(StrReplaceAll(actor.GetDisplayName(), "|", "/"), 80) + "|"
-			+ StrLeft(StrReplaceAll(actor.GetReadableName(), "|", "/"), 80);
+			+ " " + IntToString(flags) + "|" + StrLeft(StrReplaceAll(actor.GetDisplayName(), "|", "/"), 80) + "|" + entity;
 	}
 	return text;
 }

@@ -185,8 +185,10 @@ pub const MAX_ITEM_BYTES: usize = 200;
 pub const MAX_ITEM_COUNT: u32 = 1000;
 /// The widest `world.actors` radius, in the scripts' units (metres).
 pub const MAX_ACTORS_RADIUS: f32 = 100.0;
-/// The most actors one `world.actors` reply holds: 50 of them, names cut at 80 characters, stay under
-/// [`MAX_REPLY_BYTES`].
+/// The most actors one `world.actors` reply holds: 50 of them, the display name cut at 80 characters and the entity at
+/// 255 (quen-w3 0.1.11), take about 53 KB at worst (every entity character a `\`, escaped; every name character 3
+/// UTF-8 bytes), under [`MAX_REPLY_BYTES`]. Names full of control characters (6 bytes each, escaped) would exceed it:
+/// the ASI then answers that the reply is too long.
 pub const MAX_ACTORS: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

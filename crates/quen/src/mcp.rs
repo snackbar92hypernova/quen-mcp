@@ -840,9 +840,10 @@ pub(crate) fn tools() -> Value {
                 its job, replay the journal (restore every file it changed, unpark the mods, recycle the staged \
                 files and their new logs once game_logs copied them: only what still is as \
                 quen left it; a file the game rewrote is kept beside as .quen-current), release the lock. saves lists what the game wrote in gamesaves since the launch: tainted ones (written after a \
-                memory patch, cvar write or teleport) first, every changed one, and the unexpected ones (not AutoSave \
-                / CheckPoint): tell the user. The boot's ledger row gets its outcome. If the replay leaves a step \
-                (replay.left says why) the journal stays; session_recover retries. Never while the game runs outside \
+                memory patch, cvar write or teleport) first, every changed one, the ones the game deleted (deleted: \
+                each with quen's pre-launch copy, or null; quen never writes them back), and the unexpected ones (not \
+                AutoSave / CheckPoint): tell the user. The boot's ledger row gets its outcome. If the replay leaves a \
+                step (replay.left says why) the journal stays; session_recover retries. Never while the game runs outside \
                 quen's job. A play session: refused while the game runs, unless close_game; saves.user lists the \
                 user's saves.",
             "inputSchema": {
