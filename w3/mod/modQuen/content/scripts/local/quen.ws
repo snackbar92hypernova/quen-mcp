@@ -586,8 +586,10 @@ function QUEN_Groups() : array<name>
 // FLAG_OnlyAliveActors, the player added if missing), with an id only the one whose GetGuidHash it is, nearest that
 // centre first (SortNodesByDistance), at most max: "<found> <camera x y z> <pitch yaw roll> <fov>" (theCamera's), then per
 // entity "|<flags> <id> <x> <y> <share> <distance> <x y z> <heading> <head x y z> <torso x y z>|<display name>|<readable
-// name>" as W3Quen.cpp's FrameJson reads it. x, y: theCamera.WorldVectorToViewRatio of the box's centre (flag 1 when in
-// front). share: CalcBoundingBox's 8 corners projected, those in front of the camera only (flag 2 when all 8), their
+// name>" as W3Quen.cpp's FrameJson reads it. The box: with a head bone, the body's (from 0.14), from the feet to 0.15 m
+// above the head bone and 0.3 m each way along the camera's horizontal axes; else CalcBoundingBox's, which holds every
+// component (boot 190: 2 to 5 times the body). x, y: theCamera.WorldVectorToViewRatio of the box's centre (flag 1 when in
+// front). share: the box's 8 corners projected, those in front of the camera only (flag 2 when all 8), their
 // rectangle clipped to the frame (-1 to 1), its area over the frame's (4). distance: from the camera. head and torso:
 // GetBoneWorldPositionByIndex of GetHeadBoneIndex and GetTorsoBoneIndex (flags 8, 16), actors only. The first `points`
 // of head, torso and origin each get a StaticTrace from the camera over QUEN_Groups (flags 256, 512, 1024), clear when
@@ -604,8 +606,8 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 	var world : CWorld;
 	var box : Box;
 	var rot : EulerAngles;
-	var cam, centre, pos, head, torso, mid, hit, normal : Vector;
-	var x, y, minX, minY, maxX, maxY, share : float;
+	var cam, centre, pos, head, torso, mid, hit, normal, right, a, b : Vector;
+	var x, y, minX, minY, maxX, maxY, share, top : float;
 	var i, k, flags, front, bone, points : int;
 	var text, entity : string;
 
@@ -613,6 +615,10 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 	groups = QUEN_Groups();
 	cam = theCamera.GetCameraPosition();
 	rot = theCamera.GetCameraRotation();
+	// The body box's half-widths, along the camera's horizontal right and forward.
+	right = VecNormalize2D(theCamera.GetCameraRight());
+	a = 0.3 * right;
+	b = Vector(-a.Y, a.X, 0, 0);
 	centre = cam;
 	if (n[3] > 0.5)
 		centre = Vector(n[4], n[5], n[6], 1.0);
@@ -636,16 +642,53 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 		flags = 0;
 		if (thing == thePlayer)
 			flags += 4;
-		thing.CalcBoundingBox(box);
+		head = Vector(0, 0, 0, 1.0);
+		torso = Vector(0, 0, 0, 1.0);
+		if (actor)
+		{
+			bone = actor.GetHeadBoneIndex();
+			if (bone != -1)
+			{
+				head = actor.GetBoneWorldPositionByIndex(bone);
+				flags += 8;
+			}
+			bone = actor.GetTorsoBoneIndex();
+			if (bone != -1)
+			{
+				torso = actor.GetBoneWorldPositionByIndex(bone);
+				flags += 16;
+			}
+			if (actor.IsInView())
+				flags += 4096;
+		}
 		corner.Clear();
-		corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Min.Z, 1.0));
-		corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Min.Z, 1.0));
-		corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Min.Z, 1.0));
-		corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Min.Z, 1.0));
-		corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Max.Z, 1.0));
-		corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Max.Z, 1.0));
-		corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Max.Z, 1.0));
-		corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Max.Z, 1.0));
+		if (flags % 16 >= 8)
+		{
+			// The body: 0.3 m fitted Geralt's pixel box in gameplay and in photo mode within 3 % (boot 190's captures).
+			top = head.Z + 0.15;
+			corner.PushBack(Vector(pos.X - a.X - b.X, pos.Y - a.Y - b.Y, pos.Z, 1.0));
+			corner.PushBack(Vector(pos.X + a.X - b.X, pos.Y + a.Y - b.Y, pos.Z, 1.0));
+			corner.PushBack(Vector(pos.X - a.X + b.X, pos.Y - a.Y + b.Y, pos.Z, 1.0));
+			corner.PushBack(Vector(pos.X + a.X + b.X, pos.Y + a.Y + b.Y, pos.Z, 1.0));
+			corner.PushBack(Vector(pos.X - a.X - b.X, pos.Y - a.Y - b.Y, top, 1.0));
+			corner.PushBack(Vector(pos.X + a.X - b.X, pos.Y + a.Y - b.Y, top, 1.0));
+			corner.PushBack(Vector(pos.X - a.X + b.X, pos.Y - a.Y + b.Y, top, 1.0));
+			corner.PushBack(Vector(pos.X + a.X + b.X, pos.Y + a.Y + b.Y, top, 1.0));
+			mid = Vector(pos.X, pos.Y, (pos.Z + top) / 2, 1.0);
+		}
+		else
+		{
+			thing.CalcBoundingBox(box);
+			corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Min.Z, 1.0));
+			corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Min.Z, 1.0));
+			corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Min.Z, 1.0));
+			corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Min.Z, 1.0));
+			corner.PushBack(Vector(box.Min.X, box.Min.Y, box.Max.Z, 1.0));
+			corner.PushBack(Vector(box.Max.X, box.Min.Y, box.Max.Z, 1.0));
+			corner.PushBack(Vector(box.Min.X, box.Max.Y, box.Max.Z, 1.0));
+			corner.PushBack(Vector(box.Max.X, box.Max.Y, box.Max.Z, 1.0));
+			mid = Vector((box.Min.X + box.Max.X) / 2, (box.Min.Y + box.Max.Y) / 2, (box.Min.Z + box.Max.Z) / 2, 1.0);
+		}
 		front = 0;
 		minX = 1000000;
 		minY = 1000000;
@@ -667,30 +710,10 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 			share = MaxF(0, MinF(maxX, 1) - MaxF(minX, -1)) * MaxF(0, MinF(maxY, 1) - MaxF(minY, -1)) / 4;
 		if (front == 8)
 			flags += 2;
-		mid = Vector((box.Min.X + box.Max.X) / 2, (box.Min.Y + box.Max.Y) / 2, (box.Min.Z + box.Max.Z) / 2, 1.0);
 		x = 0;
 		y = 0;
 		if (theCamera.WorldVectorToViewRatio(mid, x, y))
 			flags += 1;
-		head = Vector(0, 0, 0, 1.0);
-		torso = Vector(0, 0, 0, 1.0);
-		if (actor)
-		{
-			bone = actor.GetHeadBoneIndex();
-			if (bone != -1)
-			{
-				head = actor.GetBoneWorldPositionByIndex(bone);
-				flags += 8;
-			}
-			bone = actor.GetTorsoBoneIndex();
-			if (bone != -1)
-			{
-				torso = actor.GetBoneWorldPositionByIndex(bone);
-				flags += 16;
-			}
-			if (actor.IsInView())
-				flags += 4096;
-		}
 		if (points > 0 && flags % 16 >= 8)
 		{
 			flags += 256;

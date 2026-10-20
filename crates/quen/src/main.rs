@@ -39,6 +39,8 @@ mod notice;
 #[cfg(windows)]
 mod photo;
 #[cfg(windows)]
+mod plan;
+#[cfg(windows)]
 mod profile;
 #[cfg(windows)]
 mod proxy;

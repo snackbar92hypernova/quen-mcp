@@ -173,6 +173,8 @@ Captures can grow large, so quen reports the capture folder's size against a bud
 - a window whose present mode differs from the others is refused, and the states are put back at the end;
 - each window's UTC times are returned, so another tool's capture of the same boot can be cut to the same windows.
 
+`run_plan` runs a plan of quen's own tool calls as one call, each step checked against its tool's schema before any runs, with a setup that a relaunch repeats and a teardown that runs on every way out; an A/B inside it is a `measure_ab` step. No window measures a paused world: quen closes the game's pause menu first, or refuses.
+
 ### Profilers
 
 A launch can attach a profiler through a launch profile, whose file changes are ordinary journaled steps and whose conditions go on the boot row:

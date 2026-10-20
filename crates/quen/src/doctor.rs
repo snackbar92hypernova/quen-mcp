@@ -59,6 +59,20 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.14: scene.frame's share and centre from a body box for actors with a head bone (finding 89), in quen.ws; the
+    // ASI differs from 0.1.13's only in its version.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.14",
+        sha256: "a12fb3b5d672af664ae7e31b3bf8bd79eab6d0b90df552d8f479bb394b425f1e",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.14",
+        sha256: "97040312eac5b83dab98eb639f61d6514804241e56f29ad38fdf6c53e9bd33f6",
+        exact: true,
+    },
     // 0.1.13: the scene reads (scene.frame, scene.ground, scene.ray, nav.line), cam.noclip and the exec verb (scene.rs,
     // game_exec).
     Pin {
@@ -446,7 +460,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters; from quen-w3 \
         0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them); from quen-w3 \
         0.1.13, world_frame, world_ground, world_ray, world_nav, game_frame, game_place and game_exec (and \
-        measure_ab's console actions without typing)",
+        measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
+        x, y from a box around an actor's body",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

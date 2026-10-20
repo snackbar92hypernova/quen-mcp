@@ -25,7 +25,7 @@ use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
     camera, capture, channel, config, data, disk, doctor, focus, game, hands, ledger, measure, mem,
-    photo, save, scene, setup,
+    photo, plan, save, scene, setup,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -38,7 +38,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// sets another for its client; 0 waits for every call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 17] = [
+const LONG: [&str; 18] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -54,6 +54,7 @@ const LONG: [&str; 17] = [
     "mem_patch_instances",
     "sweep_play",
     "game_frame",
+    "run_plan",
     "data_scan",
     "script_compile",
 ];
@@ -607,18 +608,19 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                         Some(params["_meta"]["progressToken"].clone()).filter(|t| !t.is_null());
                     let wait = args.as_object_mut().and_then(|a| a.remove("wait"));
                     let job = Job::new(conn, id, name);
+                    let budget = match wait {
+                        Some(Value::Bool(false)) => Some(Duration::ZERO),
+                        _ => conn.budget(),
+                    };
+                    // Before the call is queued: with wait false the session thread finds it detached (run_plan's check).
+                    if let Some(budget) = budget {
+                        job.detach_after(budget);
+                    }
                     let _ = tx.send(Msg::Call {
                         job: job.clone(),
                         args,
                         progress,
                     });
-                    let budget = match wait {
-                        Some(Value::Bool(false)) => Some(Duration::ZERO),
-                        _ => conn.budget(),
-                    };
-                    if let Some(budget) = budget {
-                        job.detach_after(budget);
-                    }
                     return;
                 }
                 _ => return conn.send(&error(id, -32602, &format!("unknown tool {name:?}"))),
@@ -929,6 +931,7 @@ pub(crate) fn tools() -> Value {
     list.extend(scene::tools());
     list.push(photo::tool());
     list.extend(measure::tools());
+    list.push(plan::tool());
     list.extend(mem::tools());
     list.extend(data::tools());
     list.extend(ledger::tools());

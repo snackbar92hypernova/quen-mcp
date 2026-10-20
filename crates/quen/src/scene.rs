@@ -29,8 +29,9 @@ const MAX_SIDES: usize = 8;
 /// game_frame's wait after each set by default, and at most (ms): the rendered camera follows a set one frame later.
 const SETTLE_MS: u64 = 250;
 const SETTLE_MAX_MS: u64 = 10_000;
-/// game_place: how far above and below the z the navmesh is looked for (metres).
-const PLACE_RANGE: f32 = 10.0;
+/// game_place: how far above and below the z the navmesh is looked for (metres): vanilla's scene player corrects a walk
+/// target's z within 5 m (scenePlayer.ws). Boot 190: within 10 m of a wall's foot it found an upper level 8.9 m up.
+const PLACE_RANGE: f32 = 5.0;
 /// game_place: how far the player may stand from the spot in xy when read back (metres), and how long the read-back
 /// waits (the pose reads back from the game's next tick).
 const PLACE_OFF_M: f64 = 0.5;
@@ -55,10 +56,11 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "world_frame",
             "description": format!("Read what the rendered camera sees: the alive actors within radius of it, the \
-                player among them, nearest first, at most max; found counts all; camera is its pose. Each: id, name, \
+                player among them, nearest first, at most max; found counts all; camera is its pose (rot as \
+                game_camera gives it). Each: id, name, \
                 entity, player, pos, heading, head, torso (null without the bone), in_front, in_view (IsInView(): its \
                 meaning unverified), x, y (the box's centre in the frame, -1 to 1; null behind it), share (its box's \
-                corners in front, clipped to the frame, over its area; a rotated box overstates it), box_whole, \
+                corners in front, clipped to the frame, over its area; which box: quen_guide), box_whole, \
                 distance, visible (head, torso, origin, as points asks: a ray from the camera hits no static geometry; \
                 null: not cast), visible_points. {reads}."),
             "inputSchema": schema(json!({
@@ -74,7 +76,8 @@ pub fn tools() -> Vec<Value> {
                 null), water_level and water_depth (GetWaterLevel, GetWaterDepth: callers in the game's scripts treat a \
                 depth above 0 as water), free (with radius above 0 and a navmesh z: NavigationCircleTest of that \
                 radius there; else null), safe (with search above 0: NavigationFindSafeSpot within search, radius as \
-                its personal space; null if none). {reads}."),
+                its personal space; null if none). Boot 190, range 10 at a wall's foot: the ray hit an overhang 8.8 m \
+                up and nav_z was that level; a small range with z near the ground keeps both near z. {reads}."),
             "inputSchema": schema(json!({
                 "points": {"type": "array", "minItems": 1, "maxItems": MAX_QUERIES, "items": vec3("[x, y, z] in metres: z where to look"), "description": "1 to 16 points"},
                 "range": {"type": "number", "minimum": 0, "maximum": MAX_GROUND_RANGE, "description": "metres above and below z, above 0; default 10"},
@@ -132,11 +135,12 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "game_place",
-            "description": "Place the player on the navmesh at pos: z from NavigationComputeZ within 10 m of pos's z \
+            "description": "Place the player on the navmesh at pos: z from NavigationComputeZ within 5 m of pos's z \
                 (default the player's), then a free circle of radius there; with search, the nearest safe spot within \
                 it if the circle isn't free (moved_m). Facing face (a point) or yaw, default the current heading. Then \
                 the teleport verb, as game_teleport sends it (journaled; every save the game writes after it counts as \
-                tainted), and the player's pose read back (world_get). quen-w3 0.1.13 or later. Refused, nothing \
+                tainted; sent: its pos and yaw), then placed: the player's pose read back (world_get; the game sets him \
+                on the ground, under the navmesh z). quen-w3 0.1.13 or later. Refused, nothing \
                 moved: wrong token, the user has the controls, no loaded game, no navmesh there, the circle not free \
                 and no safe spot, a bad value. Failed: no reply, or the player read back more than 0.5 m away in xy.",
             "inputSchema": schema(json!({
@@ -315,6 +319,13 @@ fn frame_read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
         ));
     };
     fields.extend(data);
+    // Finding 91: pitch, yaw and roll in (-180, 180], as game_camera reads them (the director's pitch read 350 for -10).
+    let rot = fields.get_mut("camera").and_then(|c| c.get_mut("rot"));
+    for a in rot.and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(deg) = a.as_f64() {
+            *a = json!((scene::wrap(deg) * 1e4).round() / 1e4);
+        }
+    }
     let entities = fields["entities"].as_array().cloned().unwrap_or_default();
     let rays = entities
         .iter()
@@ -827,13 +838,16 @@ fn place(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     }
     let reply = sent?;
     fields.insert("reply".into(), json!(reply.text));
-    fields.insert("placed".into(), json!({"pos": spot, "yaw": yaw}));
+    fields.insert("sent".into(), json!({"pos": spot, "yaw": yaw}));
     call.lap("teleport");
     sleep(PLACE_READ);
     let back = send(&cx, Verb::WorldGet {}, &fields)?
         .data
         .unwrap_or_default();
     fields.insert("world".into(), back.clone());
+    // Finding 91: the game sets the player on the ground below the navmesh z sent (0.4-1.3 m in boot 190).
+    let placed = json!({"pos": back["player"]["pos"], "yaw": back["player"]["heading"]});
+    fields.insert("placed".into(), placed);
     let off = point(&back["player"]["pos"])
         .map(|p| ((p[0] - spot[0]).powi(2) + (p[1] - spot[1]).powi(2)).sqrt());
     fields.insert("off_m".into(), json!(off.map(|o| (o * 1e3).round() / 1e3)));
@@ -890,7 +904,7 @@ mod tests {
                         json!([{"clear": true, "clear_in_direction": true, "reach": [3, 0, 1], "edge_m": 0.7}])
                     }
                     _ => {
-                        json!({"found": 1, "camera": {"pos": [0, 0, 2], "rot": [0, 0, 0], "fov": 40},
+                        json!({"found": 1, "camera": {"pos": [0, 0, 2], "rot": [350.0001, 190, 0], "fov": 40},
                         "entities": [{"id": -7, "player": true,
                             "visible": {"head": true, "torso": false, "origin": null}}]})
                     }
@@ -929,6 +943,12 @@ mod tests {
         assert_eq!(
             frame["budget"]["rays"], 2,
             "two rays cast, one not: {frame}"
+        );
+        // Finding 91: the camera's angles as game_camera reads them.
+        assert_eq!(
+            frame["camera"]["rot"],
+            json!([-9.9999, -170.0, 0.0]),
+            "{frame}"
         );
         // Refused before anything is sent: the core's caps and shapes.
         for (tool, args) in [
@@ -1175,18 +1195,21 @@ mod tests {
             read(Value::Null, Value::Null, Value::Null),
         ]);
         let at = std::sync::Mutex::new(json!([0, 0, 29]));
+        let heading = std::sync::Mutex::new(json!(45));
         let server = fake_game(
             &token(&fx),
             // Placed: world.get, scene.ground, teleport, world.get; the safe spot's four; the refusal's two.
             10,
             Box::new(move |r| {
                 let data = match &r.verb {
-                    Verb::WorldGet {} => {
-                        Some(json!({"player": {"pos": *at.lock().unwrap(), "heading": 45}}))
-                    }
+                    Verb::WorldGet {} => Some(
+                        json!({"player": {"pos": *at.lock().unwrap(), "heading": *heading.lock().unwrap()}}),
+                    ),
                     Verb::SceneGround { .. } => Some(ground.lock().unwrap().remove(0)),
-                    Verb::Teleport { pos, .. } => {
-                        *at.lock().unwrap() = json!(pos);
+                    Verb::Teleport { pos, rot } => {
+                        // The game sets the player 0.25 m below the navmesh z, on the ground, turned to the yaw.
+                        *at.lock().unwrap() = json!([pos[0], pos[1], pos[2] - 0.25]);
+                        *heading.lock().unwrap() = json!(rot[1]);
                         None
                     }
                     _ => None,
@@ -1198,15 +1221,20 @@ mod tests {
         let args = json!({"token": "tok", "pos": [10, 20], "face": [10, 30]});
         let out = run(&mut session, "game_place", args);
         assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["sent"], json!({"pos": [10.0, 20.0, 30.25], "yaw": 0.0}));
+        // Finding 91: placed is where the game put the player, read back.
         assert_eq!(
             out["placed"],
-            json!({"pos": [10.0, 20.0, 30.25], "yaw": 0.0})
+            json!({"pos": [10.0, 20.0, 30.0], "yaw": 0.0})
         );
         let args = json!({"token": "tok", "pos": [10, 20, 29], "search": 3});
         let out = run(&mut session, "game_place", args);
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["moved_m"], 1.0);
-        assert_eq!(out["placed"]["yaw"], 45.0, "the heading kept");
+        assert_eq!(
+            out["sent"]["yaw"], 0.0,
+            "the heading kept: the first place turned him to 0"
+        );
         let out = run(
             &mut session,
             "game_place",
@@ -1231,7 +1259,7 @@ mod tests {
         let sent = verbs(server.join().unwrap());
         let ground = Verb::SceneGround {
             xyz: vec![10.0, 20.0, 29.0],
-            range: 10.0,
+            range: 5.0,
             radius: 0.5,
             search: 0.0,
         };
@@ -1243,7 +1271,7 @@ mod tests {
         assert_eq!(sent[2], first);
         let safe = Verb::Teleport {
             pos: [11.0, 20.0, 30.5],
-            rot: [0.0, 45.0, 0.0],
+            rot: [0.0; 3],
         };
         assert_eq!(sent[6], safe);
         // Each teleport journaled and tainting, as game_teleport's; the refused place sent none.
