@@ -26,6 +26,7 @@ The sources moved here from the maintainer's `witcher3-mods` repo (its `asi\quen
 | `third_party\` | Tracy 0.14.1's client and Microsoft Detours 4.0.1, compiled into the ASI (versions and licences: its README) |
 | `mod\modQuen\content\scripts\local\quen.ws` | the one script: state, channel, camera paths, photo mode, console commands |
 | `pack.py` | builds, tests and packs the release zip |
+| `probes\walkers\` | a throwaway probe mod, never packed: do spawned NPCs walk where scripts tell them (its README) |
 | `out\` | build output and zips (ignored by git, never committed) |
 
 ## Release
