@@ -1,6 +1,6 @@
 # Installing quen
 
-quen lets a coding agent (Claude Code, or another MCP client) drive one Witcher 3 session at a time for mod testing: launch with settings overrides and mods parked, load saves, take screenshots, run PresentMon A/B measurements, and record everything in a local database. Whatever happens, it puts the game folder back.
+quen lets a coding agent (Claude Code, or another MCP client) drive one Witcher 3 session at a time for mod development, testing and troubleshooting: launch with settings overrides and mods parked, load saves, take screenshots, run PresentMon A/B measurements, and record everything in a local database. Whatever happens, it puts the game folder back.
 
 > **Early access.** quen is in early development, and so is this guide.
 >

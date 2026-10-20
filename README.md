@@ -1,14 +1,32 @@
 # quen
 
-**An MCP server that lets an AI coding agent drive The Witcher 3 for mod testing: reproducibly, with guard rails, and with a record of every result.**
+**An MCP server that lets an AI coding agent drive The Witcher 3 for mod development, testing and troubleshooting: reproducibly, with guard rails, and with a record of every result.**
 
-quen gives an agent (Claude Code, VS Code's agent mode and other MCP clients) the tools to launch the game into a test session, control it, capture frames, measure frame times, read and patch memory, and fly the camera. Afterwards it puts the game back exactly as it was. Every boot, capture and measurement goes into a local SQLite ledger. Results from the other tools a modder uses (the RenoDX devkit, Nsight, RenderDoc, Tracy, REA / Ghidra) go there too, so a later agent can investigate across all of them.
+quen gives an agent (Claude Code, VS Code's agent mode and other MCP clients) the tools to launch the game into a test session, control it, run a mod's own commands, read what the game is doing, capture frames, measure frame times and NPC behaviour, read and patch memory, and fly the camera. Afterwards it puts the game back exactly as it was. Every boot, capture and measurement goes into a local SQLite ledger. Results from the other tools a modder uses (the RenoDX devkit, Nsight, RenderDoc, Tracy, REA / Ghidra) go there too, so a later agent can investigate across all of them.
 
 > **Status: early access.** quen has been built and tested on one PC: The Witcher 3 5.01 (Steam, DX12), on Windows. Expect rough edges, and config keys that may still change.
 
-## Why
+## What it's for
 
-Testing a render mod by hand means the same chores every time:
+- **Developing a mod.** The agent works the build-and-try loop beside your other tools:
+  - it stages the build you just made, without touching your install;
+  - it relaunches in one call at the same save, spot, time, weather and settings;
+  - it switches your mod's options through its own exec functions, without typing into the console;
+  - it reads what the game is doing: the NPCs near the player, what's in frame, the game's memory and its data files.
+  
+  The evidence sits in one ledger beside the results of REA / Ghidra, the RenoDX devkit, RenderDoc, Nsight and Tracy.
+- **Testing a mod.**
+  - Frame-time A/B comparisons inside one boot, with a verdict.
+  - Screenshot sets and camera sweeps that repeat exactly after a change.
+  - Traces of the NPCs around the player (contacts, pushes, gliding, time blocked) for gameplay mods.
+- **Troubleshooting a mod list.** Mod conflicts and a sudden drop in frame rate after installing mods are some of the most common questions in modding communities. quen gives an agent the tools to narrow them down:
+  - it launches your install with any set of mods parked (moved aside for that boot);
+  - it measures frame times at the same spot each time, and records each boot's exact mod set, so halving the list boot by boot narrows down the mod that costs the frames;
+  - its offline script compile lists script files that two mods both carry, and its data tools list every mod that holds a given game file.
+  
+  Every boot is undone afterwards, so your install stays as it was.
+
+Done by hand, each of these is the same chores every time:
 - launch with the right settings and the right mods parked;
 - get to the same spot and toggle a setting;
 - measure, screenshot, and put everything back.
@@ -25,16 +43,25 @@ quen makes that the agent's job, with guard rails:
   - `session_launch` starts the game at a named save, with your `dx12user.settings` overrides, mods parked, frame generation and VSync as asked, and photo mode.
   - `session_end` puts every file it changed back, byte for byte, write times included, and reports any save the game wrote.
   - Play sessions (`mode: "play"`): you play the game quen launched with your mods and settings as they are, and hand the agent the controls when you want it to look at something; the session ends when you quit the game.
+  - Staged test files and mods (`stage`, `stage_mods`), copied in for one boot and taken out after.
+  - A relaunch with the same spec (`session_launch` with `again`): a rebuilt staged mod is copied in fresh, and the setup since the last launch (load, teleport, time, weather, console and exec lines) is replayed.
   - One agent drives at a time. A crash is recovered at quen's next start, or with `quen recover`.
 - **In-game control.**
+  - A mod's exec functions run directly (`game_exec`), without typing into the console.
   - Console commands typed for your keyboard layout. quen never uses your clipboard.
   - Keys, and loading a save by name.
-  - Pause, time of day, weather and teleport.
+  - Pause, time of day, weather, teleport, and placing the player on the navmesh at a free spot.
   - Engine variable (cvar) reads and writes, which last only for the session.
+- **Reading the game.**
+  - The actors near the player: positions, headings, velocities and flags, filtered by tag or class.
+  - The scene: what's in frame, ground height, line of sight and navmesh lines.
+  - Framing sets: the photo-mode camera placed around a subject from several sides in one call, each checked for a clear view first.
 - **Captures.**
   - SDR and HDR screenshots of the game window (Windows Graphics Capture, with Desktop Duplication as the fallback).
   - Disk use tracked against a budget. Captures are cleaned up only when you approve, to the Recycle Bin, never as a hard delete.
-- **Measurements.** PresentMon frame times, and A/B/A/B comparisons inside one boot, with a drift check and a quiet-machine check. The result is a verdict, not just a number.
+- **Measurements.**
+  - PresentMon frame times, and A/B/A/B comparisons inside one boot, with a drift check, a world-change check and a quiet-machine check. The result is a verdict, not just a number.
+  - Actor traces: the NPCs around the player sampled up to 10 times a second, with behaviour metrics (contacts per minute, closest approach, gliding, time blocked, pushes) that get A/B verdicts too.
 - **Camera sweeps.** Keyframed paths on the photo-mode camera:
   - played in real time, or frame by frame with a capture of each frame;
   - stored, so the same sweep replays after a change and the two runs compare frame by frame.
@@ -46,7 +73,8 @@ quen makes that the agent's job, with guard rails:
 - **The game's data.** Find, read and scan the files in its bundles and in REDkit's editor depot (CR2W files decoded to JSON; which files import or name something), and run REDkit's offline script compile on a scratch copy.
 - **Memory.**
   - Read, scan and follow pointers in the running game.
-  - Apply and undo live patches defined in your reverse-engineering knowledge base. Saves written after a patch are flagged as tainted.
+  - Apply and undo live patches defined in your reverse-engineering knowledge base: at a fixed address, or a field in every live instance of a class (or only the instances you list). Saves written after a patch are flagged as tainted.
+  - Compare two memory searches: instances added, removed and changed.
 - **The ledger.**
   - Boots, with their game build, mod set, settings and conditions.
   - Captures and measurements.
@@ -100,6 +128,10 @@ quen never downloads or installs third-party tools: you install them yourself, u
 4. **End the session** (or let the agent end it). quen restores everything and tells you what the game wrote.
 
 **More things to ask for:**
+- "My frame rate halved after I installed a batch of mods. Measure my setup at this spot, then park half the mods per boot until you've narrowed down which one costs the frames."
+- "Which of my installed mods carry the same script files?"
+- "I rebuilt my mod: relaunch at the same spot and settings, then switch it on and off with its exec command and compare."
+- "Trace the NPCs around Geralt on this bridge for 30 seconds, with my crowd mod on and off."
 - "Compare frame time with bloom on and off at this spot, A/B inside one boot, and tell me whether the difference is outside drift."
 - "Record a camera sweep through this room from four poses, play it frame by frame, and save it as tavern-flyby."
 - "Take an HDR screenshot with my mod's tonemapper on, then off."

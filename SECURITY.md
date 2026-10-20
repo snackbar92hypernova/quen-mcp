@@ -1,6 +1,6 @@
 # Security
 
-quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This page says what quen can do there, where its limits are, and what it trusts. It covers quen's own behaviour only.
+quen lets a coding agent drive The Witcher 3 on your PC for mod development, testing and troubleshooting. This page says what quen can do there, where its limits are, and what it trusts. It covers quen's own behaviour only.
 
 ## In short
 

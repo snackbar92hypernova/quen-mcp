@@ -17,6 +17,10 @@ Testing a render or performance mod is the same chores, boot after boot: launch 
 
 quen turns those chores into a service with guard rails. It is an MCP server and command-line tool. An agent asks quen for a test session; quen checks the request, records each change before it makes it, launches the game, and undoes every change on every way out. During the session the agent gets typed tools: control the game, capture frames, measure frame times, read and patch memory, fly the camera. Every boot, capture and measurement goes into a local SQLite ledger, beside the results of the other tools a modder uses, so a question asked next week is answered from recorded evidence rather than from memory.
 
+The same tools serve more than testing:
+- **Development:** an agent can drive a mod's build-and-try loop beside the modder's other tools: stage a new build, relaunch at the same spot, switch the mod through its own exec functions, and read what the game does.
+- **Troubleshooting:** it can narrow down a mod list's conflicts, or a sudden loss of frame rate, boot by boot, parking a different set of mods each time, with every loadout and its measurements recorded.
+
 quen supports one game: The Witcher 3 5.01 (DX12) on Windows. Its core logic is game-neutral.
 
 ## Principles
@@ -52,7 +56,7 @@ quen sends nothing off the PC: it has no network code, no telemetry and no updat
 
 ## Scope and non-goals
 
-quen is for testing mods on a single-player game installed on the user's own PC: launching controlled test sessions, driving the game into a state, capturing and measuring there, and keeping the evidence.
+quen is for developing, testing and troubleshooting mods on a single-player game installed on the user's own PC: launching controlled test sessions, driving the game into a state, capturing and measuring there, and keeping the evidence.
 
 It is deliberately not:
 - **a sandbox.** quen limits what quen itself does. An agent that also has shell or file tools can do anything the user's account can, with or without quen.
