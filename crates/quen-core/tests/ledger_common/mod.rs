@@ -121,8 +121,8 @@ pub fn commit() -> String {
 }
 
 /// A synthetic RE knowledge base for the build `exe_sha256` under `dir`: a git work tree `repo` (its `.git` only HEAD
-/// and the branch's ref) with the KB at `repo/re`: names.tsv, hooks.tsv, patches.tsv and cvar_layout.tsv, a note under
-/// `notes/` and a small frame map under `frame/`. Returns the KB root.
+/// and the branch's ref) with the KB at `repo/re`: names.tsv, hooks.tsv, patches.tsv, instance_patches.tsv and
+/// cvar_layout.tsv, a note under `notes/` and a small frame map under `frame/`. Returns the KB root.
 pub fn fake_kb(dir: &Path, exe_sha256: &str) -> PathBuf {
     let repo = dir.join("repo");
     let kb = repo.join("re");
@@ -155,6 +155,13 @@ pub fn fake_kb(dir: &Path, exe_sha256: &str) -> PathBuf {
         (
             "patches.tsv",
             format!("name\trva\told\tnew\tbuild\tboundaries-checked\ncull_off\t0x1F00\t74 05\teb 05\t{STAMP}\t-\n"),
+        ),
+        (
+            "instance_patches.tsv",
+            format!(
+                "name\tclass\tvtable\tbuild\toffset\ttype\told\tnew\tboundaries-checked\n\
+                 steer_wide\tCFake\t0x5000\t{STAMP}\t0x58\tf32\t0.2\t0.35\t-\n"
+            ),
         ),
         (
             "cvar_layout.tsv",

@@ -12,6 +12,7 @@
 //! write per live instance of a class, and made through the platform's write by [`write_instances`], which checks each
 //! instance again right before its write.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::ops::{ControlFlow, Range};
@@ -615,6 +616,42 @@ pub fn find(
         left_out: page.left_out,
     };
     Ok((page, digest(reads)))
+}
+
+/// What changed from one [`find`]'s hits (`a`) to another's (`b`), matched by `address`: `added` (the hits only `b`
+/// has), `removed` (only `a`), `changed` (`{address, <key>: {a, b}}`, every other key whose values differ, a missing one
+/// as null), in address order; `counts` of each and of the hits that are the `same`.
+pub fn diff(a: &[Row], b: &[Row]) -> serde_json::Value {
+    fn keyed(rows: &[Row]) -> BTreeMap<i128, &Row> {
+        let at = |r: &Row| number(r.get("address")?.as_str()?);
+        rows.iter().filter_map(|r| Some((at(r)?, r))).collect()
+    }
+    let (a, b) = (keyed(a), keyed(b));
+    let (mut removed, mut changed, mut same) = (Vec::new(), Vec::new(), 0);
+    for (at, was) in &a {
+        let Some(now) = b.get(at) else {
+            removed.push(was);
+            continue;
+        };
+        let keys: BTreeSet<&String> = was.keys().chain(now.keys()).collect();
+        let mut d = Row::from_iter([("address".into(), was["address"].clone())]);
+        for k in keys.into_iter().filter(|k| *k != "address") {
+            if was.get(k) != now.get(k) {
+                d.insert(k.clone(), json!({"a": was.get(k), "b": now.get(k)}));
+            }
+        }
+        match d.len() {
+            1 => same += 1,
+            _ => changed.push(d),
+        }
+    }
+    let added: Vec<_> = b
+        .iter()
+        .filter(|(at, _)| !a.contains_key(at))
+        .map(|(_, r)| r)
+        .collect();
+    let counts = json!({"added": added.len(), "removed": removed.len(), "changed": changed.len(), "same": same});
+    json!({"counts": counts, "added": added, "removed": removed, "changed": changed})
 }
 
 /// One hop of a pointer chain: the qword read at `at`.
@@ -1489,11 +1526,15 @@ pub fn from_instances_tsv(text: &str) -> Result<Vec<InstancePatch>, TsvError> {
 pub struct Instances {
     /// The vtable pointer searched for: the image base plus the row's RVA.
     pub vtable: u64,
+    /// The qwords the search found holding it; with a list of instances, those of them not listed.
+    pub found: usize,
+    pub unlisted: usize,
     /// One per instance whose field held the row's old bytes, in address order: the field's address, old, new.
     pub writes: Vec<Write>,
     /// The instances whose field held the row's new bytes.
     pub already: Vec<u64>,
-    /// The other qwords that held the vtable pointer, and why each isn't written.
+    /// The other qwords that held the vtable pointer (with a list, the listed ones the search didn't find too), and
+    /// why each isn't written.
     pub left: Vec<(u64, String)>,
     /// What the search covered: bytes, the pages it couldn't read, the regions it left out ([`scan`]'s).
     pub bytes: u64,
@@ -1504,12 +1545,14 @@ pub struct Instances {
 /// Plans the instance patch `name` in a process running `build`, its image at `image_base`: checks the row's rules,
 /// then finds every 8-byte-aligned qword holding the class's vtable pointer in the image and private regions
 /// ([`find`]'s scope, [`UNCACHED`] regions left out), page after page with `tick` as [`scan`] takes it, and reads the
-/// field of each. Refused, nothing written: a rule broken, the search stopped, or over [`MAX_INSTANCES`] found.
+/// field of each; with `only`, of those at the addresses it lists. Refused, nothing written: a rule broken, the search
+/// stopped, or over [`MAX_INSTANCES`] found.
 pub fn plan_instances(
     defs: &[InstancePatch],
     name: &str,
     build: &str,
     image_base: u64,
+    only: Option<&[u64]>,
     mem: &dyn Memory,
     tick: &mut dyn FnMut(u64, u64) -> ControlFlow<&'static str>,
 ) -> Result<(InstancePatch, Instances), Refusal> {
@@ -1574,6 +1617,18 @@ pub fn plan_instances(
             Some(next) => from = next,
             None => break,
         }
+    }
+    out.found = hits.len();
+    // ponytail: linear lookups, at most 1000 x 1000.
+    if let Some(only) = only {
+        for &at in only.iter().filter(|at| !hits.contains(at)) {
+            let why = "the search found no vtable pointer there".to_string();
+            if !out.left.iter().any(|(a, _)| *a == at) {
+                out.left.push((at, why));
+            }
+        }
+        hits.retain(|at| only.contains(at));
+        out.unlisted = out.found - hits.len();
     }
     let regions = mem.regions().map_err(listed)?;
     for at in hits {
@@ -3062,7 +3117,7 @@ mod tests {
         defs: &[InstancePatch],
         mem: &Fake,
     ) -> Result<(InstancePatch, Instances), Refusal> {
-        plan_instances(defs, "steer", "build-1", IMAGE, mem, &mut go)
+        plan_instances(defs, "steer", "build-1", IMAGE, None, mem, &mut go)
     }
 
     /// The writes `write_instances` made through it, kept to be made in the fake afterwards.
@@ -3264,6 +3319,64 @@ mod tests {
         assert_eq!(failed, [Err("no".to_string())]);
     }
 
+    /// With a list, only the listed instances the search found are planned; the others found are unlisted, a listed
+    /// address it didn't find is left once. The cap still counts every instance found.
+    #[test]
+    fn instance_patches_with_a_list_plan_only_the_instances_listed() {
+        let at = |i: u64| HEAP + i * SIZE;
+        let mut mem = Fake::default().with(HEAP, heap(4, 0.2), None);
+        mem.poke(at(2) + FIELD, &0.35f32.to_le_bytes());
+        let defs = [steer()];
+        let plan = |only: &[u64], mem: &Fake| {
+            plan_instances(&defs, "steer", "build-1", IMAGE, Some(only), mem, &mut go)
+        };
+        let list = [at(1), at(2), at(2), at(3) + 8, at(3) + 8];
+        let (_, found) = plan(&list, &mem).unwrap();
+        let fields: Vec<u64> = found.writes.iter().map(|w| w.address - FIELD).collect();
+        assert_eq!(fields, [at(1)]);
+        assert_eq!(found.already, [at(2)]);
+        let why = "the search found no vtable pointer there".to_string();
+        assert_eq!(found.left, [(at(3) + 8, why)]);
+        assert_eq!((found.found, found.unlisted), (4, 2));
+        let (_, all) = plan_steer(&defs, &mem).unwrap();
+        assert_eq!((all.found, all.unlisted, all.writes.len()), (4, 0, 3));
+        let over = Fake::default().with(HEAP, heap(MAX_INSTANCES as u64 + 1, 0.2), None);
+        assert_eq!(
+            plan(&[HEAP], &over).unwrap_err(),
+            Refusal::TooMany(MAX_INSTANCES + 1)
+        );
+    }
+
+    /// Hits match by address, in address order (0x100 after 0x20); a key only one side has differs from null.
+    #[test]
+    fn diffs_match_hits_by_address() {
+        let row = |v: serde_json::Value| -> Row { serde_json::from_value(v).unwrap() };
+        let a = [
+            row(json!({"address": "0x10", "value": "0x1", "w": 0.2})),
+            row(json!({"address": "0x8", "value": "0x1", "w": 0.2})),
+            row(json!({"address": "0x20", "value": "0x1", "rva": "0x20"})),
+            row(json!({"address": "0x30", "why": "gone"})),
+        ];
+        let b = [
+            row(json!({"address": "0x8", "value": "0x1", "w": 0.2})),
+            row(json!({"address": "0x10", "value": "0x1", "w": 0.35})),
+            row(json!({"address": "0x20", "value": "0x1"})),
+            row(json!({"address": "0x100", "value": "0x1", "w": 0.2})),
+        ];
+        let d = diff(&a, &b);
+        let counts = json!({"added": 1, "removed": 1, "changed": 2, "same": 1});
+        assert_eq!(d["counts"], counts, "{d}");
+        assert_eq!(
+            (&d["added"], &d["removed"]),
+            (&json!([b[3]]), &json!([a[3]]))
+        );
+        let changed = json!([
+            {"address": "0x10", "w": {"a": 0.2, "b": 0.35}},
+            {"address": "0x20", "rva": {"a": "0x20", "b": null}},
+        ]);
+        assert_eq!(d["changed"], changed, "{d}");
+    }
+
     #[test]
     fn instance_patches_refuse_rows_that_break_the_rules_and_over_the_cap() {
         let mem = Fake::default().with(HEAP, heap(4, 0.2), None);
@@ -3301,7 +3414,7 @@ mod tests {
             refusal(other).to_string(),
             "defined for build build-2, not the running build-1"
         );
-        let unknown = plan_instances(&[steer()], "nope", "build-1", IMAGE, &mem, &mut go);
+        let unknown = plan_instances(&[steer()], "nope", "build-1", IMAGE, None, &mem, &mut go);
         assert_eq!(
             unknown.unwrap_err().to_string(),
             r#"no patch named "nope" in instance_patches.tsv"#
@@ -3311,7 +3424,7 @@ mod tests {
             .with(HEAP, heap(4, 0.2), None)
             .with(FREED, heap(4, 0.2), None);
         let mut stop = |_: u64, _: u64| ControlFlow::Break("deadline");
-        let stopped = plan_instances(&[steer()], "steer", "build-1", IMAGE, &two, &mut stop);
+        let stopped = plan_instances(&[steer()], "steer", "build-1", IMAGE, None, &two, &mut stop);
         assert_eq!(
             stopped.unwrap_err(),
             Refusal::Stopped {

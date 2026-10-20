@@ -1,7 +1,7 @@
 //! The RE knowledge base's index in the ledger (docs/intent.md, "Game knowledge"): `quen kb scan` mirrors the KB's
-//! curated tables (names.tsv, hooks.tsv, patches.tsv, cvar_layout.tsv) as entities, addresses and links stamped
-//! `<file>@<commit>`, splits every note at its H2 / H3 headings into addressable sections, and records which known
-//! entities each section mentions; `quen kb claims` turns the rows of chosen note tables into keyed claims with the
+//! curated tables (names.tsv, hooks.tsv, patches.tsv, instance_patches.tsv, cvar_layout.tsv) as entities, addresses
+//! and links stamped `<file>@<commit>`, splits every note at its H2 / H3 headings into addressable sections, and records
+//! which known entities each section mentions; `quen kb claims` turns the rows of chosen note tables into keyed claims with the
 //! author's grades. The text stays in git: the ledger holds paths, anchors, line ranges, sha256s and the commit. The
 //! commit is read from the work tree's `.git` files ([`git_head`]), so no git process is started.
 
@@ -289,8 +289,10 @@ pub struct KbScan {
     pub names: usize,
     pub hooks: usize,
     pub patches: usize,
+    pub instance_patches: usize,
     pub cvar_layouts: usize,
-    /// patches.tsv and cvar_layout.tsv rows of a build stamp the ledger has no game row for: not mirrored.
+    /// patches.tsv, instance_patches.tsv and cvar_layout.tsv rows of a build stamp the ledger has no game row for: not
+    /// mirrored.
     pub rows_unknown_build: usize,
     pub notes: usize,
     pub sections: usize,
@@ -469,7 +471,7 @@ impl Ledger {
     /// Everything is read and checked first, then written in one transaction; a scan of an unchanged KB adds nothing.
     /// Refused, nothing written: a KB outside a git work tree (or before its first commit), no names.tsv or hooks.tsv
     /// with a build line, two tables naming different builds, a build the ledger has no game row for, a bad table row,
-    /// a name defined twice, a note that isn't UTF-8.
+    /// a name defined twice (a patch's in patches.tsv and instance_patches.tsv too), a note that isn't UTF-8.
     pub fn scan_kb(&mut self, root: &Path) -> Result<KbScan> {
         let commit = git_head(root).ok_or_else(|| {
             Error::Refused(format!(
@@ -479,6 +481,7 @@ impl Ledger {
         })?;
         let (names, hooks) = (read(root, "names.tsv")?, read(root, "hooks.tsv")?);
         let (patches, layouts) = (read(root, "patches.tsv")?, read(root, "cvar_layout.tsv")?);
+        let instances = read(root, "instance_patches.tsv")?;
         let build = kb_build(names.as_deref(), hooks.as_deref())?;
         let stamp = format!("{:08X}", build.stamp.0);
 
@@ -539,6 +542,21 @@ impl Ledger {
             }
             None => Vec::new(),
         };
+        let instance_rows = match &instances {
+            Some(text) => {
+                crate::mem::from_instances_tsv(text).map_err(|e| Error::Refused(e.to_string()))?
+            }
+            None => Vec::new(),
+        };
+        if let Some(p) = instance_rows
+            .iter()
+            .find(|p| patch_rows.iter().any(|q| q.name == p.name))
+        {
+            return Err(Error::Refused(format!(
+                "{} names a patch in patches.tsv and one in instance_patches.tsv: one name, one patch",
+                p.name
+            )));
+        }
         let layout_rows = match &layouts {
             Some(text) => {
                 crate::cvar::from_layout_tsv(text).map_err(|e| Error::Refused(e.to_string()))?
@@ -565,6 +583,7 @@ impl Ledger {
                 names: named.len(),
                 hooks: hooked.len(),
                 patches: 0,
+                instance_patches: 0,
                 cvar_layouts: 0,
                 rows_unknown_build: 0,
                 notes: docs.len(),
@@ -637,6 +656,31 @@ impl Ledger {
             }
             out.patches = rows.len();
             l.mirror("patches.tsv", &commit, &game, &rows)?;
+            // An instance patch: at its class's vtable, and the field `<class>+0x<offset>` it sets.
+            let mut rows = Vec::new();
+            for p in &instance_rows {
+                let Some(g) = l.stamp_game(&p.build, &build, game_id)? else {
+                    out.rows_unknown_build += 1;
+                    continue;
+                };
+                out.instance_patches += 1;
+                let mirrored = |kind, key, rva, offset| Mirrored {
+                    kind,
+                    key,
+                    label: None,
+                    game_id: g,
+                    rva,
+                    offset,
+                    confidence: None,
+                };
+                let field = format!("{}+{:#x}", p.class, p.offset);
+                rows.push(mirrored("patch", p.name.clone(), Some(i64::from(p.vtable)), None));
+                rows.push(mirrored("field", field, None, Some(p.offset as i64)));
+            }
+            let ids = l.mirror("instance_patches.tsv", &commit, &game, &rows)?;
+            let want: BTreeSet<(i64, &str, i64)> = ids.chunks(2).map(|p| (p[0], "sets", p[1])).collect();
+            out.links += want.len();
+            l.mirror_links("instance_patches.tsv", &commit, &want)?;
             let mut rows = Vec::new();
             for layout in &layout_rows {
                 let Some(g) = l.stamp_game(&layout.build, &build, game_id)? else {
