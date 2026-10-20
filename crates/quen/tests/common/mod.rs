@@ -348,13 +348,15 @@ impl Quen {
     pub fn spawn_with(fx: &Fixture, config: &str, flags: u32, env: &[(&str, &str)]) -> Quen {
         let mut child = Command::new(env!("CARGO_BIN_EXE_quen"))
             .arg("mcp")
-            .envs(env.iter().copied())
             .env("QUEN_CONFIG", fx.path(config))
             .env("QUEN_TEST_IN_JOB", "1")
             .env("QUEN_TEST_PINS", test_pins())
             .env("QUEN_TEST_RECYCLE_TO", fx.path("recycled"))
             .env("QUEN_TEST_WCC_IMAGE", "quen-test-no-such-wcc.exe")
+            // REDkit's licence answer, accepted: no test reads the user's.
+            .env("QUEN_TEST_EULA", "1")
             .env("QUEN_TEST_INPUT", fx.path("harness/fake_input.py"))
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .creation_flags(flags)

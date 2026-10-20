@@ -857,7 +857,10 @@ impl<'a> Session<'a> {
             n if n.starts_with("sweep_") => camera::call(self, call, n, args),
             n if n.starts_with("measure_") => measure::call(self, call, n, args),
             n if n.starts_with("mem_") => mem::call(self, call, n, args),
-            n @ ("data_read" | "data_scan" | "script_compile") => data::call(self, call, n, args),
+            // quen_setup comes here only with licence (mcp.rs): it runs wcc_lite as script_compile does.
+            n @ ("data_read" | "data_scan" | "script_compile" | "quen_setup") => {
+                data::call(self, call, n, args)
+            }
             _ => self.recover(call, true),
         }
     }

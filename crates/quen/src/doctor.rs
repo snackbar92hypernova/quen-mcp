@@ -977,8 +977,9 @@ pub(crate) const REDKIT: Dep = Dep {
     enables: "script_compile (its wcc_lite), and data_find, data_read and data_scan with where: redkit (its depot, \
         r4data)",
     how_to_get: "The Witcher 3 REDkit on Steam (free, app 2684660), installed by you: its licence (wcc_eula.rtf beside \
-        wcc_lite.exe) is between you and CD PROJEKT RED, and quen never installs it. quen's config names its folder \
-        (redkit; quen_setup finds it in Steam's libraries)",
+        wcc_lite.exe) is between you and CD PROJEKT RED, and quen never installs it. You accept it with Agree in \
+        REDkit's own licence dialog, which quen_setup licence: true opens; quen never answers it. quen's config names \
+        its folder (redkit; quen_setup finds it in Steam's libraries)",
     check: |cx| {
         let Some(dir) = &cx.config.redkit else {
             return State::missing("no redkit in quen's config".into());
@@ -994,10 +995,50 @@ pub(crate) const REDKIT: Dep = Dep {
                 Some(build) => format!("wcc_lite {version}, Steam build {build}"),
                 None => format!("wcc_lite {version}"),
             }),
+            note: Some(licence().map_or_else(|why| why, String::from)),
             ..State::found(exe)
         }
     },
 };
+
+/// Where REDkit's licence dialog keeps the user's answer, under HKEY_CURRENT_USER.
+const REDKIT_EULA: &str = r"Software\CD Projekt RED\Mod Tools\1.0";
+
+/// `DoNotShowEula` under [`REDKIT_EULA`]: 1 when the user's last answer in REDkit's licence dialog was Agree (wcc_lite
+/// writes 0 before it shows the dialog, 1 on Agree). quen only reads it. `QUEN_TEST_EULA` (tests only) stands in for
+/// it: a number, or empty for none.
+pub(crate) fn redkit_licence() -> Option<u32> {
+    match env::var("QUEN_TEST_EULA") {
+        Ok(v) => v.parse().ok(),
+        Err(_) => crate::win::reg_dword(false, REDKIT_EULA, "DoNotShowEula"),
+    }
+}
+
+/// [`redkit_licence`] as quen_doctor's note and script_compile's refusal say it: Err until it is 1.
+fn licence() -> Result<&'static str, String> {
+    match redkit_licence() {
+        Some(1) => Ok("licence accepted (DoNotShowEula = 1: the user's Agree in REDkit's dialog)"),
+        v => Err(format!(
+            "REDkit's licence is not accepted (DoNotShowEula = {}): quen_setup with licence: true opens REDkit's own \
+             licence dialog (tell the user first that it opens and that the choice is theirs); script_compile is \
+             refused until then",
+            v.map_or("not set".into(), |v| v.to_string())
+        )),
+    }
+}
+
+/// Refused with needs, nothing changed, until the user agreed to REDkit's licence in its own dialog.
+pub(crate) fn redkit_licence_accepted(tool: &str) -> Result<(), Done> {
+    licence().map(drop).map_err(|why| {
+        let need = json!({
+            "dependency": REDKIT.name,
+            "status": "licence_not_accepted",
+            "needed_for": tool,
+            "how_to_get": REDKIT.how_to_get,
+        });
+        Done::Needs(why, vec![need])
+    })
+}
 
 /// A table of the RE knowledge base (live boot 1: the KB folder was there, its tables weren't).
 fn kb_table(cx: &Cx, file: &str) -> State {
