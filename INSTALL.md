@@ -101,7 +101,7 @@ Your config, ledger, logs and captures stay. When a new quen changes the ledger'
 
 **Optional:** ReShade with RenoDX, the RenoDX devkit, Nsight Systems, Nsight Graphics, RenderDoc, and Tracy's capture tool. Each stays off until its key is in the config (§3: `quen_setup` finds the ones an installer put in place, and writes a key once you confirm it; Tracy's capture tool comes as a zip, so you name its path); then a launch can ask for it. Tracy needs version 0.14.1 exactly, `tracy-capture.exe` from Tracy's v0.14.1 release (<https://github.com/wolfpld/tracy/releases>): it must match the Tracy client inside quen's package from quen-w3 0.1.3, which runs only in a `tracy` launch. Once the devkit is configured it loads by default (ReShade loads it; the RenoDX add-on isn't needed for it); `devkit: false` leaves it out, for timing runs.
 
-**Optional: The Witcher 3 REDkit** (Steam, free), for `script_compile` and the data tools' `where: redkit`. `quen_setup` finds it in Steam's libraries. Its licence (`wcc_eula.rtf` beside `wcc_lite.exe`) is yours to accept; quen never installs it.
+**Optional: The Witcher 3 REDkit** (Steam, free), for `script_compile` and the data tools' `where: redkit`. `quen_setup` finds it in Steam's libraries. Its licence (`wcc_eula.rtf` beside `wcc_lite.exe`) is yours to accept, with Agree in REDkit's own licence dialog: `quen_setup` can open it (`licence: true`), and you answer it yourself. quen never installs REDkit and never answers that dialog. Once you have agreed, `script_compile` runs wcc_lite with `-agreetoterms`; until then it is refused.
 
 ## 2. Build and install
 

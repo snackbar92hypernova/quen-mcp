@@ -5,7 +5,8 @@
 //! checks them, then written to the config, its other lines and comments kept; the quen serve this runs in takes them
 //! up for every connection (session.rs `Session::reload`). A key in the config file counts as confirmed: only the user
 //! (by hand) or this tool (with user_ok) writes one. The agent asks, quen doesn't: it never picks between candidates.
-//! `quen setup` is the same in a terminal.
+//! `quen setup` is the same in a terminal. With `licence` it shows REDkit's licence dialog instead, on the session
+//! thread (data.rs).
 
 use std::env;
 use std::ffi::OsString;
@@ -782,7 +783,8 @@ pub fn tool() -> Value {
             the user its note first. When the user installed a tool, run it again and confirm its new rows the same \
             way. Then call with values (every one agreed) and user_ok: true: each is checked as quen_doctor checks \
             it, and any problem is refused with nothing written. reloaded / applies: whether every connection uses \
-            the new config now (no reconnect), or when it will (after a live session ends).",
+            the new config now (no reconnect), or when it will (after a live session ends). licence: REDkit's \
+            licence dialog.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -812,6 +814,7 @@ pub fn tool() -> Value {
                     "additionalProperties": false,
                 },
                 "user_ok": {"type": "boolean", "description": "true only after the user agreed to these values (or the move) in this conversation"},
+                "licence": {"type": "boolean", "description": "true, alone: opens The Witcher 3 REDkit's own licence dialog (CD PROJEKT RED's) for the user to answer: tell the user first that it opens and that the choice is theirs. quen runs wcc_lite once without -agreetoterms and with no command, brings the dialog to the front and waits up to 600 s; it never clicks it and never writes the answer, which REDkit keeps (DoNotShowEula under HKCU\\Software\\CD Projekt RED\\Mod Tools\\1.0). Result: accepted and do_not_show_eula (1: Agree), dialog_shown, dialog_in_front, exit_code: tell the user the answer. script_compile runs only after an Agree. The documents folder's settings, which wcc_lite rewrites, are backed up first and put back after, journaled, and it is refused as script_compile is (needs without REDkit)"},
                 "move": {"type": "boolean", "description": "true: the one-time move of an older quen's config and data (AppData, or an app's private copy of it) into %USERPROFILE%\\.quen. Without user_ok, what moves; with it, every file copied and checked by sha256, then the old folders renamed quen.moved-<date>. Nothing is deleted"},
             },
             "additionalProperties": false,

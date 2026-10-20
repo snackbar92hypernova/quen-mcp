@@ -568,7 +568,10 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
             match name {
                 "session_status" => tool_result(&session::status(shared)),
                 "job_status" | "job_cancel" => return poll(shared, conn, id, name, &args),
-                "quen_setup" => tool_result(&setup::call(shared, &args, Some(tx))),
+                // With licence it runs wcc_lite under the game lock: on the session thread, below.
+                "quen_setup" if args.get("licence").is_none() => {
+                    tool_result(&setup::call(shared, &args, Some(tx)))
+                }
                 "quen_doctor" => tool_result(&doctor::call(shared, &args)),
                 "quen_guide" => tool_result(&guide(shared, &args)),
                 "capture_usage" => tool_result(&disk::usage(shared, &args)),

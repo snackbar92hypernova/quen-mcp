@@ -24,6 +24,7 @@ use crate::game::{Fields, flag, text};
 use crate::ledger::{self, INLINE_BYTES};
 use crate::session::{self, Call, Done, JournalFs, Session, Shared};
 use crate::win::Job;
+use crate::{focus, input};
 
 /// A page's rows when the call gives no `limit`, and the most it takes.
 const LIMIT: u64 = 100;
@@ -43,6 +44,9 @@ const ERRORS_INLINE: usize = 100;
 /// script_compile's `time_limit_s` when the call gives none, and the most it takes.
 const COMPILE_S: u64 = 600;
 const MAX_COMPILE_S: u64 = 1800;
+/// quen_setup licence: how long REDkit's licence dialog waits for the user's answer, and wcc_lite's run after it closes.
+const ANSWER: Duration = Duration::from_secs(600);
+const AFTER_ANSWER: Duration = Duration::from_secs(60);
 pub(crate) const REDKIT_APPID: &str = "2684660";
 pub(crate) const WCC_LITE: &str = r"bin\x64_RedKit\wcc_lite.exe";
 
@@ -125,8 +129,9 @@ pub fn tools() -> Vec<Value> {
                 wcc_lite rewrites files in the game's documents folder: each *.settings and *.settings.bak there is \
                 backed up first and put back after, journaled, so a crash is undone by the replay. Result: \
                 exit_code, errors (file, line, msg; file relative to the tree), warning_count, wcc_log (its log, \
-                copied). Refused while a session is live, while the game or another wcc_lite runs, and without \
-                REDkit (needs). About 25 s on the game's scripts: tell the user first. Counts as a busy machine for the measure tools.",
+                copied). Refused while a session is live, while the game or another wcc_lite runs, without REDkit, \
+                and until the user agreed in REDkit's licence dialog (quen_setup licence): needs says which. About \
+                25 s on the game's scripts: tell the user first. Counts as a busy machine for the measure tools.",
             "inputSchema": {"type": "object", "properties": {
                 "extra": list("mod folders outside the game (absolute paths), each holding content\\scripts, copied over the rest in this order"),
                 "stubs": {"type": "boolean", "description": "replace the mods' and extra's import functions with plain stubs; default false"},
@@ -142,6 +147,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "data_read" => read(session, call, args),
         "data_scan" => scan(session, call, args),
         "script_compile" => compile(session, call, args),
+        "quen_setup" => licence(session, call, args),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
     };
     out.map_or_else(|done| done, Done::Ok)
@@ -978,39 +984,9 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
         )
         .into());
     }
-    let exe = doctor::require(&doctor::REDKIT, &config, "script_compile")?
-        .path
-        .unwrap_or_default();
-    let bin = exe.parent().unwrap_or(&exe).to_owned();
+    let (exe, docs) = wcc_ready(session, &config, "script_compile")?;
+    doctor::redkit_licence_accepted("script_compile")?;
     let game = game_dir(&config)?;
-    let docs = config
-        .documents
-        .clone()
-        .ok_or("no documents in quen's config: run quen_setup".to_owned())?;
-    if session.live.is_some() {
-        return Err("a session is live, and its journal owns the game's documents folder, which wcc_lite writes: \
-                    script_compile after session_end"
-            .to_owned()
-            .into());
-    }
-    let journal = session::journal_path(&config);
-    if journal.exists() {
-        return Err(format!("{} is left: session_recover first", journal.display()).into());
-    }
-    // Any wcc_lite on the PC, not only REDkit's: every run writes the same documents folder. `QUEN_TEST_WCC_IMAGE`
-    // (tests only) names another image, so the user's own REDkit runs don't fail the tests (finding 78).
-    let wcc = std::env::var("QUEN_TEST_WCC_IMAGE").unwrap_or_else(|_| "wcc_lite.exe".into());
-    for (image, why) in [
-        (
-            config.game_exe.as_str(),
-            "the game runs: it writes the documents folder too",
-        ),
-        (wcc.as_str(), "a wcc_lite runs already: one at a time"),
-    ] {
-        if !session::outside(image, None)?.is_empty() {
-            return Err(format!("{image}: {why}").into());
-        }
-    }
     let scratch = config
         .data_root
         .join("logs")
@@ -1074,60 +1050,35 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
         .filter(|(_, mods)| mods.len() > 1)
         .map(|(file, mods)| json!({"file": file, "used": mods.last(), "mods": mods}))
         .collect();
-    for dir in [&out_dir, &scratch.join("backup")] {
-        fs::create_dir_all(dir)
-            .map_err(|e| Done::Failed(format!("{}: {e}", dir.display()), Map::new()))?;
-    }
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| Done::Failed(format!("{}: {e}", out_dir.display()), Map::new()))?;
     call.lap("copy");
-    // The documents folder's settings, journaled under the lock before wcc_lite can write them.
-    let listing: Vec<(String, String)> = fs::read_dir(&docs)
-        .map_err(|e| format!("{}: {e}", docs.display()))?
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter_map(|e| {
-            Some((
-                e.file_name().to_string_lossy().into_owned(),
-                sha256_file(&e.path()).ok()?,
-            ))
-        })
-        .collect();
-    let changes = wcc::settings_changes(&docs, &listing, &scratch.join("backup"));
-    session.take_lock(&config, "script_compile")?;
-    let started = SystemTime::now();
-    let ran = run_wcc(
-        call, &config, &changes, &exe, &bin, &tree, &out_dir, &scratch, limit,
-    );
-    // Put back, whatever happened: the replay the session tools use.
-    let replay = match journal.exists() {
-        true => session.unwind(call, &scratch.join("journal.jsonl")),
-        false => Ok(Map::new()),
-    };
-    session.release_lock();
     let mut fields = Fields::new();
     fields.insert("scratch".into(), json!(scratch));
     fields.insert("sources".into(), json!(copied));
     fields.insert("conflicts".into(), json!(conflicts));
-    let (replay_ok, replay_fields) = match replay {
-        Ok(f) => (None, f),
-        Err((why, f)) => (Some(why), f),
-    };
-    fields.insert("settings".into(), json!(replay_fields));
-    let (code, log) = match ran {
-        Ok(ran) => ran,
-        Err(why) => return Err(Done::Failed(why, fields)),
-    };
-    if let Some(why) = replay_ok {
-        return Err(Done::Failed(
-            format!("wcc_lite ran, but the settings weren't all put back: {why}"),
-            fields,
-        ));
-    }
+    let argv = [
+        exe.display().to_string(),
+        "compilescripts".into(),
+        tree.display().to_string(),
+        format!("-out={}", out_dir.display()),
+        "-agreetoterms".into(),
+        "-noninteractivecrash".into(),
+    ];
+    let started = SystemTime::now();
+    let (code, log) = run_journaled(
+        session,
+        call,
+        &docs,
+        &scratch,
+        &argv,
+        &mut fields,
+        |_, t| (t > limit).then(|| "it ran past time_limit_s".into()),
+    )?;
     fields.insert("exit_code".into(), json!(code));
     fields.insert("log".into(), json!(log));
-    let (log_in, copy) = (
-        bin.parent().unwrap_or(&bin).join("wcc.log"),
-        scratch.join("wcc.log"),
-    );
+    let bin = exe.parent().and_then(Path::parent).unwrap_or(&exe);
+    let (log_in, copy) = (bin.join("wcc.log"), scratch.join("wcc.log"));
     // An earlier run's log isn't this one's.
     let fresh = fs::metadata(&log_in)
         .and_then(|m| m.modified())
@@ -1167,19 +1118,107 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
     Ok(fields)
 }
 
-/// Journals the settings `changes`, runs wcc_lite in a job of its own (killed past `limit` or when the call is
-/// cancelled) and returns its exit code and output log. The caller replays the journal either way.
-#[allow(clippy::too_many_arguments)]
+/// What every wcc_lite run needs, checked before anything changes (`tool` names the caller in needs): REDkit, the
+/// documents folder in the config, no live session, no journal left, neither the game nor another wcc_lite running.
+/// wcc_lite's exe and the documents folder.
+fn wcc_ready(session: &Session, config: &Config, tool: &str) -> Result<(PathBuf, PathBuf), Done> {
+    let exe = doctor::require(&doctor::REDKIT, config, tool)?
+        .path
+        .unwrap_or_default();
+    let docs = config
+        .documents
+        .clone()
+        .ok_or("no documents in quen's config: run quen_setup".to_owned())?;
+    if session.live.is_some() {
+        return Err(format!(
+            "a session is live, and its journal owns the game's documents folder, which wcc_lite writes: {tool} \
+             after session_end"
+        )
+        .into());
+    }
+    let journal = session::journal_path(config);
+    if journal.exists() {
+        return Err(format!("{} is left: session_recover first", journal.display()).into());
+    }
+    // Any wcc_lite on the PC, not only REDkit's: every run writes the same documents folder. `QUEN_TEST_WCC_IMAGE`
+    // (tests only) names another image, so the user's own REDkit runs don't fail the tests (finding 78).
+    let wcc = std::env::var("QUEN_TEST_WCC_IMAGE").unwrap_or_else(|_| "wcc_lite.exe".into());
+    for (image, why) in [
+        (
+            config.game_exe.as_str(),
+            "the game runs: it writes the documents folder too",
+        ),
+        (wcc.as_str(), "a wcc_lite runs already: one at a time"),
+    ] {
+        if !session::outside(image, None)?.is_empty() {
+            return Err(format!("{image}: {why}").into());
+        }
+    }
+    Ok((exe, docs))
+}
+
+/// wcc_lite (`argv`, from REDkit's bin folder) under the game lock, the documents folder's settings backed up into
+/// `scratch` and journaled first, then put back by the session tools' replay, whatever happened. Killed when the call
+/// is cancelled or `stop` (the job, the time since the start) gives a reason. `fields` gains the replay's (settings).
+/// Its exit code and output log; Failed when it didn't run to its end or the settings weren't all put back.
+fn run_journaled(
+    session: &mut Session,
+    call: &mut Call,
+    docs: &Path,
+    scratch: &Path,
+    argv: &[String],
+    fields: &mut Fields,
+    mut stop: impl FnMut(&Job, Duration) -> Option<String>,
+) -> Result<(u32, PathBuf), Done> {
+    let config = session.config()?.clone();
+    let backup = scratch.join("backup");
+    fs::create_dir_all(&backup)
+        .map_err(|e| Done::Failed(format!("{}: {e}", backup.display()), Map::new()))?;
+    // The documents folder's settings, journaled under the lock before wcc_lite can write them.
+    let listing: Vec<(String, String)> = fs::read_dir(docs)
+        .map_err(|e| format!("{}: {e}", docs.display()))?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            Some((
+                e.file_name().to_string_lossy().into_owned(),
+                sha256_file(&e.path()).ok()?,
+            ))
+        })
+        .collect();
+    let changes = wcc::settings_changes(docs, &listing, &backup);
+    session.take_lock(&config, "wcc_lite")?;
+    let ran = run_wcc(call, &config, &changes, argv, scratch, &mut stop);
+    // Put back, whatever happened: the replay the session tools use.
+    let replay = match session::journal_path(&config).exists() {
+        true => session.unwind(call, &scratch.join("journal.jsonl")),
+        false => Ok(Map::new()),
+    };
+    session.release_lock();
+    let (replay_ok, replay_fields) = match replay {
+        Ok(f) => (None, f),
+        Err((why, f)) => (Some(why), f),
+    };
+    fields.insert("settings".into(), json!(replay_fields));
+    let ran = ran.map_err(|why| Done::Failed(why, fields.clone()))?;
+    match replay_ok {
+        Some(why) => Err(Done::Failed(
+            format!("wcc_lite ran, but the settings weren't all put back: {why}"),
+            fields.clone(),
+        )),
+        None => Ok(ran),
+    }
+}
+
+/// Journals the settings `changes`, runs wcc_lite in a job of its own (killed when the call is cancelled or `stop`
+/// says why) and returns its exit code and output log. The caller replays the journal either way.
 fn run_wcc(
     call: &mut Call,
     config: &Config,
     changes: &[boot::Change],
-    exe: &Path,
-    bin: &Path,
-    tree: &Path,
-    out: &Path,
+    argv: &[String],
     scratch: &Path,
-    limit: Duration,
+    stop: &mut impl FnMut(&Job, Duration) -> Option<String>,
 ) -> Result<(u32, PathBuf), String> {
     let path = session::journal_path(config);
     let mut journal =
@@ -1188,33 +1227,26 @@ fn run_wcc(
         .map_err(|e| format!("backing up the documents folder's settings: {e}"))?;
     call.lap("journal");
     let log = scratch.join("wcc_lite.log");
-    let argv: Vec<String> = [
-        exe.display().to_string(),
-        "compilescripts".into(),
-        tree.display().to_string(),
-        format!("-out={}", out.display()),
-        "-agreetoterms".into(),
-        "-noninteractivecrash".into(),
-    ]
-    .into();
+    let exe = Path::new(&argv[0]);
     let job = Job::new().map_err(|e| format!("wcc_lite's job: {e}"))?;
     let child = File::create(&log)
-        .and_then(|f| job.spawn(&argv, &[], bin, &f))
+        .and_then(|f| job.spawn(argv, &[], exe.parent().unwrap_or(exe), &f))
         .map_err(|e| format!("wcc_lite did not start: {e}"))?;
     let t = Instant::now();
     let code = loop {
         match child.wait(Duration::from_millis(250)) {
             Ok(Some(code)) => break code,
-            Ok(None) if call.stopped() || t.elapsed() > limit => {
-                let _ = job.kill();
-                let why = if call.stopped() {
-                    call.stop_cause()
-                } else {
-                    "it ran past time_limit_s"
+            Ok(None) => {
+                let why = match call.stopped() {
+                    true => Some(call.stop_cause().to_owned()),
+                    false => stop(&job, t.elapsed()),
                 };
-                return Err(format!("wcc_lite killed: {why}"));
+                if let Some(why) = why {
+                    let _ = job.kill();
+                    return Err(format!("wcc_lite killed: {why}"));
+                }
+                call.progress(&format!("wcc_lite running, {} s", t.elapsed().as_secs()));
             }
-            Ok(None) => call.progress(&format!("wcc_lite running, {} s", t.elapsed().as_secs())),
             Err(e) => {
                 let _ = job.kill();
                 return Err(format!("waiting for wcc_lite: {e}"));
@@ -1224,6 +1256,73 @@ fn run_wcc(
     call.artifact(&log);
     call.lap("wcc_lite");
     Ok((code, log))
+}
+
+/// `quen_setup` with `licence`: wcc_lite once without -agreetoterms and with no command, so REDkit's own licence dialog
+/// shows, brought to the front, for the user to answer; quen never clicks it. After Agree, wcc_lite with no command
+/// lists its commands and exits (its own unknown-command message says so; not run here yet: a live check); after
+/// Decline it exits. Then DoNotShowEula is read again: quen never writes it. The same refusals as script_compile but
+/// the licence's.
+fn licence(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    ledger::object(args, &["licence"])?;
+    if args["licence"] != true {
+        return Err("licence must be true".to_string().into());
+    }
+    let config = session.config()?.clone();
+    let (exe, docs) = wcc_ready(session, &config, "quen_setup licence")?;
+    let scratch = config
+        .data_root
+        .join("logs")
+        .join(format!("{}-licence", session::now()));
+    let mut fields = Fields::from_iter([("scratch".into(), json!(scratch))]);
+    let (mut shown, mut front, mut closed) = (false, None, None);
+    let argv = [exe.display().to_string()];
+    let ran = run_journaled(
+        session,
+        call,
+        &docs,
+        &scratch,
+        &argv,
+        &mut fields,
+        |job, t| {
+            let pids = job.pids().unwrap_or_default();
+            match pids.into_iter().find_map(|pid| focus::window_of(pid).ok()?) {
+                Some(dialog) if !shown => {
+                    shown = true;
+                    front = Some(input::focus(dialog).is_ok());
+                }
+                None if shown && closed.is_none() => closed = Some(t),
+                _ => {}
+            }
+            match closed {
+                Some(at) if t > at + AFTER_ANSWER => Some(format!(
+                    "it ran on {} s after its dialog closed",
+                    AFTER_ANSWER.as_secs()
+                )),
+                None if t > ANSWER => Some(format!(
+                    "no answer in REDkit's licence dialog within {} s",
+                    ANSWER.as_secs()
+                )),
+                _ => None,
+            }
+        },
+    );
+    let answer = doctor::redkit_licence();
+    let with_answer = |mut f: Fields| {
+        f.insert("dialog_shown".into(), json!(shown));
+        f.insert("dialog_in_front".into(), json!(front));
+        f.insert("do_not_show_eula".into(), json!(answer));
+        f.insert("accepted".into(), json!(answer == Some(1)));
+        f
+    };
+    let (code, log) = ran.map_err(|done| match done {
+        Done::Failed(why, f) => Done::Failed(why, with_answer(f)),
+        done => done,
+    })?;
+    let mut fields = with_answer(fields);
+    fields.insert("exit_code".into(), json!(code));
+    fields.insert("log".into(), json!(log));
+    Ok(fields)
 }
 
 #[cfg(test)]
