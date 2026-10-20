@@ -199,12 +199,29 @@ fn judge(reply: Reply) -> Result<Reply, Error> {
 impl Ctx<'_> {
     /// The session's game's channel ([`Channel::open`]), its server checked to be the game in the session's job.
     pub(crate) fn channel(&self) -> Result<Channel, String> {
+        Channel::open(&self.live.channel, self.channel_server()?)
+    }
+
+    /// The pid that must serve the channel: the game in the session's job (in unit tests, where the stand-in serves).
+    pub(crate) fn channel_server(&self) -> Result<u32, String> {
         #[cfg(test)]
         if let Some(pid) = tests::SERVER.get() {
-            return Channel::open(&self.live.channel, pid);
+            return Ok(pid);
         }
-        Channel::open(&self.live.channel, self.game_pid()?)
+        self.game_pid()
     }
+}
+
+/// One verb on the channel named `channel`, served by `server`, and its reply's data: for a sampler on a thread of its
+/// own (measure.rs). Err: why, with the game's words.
+pub(crate) fn read(channel: &str, server: u32, verb: Verb) -> Result<Value, String> {
+    let reply = Channel::open(channel, server)?
+        .call(verb, REPLY_MAX)
+        .map_err(|e| match e.game_text() {
+            Some(text) => format!("{} (the game: {text})", e.why()),
+            None => e.why().to_string(),
+        })?;
+    Ok(reply.data.unwrap_or_default())
 }
 
 pub fn tools() -> Vec<Value> {
@@ -271,15 +288,17 @@ pub fn tools() -> Vec<Value> {
             "name": "world_actors",
             "description": format!("Read the alive actors within radius of the player (the player left out), \
                 nearest first, at most max; found: all within radius. Each: pos, heading, velocity (its moving agent \
-                component's GetVelocity(), [x, y, z] or null), distance, name (GetDisplayName(), at most 80 \
-                characters), entity (GetReadableName(), at most 255; entity_cut: longer), and combat (IsInCombat()), \
-                hostile (GetAttitude towards the player is AIA_Hostile), guard (GetNPCType() is ENGT_Guard), at_work \
-                (IsAtWork()), action_point (IsAPValid(GetActiveActionPoint())), scene (IsInGameplayScene()). Changes \
-                nothing, taints no save. Runs while the user has the controls. quen-w3 0.1.10 or later. {needs}; \
-                with needs: an older package, or {game}, or no player. Failed: no reply within 5 s."),
+                component's GetVelocity(), or null), distance, name (GetDisplayName(), at most 80 characters), entity \
+                (GetReadableName(), at most 255; entity_cut: longer), combat, hostile (towards the player), guard, \
+                at_work, action_point, scene; 0.1.12: id (GetGuidHash()), actor. tag (0.1.12): only those with that \
+                tag; class (0.1.12): the gameplay entities of that class instead, actors or not, dead ones too. \
+                Changes nothing, taints no save. Runs while the user has the controls. quen-w3 0.1.10 or later. {needs}; with needs: an older package, or {game}, or \
+                no player. Failed: no reply within 5 s."),
             "inputSchema": schema(json!({
                 "radius": {"type": "number", "minimum": 0, "maximum": MAX_ACTORS_RADIUS, "description": "metres, above 0; default 30"},
                 "max": {"type": "integer", "minimum": 1, "maximum": MAX_ACTORS, "description": "how many, nearest first, default 20"},
+                "tag": {"type": "string", "description": "only those with this tag: 1 to 64 letters, digits and _ (quen-w3 0.1.12)"},
+                "class": {"type": "string", "description": "the gameplay entities of this class instead of the alive actors, e.g. CNewNPC: 1 to 64 letters, digits and _ (quen-w3 0.1.12)"},
             }), &[]),
         }),
         json!({
@@ -321,7 +340,7 @@ pub(crate) fn call(
         "game_weather" => &["name", "settle_s"],
         "game_teleport" => &["pos", "rot"],
         "game_items" => &["name", "count", "equip"],
-        "world_actors" => &["radius", "max"],
+        "world_actors" => &["radius", "max", "tag", "class"],
         _ => &[],
     };
     let cx = ctx(session, args, known)?;
@@ -349,6 +368,16 @@ pub(crate) fn call(
                 None => ACTORS_MAX,
                 Some(_) => whole(args, "max", MAX_ACTORS)?,
             },
+            tag: args
+                .get("tag")
+                .map(|_| text(args, "tag"))
+                .transpose()?
+                .map(Into::into),
+            class: args
+                .get("class")
+                .map(|_| text(args, "class"))
+                .transpose()?
+                .map(Into::into),
         },
         "game_pause" => Verb::Pause {
             on: args["on"]
@@ -388,6 +417,12 @@ pub(crate) fn call(
     }
     if name == "game_items" || name == "world_actors" {
         doctor::package_at_least(cx.config, doctor::BEFORE_ITEMS, name, "0.1.10")?;
+    }
+    if let Verb::WorldActors { tag, class, .. } = &verb
+        && (tag.is_some() || class.is_some())
+    {
+        let tool = "world_actors with tag or class";
+        doctor::package_at_least(cx.config, doctor::BEFORE_ENTITIES, tool, "0.1.12")?;
     }
     let last = cx.last_flags();
     if name != "game_listsaves" && last.is_none_or(|f| f & VALID == 0) {
@@ -668,6 +703,8 @@ pub(crate) mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::thread::{self, JoinHandle};
 
     thread_local! {
@@ -682,14 +719,39 @@ pub(crate) mod tests {
     /// process (as the ASI checks quen's pid), then sends `answer`'s lines for each request line (none: silence) until
     /// the client leaves. Joined, it gives the requests it read. Its first instance is up when this returns.
     pub(crate) fn fake_game(token: &str, conns: usize, answer: Answer) -> JoinHandle<Vec<Request>> {
+        serve(token, Some(conns), answer, Arc::default())
+    }
+
+    /// [`fake_game`] for any number of connections, until `stop` is set: for a sampler, whose reads depend on time.
+    pub(crate) fn fake_game_until(
+        token: &str,
+        answer: Answer,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<Vec<Request>> {
+        serve(token, None, answer, stop)
+    }
+
+    fn serve(
+        token: &str,
+        conns: Option<usize>,
+        answer: Answer,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<Vec<Request>> {
         let name = format!(r"\\.\pipe\quen-w3-{token}");
         let first = Pipe::create(&name, true).unwrap();
         thread::spawn(move || {
             let (mut next, mut seen) = (first, Vec::new());
-            for _ in 0..conns {
+            for _ in 0..conns.unwrap_or(usize::MAX) {
                 let pipe = next;
                 let start = Instant::now();
-                assert!(pipe.accept(|| start.elapsed().as_secs() > 10).unwrap());
+                let gone = || stop.load(Ordering::Relaxed);
+                let came = pipe
+                    .accept(|| gone() || start.elapsed().as_secs() > 10)
+                    .unwrap();
+                if !came && gone() {
+                    break;
+                }
+                assert!(came, "no client within 10 s");
                 // The next instance is up before this client leaves, so the next open never finds none.
                 next = Pipe::create(&name, false).unwrap();
                 assert_eq!(pipe.peer_pid(true).unwrap(), std::process::id());
@@ -996,7 +1058,7 @@ pub(crate) mod tests {
         let answer = data.clone();
         let server = fake_game(
             &token(&fx),
-            2,
+            3,
             Box::new(move |r| vec![reply(r.id, true, "the actors", Some(answer.clone()))]),
         );
         fx.shared.set_hands(Some(crate::hands::Hands::User));
@@ -1010,11 +1072,16 @@ pub(crate) mod tests {
         );
         let asked = json!({"token": "tok", "radius": 100, "max": MAX_ACTORS});
         assert_eq!(run(&mut session, "world_actors", asked)["ok"], true);
+        let filtered =
+            json!({"token": "tok", "radius": 8, "max": 5, "tag": "q1", "class": "CNewNPC"});
+        assert_eq!(run(&mut session, "world_actors", filtered)["ok"], true);
         for bad in [
             json!({"radius": 0}),
             json!({"radius": 100.5}),
             json!({"max": 0}),
             json!({"max": 51}),
+            json!({"tag": "a b"}),
+            json!({"class": 3}),
         ] {
             let mut args = bad.clone();
             args["token"] = json!("tok");
@@ -1028,11 +1095,21 @@ pub(crate) mod tests {
             [
                 Verb::WorldActors {
                     radius: 30.0,
-                    max: 20
+                    max: 20,
+                    tag: None,
+                    class: None,
                 },
                 Verb::WorldActors {
                     radius: 100.0,
-                    max: MAX_ACTORS
+                    max: MAX_ACTORS,
+                    tag: None,
+                    class: None,
+                },
+                Verb::WorldActors {
+                    radius: 8.0,
+                    max: 5,
+                    tag: Some("q1".into()),
+                    class: Some("CNewNPC".into()),
                 },
             ]
         );

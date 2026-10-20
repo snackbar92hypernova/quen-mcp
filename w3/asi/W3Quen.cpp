@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -31,7 +32,7 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.11";
+constexpr char kVersion[] = "0.1.12";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -48,6 +49,12 @@ constexpr uint64_t kMaxItemCount = 1000;
 // protocol.rs's MAX_ACTORS_RADIUS and MAX_ACTORS: world.actors' radius and max, from quen-w3 0.1.10.
 constexpr float kMaxActorsRadius = 100;
 constexpr uint64_t kMaxActors = 50;
+
+// trace.rs's plain_name: world.actors' tag and class, from quen-w3 0.1.12: 1 to 64 letters, digits and _.
+static bool PlainName(std::string_view s) {
+  return !s.empty() && s.size() <= 64 &&
+         std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
+}
 // photo.grade's sliders, in modQuen's QUEN_Grade order, as protocol.rs names them.
 constexpr const char* kGrade[] = {"exposure", "contrast", "highlights", "saturation", "temperature", "vignette", "grain",
                                   "chromatic_aberration"};
@@ -779,12 +786,18 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
          cmd.args.size() <= kMaxItem + 1;
     cmd.args = ' ' + std::to_string(n) + (equip.flag ? " 1" : " 0") + cmd.args;
   } else if (v == "world.actors") {
-    // "<max> <radius>".
+    // "<max> <radius>", then " <tag> <class>" ('-' for none) when either is given (from quen-w3 0.1.12).
     Value r;
     float radius = 0;
     ok = whole("max", kMaxActors, n) && n > 0 && take("radius", Value::kNumber, r) && ParseFloat(r.text, radius) &&
          radius > 0 && radius <= kMaxActorsRadius;
-    cmd.args = ' ' + std::to_string(n) + ' ' + Fixed(radius);
+    std::string names;
+    for (const char* key : {"tag", "class"}) {
+      Value given;
+      if (fields.contains(key)) ok = ok && take(key, Value::kString, given) && PlainName(given.text);
+      names += ' ' + (given.text.empty() ? std::string("-") : given.text);
+    }
+    cmd.args = ' ' + std::to_string(n) + ' ' + Fixed(radius) + (names == " - -" ? "" : names);
   } else if (v == "photo.reset") {
     const char* parts[] = {"weather", "env", "grading"};
     int part = -1;
@@ -829,8 +842,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
             "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
             "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes, an "
-            "items.add name over 200 bytes or count outside 1 to 1000, a world.actors radius outside 0 (excluded) to 100 or "
-            "max outside 1 to 50)";
+            "items.add name over 200 bytes or count outside 1 to 1000, a world.actors radius outside 0 (excluded) to 100, "
+            "max outside 1 to 50, or a tag or class other than 1 to 64 letters, digits and _)";
     return false;
   }
   if (!fields.empty()) {
@@ -913,11 +926,11 @@ static void Next(void*, void* frame, void* result) {
 // {"player":{"pos":[..],"heading":..},"time":{"day":..,"hour":..},"rain":..,"snow":..,"sky_clear":..,"weather":..};
 // items.add "before after equipped" (the item's count before and after, equipped 0 or 1) ->
 // {"before":..,"after":..,"equipped":..};
-// world.actors "<found>" then per actor "|x y z heading vx vy vz distance flags|<name>|<entity>" (modQuen's
+// world.actors "<found>" then per actor "|x y z heading vx vy vz distance flags id|<name>|<entity>" (modQuen's
 // QUENRPC_Actors: flags 1 combat, 2 hostile, 4 guard, 8 at work, 16 action point, 32 scene, 64 velocity known, 128
-// entity cut, from quen-w3 0.1.11) ->
+// entity cut from quen-w3 0.1.11, 256 not an actor and the id from quen-w3 0.1.12) ->
 // {"found":..,"actors":[{"name":..,"entity":..,"pos":[..],"heading":..,"velocity":[..] or null,"distance":..,
-// "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..,"entity_cut":..}]};
+// "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..,"entity_cut":..,"id":..,"actor":..}]};
 // the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
 // {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
 // "world_weather":..}.
@@ -939,7 +952,11 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
       const std::vector<std::string_view> t = Split(part[a], ' ');
       float f[8];
       uint64_t flags = 0;
-      if (t.size() != 9 || !Whole(t[8], 255, flags)) return false;
+      int32_t id = 0;
+      if (t.size() != 10 || !Whole(t[8], 511, flags)) return false;
+      if (const auto [end, ec] = std::from_chars(t[9].data(), t[9].data() + t[9].size(), id);
+          ec != std::errc() || end != t[9].data() + t[9].size())
+        return false;
       for (int k = 0; k < 8; ++k)
         if (!ParseFloat(t[k], f[k])) return false;
       const auto flag = [&](uint64_t bit) { return std::string(flags & bit ? "true" : "false"); };
@@ -950,7 +967,8 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
               ",\"velocity\":" + velocity + ",\"distance\":" + Number(f[7]) + ",\"combat\":" + flag(1) +
               ",\"hostile\":" + flag(2) + ",\"guard\":" + flag(4) + ",\"at_work\":" + flag(8) +
               ",\"action_point\":" + flag(16) + ",\"scene\":" + flag(32) +
-              ",\"entity_cut\":" + flag(128) + '}';
+              ",\"entity_cut\":" + flag(128) + ",\"id\":" + std::to_string(id) +
+              ",\"actor\":" + (flags & 256 ? "false" : "true") + '}';
     }
     json = out + "]}";
     return true;

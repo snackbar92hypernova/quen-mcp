@@ -465,16 +465,23 @@ static void Channel() {
   RoundTrip(h, R"({"id":55,"ttl_ms":5000,"verb":"items.add","name":"Nope","count":1000,"equip":false})",
             L"items.add 1000 0 Nope", false, "nothing added", "2 2 0",
             R"({"id":55,"ok":false,"text":"nothing added","data":{"before":2,"after":2,"equipped":false}})");
-  // world.actors (0.1.10): "<max> <radius>" to the script; per actor nine numbers and two names back, the velocity null
-  // without flag 64, entity_cut with flag 128 (0.1.11); no actor.
+  // world.actors (0.1.10): "<max> <radius>" to the script; per actor ten numbers and two names back, the velocity null
+  // without flag 64, entity_cut with flag 128 (0.1.11), the id and actor false with flag 256 (0.1.12); no actor.
   RoundTrip(h, R"({"id":56,"ttl_ms":5000,"verb":"world.actors","radius":30,"max":20})", L"world.actors 20 30.000000",
-            true, "the actors", "7|1.5 2 3 90 0.5 0 0 2.5 213|Novigrad Guard|guard \"x\"|4 5 6 0 0 0 0 7 0||",
+            true, "the actors", "7|1.5 2 3 90 0.5 0 0 2.5 213 -42|Novigrad Guard|guard \"x\"|4 5 6 0 0 0 0 7 256 7||",
             R"({"id":56,"ok":true,"text":"the actors","data":{"found":7,"actors":[{"name":"Novigrad Guard",)"
             R"("entity":"guard \"x\"","pos":[1.5,2,3],"heading":90,"velocity":[0.5,0,0],"distance":2.5,"combat":true,)"
-            R"("hostile":false,"guard":true,"at_work":false,"action_point":true,"scene":false,"entity_cut":true},)"
-            R"({"name":"","entity":"",)"
+            R"("hostile":false,"guard":true,"at_work":false,"action_point":true,"scene":false,"entity_cut":true,)"
+            R"("id":-42,"actor":true},{"name":"","entity":"",)"
             R"("pos":[4,5,6],"heading":0,"velocity":null,"distance":7,"combat":false,"hostile":false,"guard":false,)"
-            R"("at_work":false,"action_point":false,"scene":false,"entity_cut":false}]}})");
+            R"("at_work":false,"action_point":false,"scene":false,"entity_cut":false,"id":7,"actor":false}]}})");
+  // tag and class (0.1.12): after the numbers, '-' for the one not given.
+  RoundTrip(h, R"({"id":58,"ttl_ms":5000,"verb":"world.actors","radius":8,"max":5,"tag":"q104_ciri","class":"CNewNPC"})",
+            L"world.actors 5 8.000000 q104_ciri CNewNPC", true, "the actors", "0",
+            R"({"id":58,"ok":true,"text":"the actors","data":{"found":0,"actors":[]}})");
+  RoundTrip(h, R"({"id":59,"ttl_ms":5000,"verb":"world.actors","radius":8,"max":5,"class":"W3Boat"})",
+            L"world.actors 5 8.000000 - W3Boat", true, "the actors", "0",
+            R"({"id":59,"ok":true,"text":"the actors","data":{"found":0,"actors":[]}})");
   RoundTrip(h, R"({"id":57,"ttl_ms":5000,"verb":"world.actors","radius":100,"max":50})", L"world.actors 50 100.000000",
             true, "the actors", "0", R"({"id":57,"ok":true,"text":"the actors","data":{"found":0,"actors":[]}})");
   RoundTrip(h, R"({"id":9,"ttl_ms":2000,"verb":"listsaves"})", L"listsaves", true, "2 saves", "save \"one\"|C:\\two",
@@ -536,12 +543,14 @@ static void Channel() {
     Refused(h, R"({"id":1,"ttl_ms":1,"verb":"items.add",)" + items + "}", refused1, "invalid items.add");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"items.add","name":"x","count":1,"equip":false,"slot":1})", refused1,
           "unknown field");
-  for (const char* actors : {R"("radius":0,"max":1)", R"("radius":100.5,"max":1)", R"("radius":-1,"max":1)",
+  for (const std::string& actors : std::vector<std::string>{R"("radius":0,"max":1)", R"("radius":100.5,"max":1)", R"("radius":-1,"max":1)",
                              R"("radius":30,"max":0)", R"("radius":30,"max":51)", R"("radius":30)",
-                             R"("radius":"30","max":1)", R"("max":1)"})
-    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"world.actors",)" + std::string(actors) + "}", refused1,
+                             R"("radius":"30","max":1)", R"("max":1)", R"("radius":30,"max":1,"tag":"a b")",
+                             R"("radius":30,"max":1,"tag":"")", R"("radius":30,"max":1,"class":7)",
+                             R"("radius":30,"max":1,"class":")" + std::string(65, 'c') + "\""})
+    Refused(h, R"({"id":1,"ttl_ms":1,"verb":"world.actors",)" + actors + "}", refused1,
             "invalid world.actors");
-  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"world.actors","radius":30,"max":1,"tag":"x"})", refused1, "unknown field");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"world.actors","radius":30,"max":1,"slot":"x"})", refused1, "unknown field");
   Refused(h, R"({"id":1,"verb":"loadlast"})", refused1, "ttl_ms");
   Refused(h, R"({"id":-1,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");
   Refused(h, R"({"id":1.0,"ttl_ms":1,"verb":"loadlast"})", refused0, "no id");
@@ -609,9 +618,11 @@ static void Channel() {
     CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", bad) == 0);
     CHECK(ReadLine(h) == R"({"id":28,"ok":false,"text":"modQuen's read-back did not parse: )" + std::string(bad) + "\"}");
   }
-  // world.actors: eight numbers, a name missing, more actors than found, a flag past 255, no count.
-  for (const char* bad : {"1|1 2 3 4 5 6 7 0|a|b", "1|1 2 3 4 5 6 7 8 0|a", "0|1 2 3 4 5 6 7 8 0|a|b",
-                          "1|1 2 3 4 5 6 7 8 256|a|b", "|1 2 3 4 5 6 7 8 0|a|b"}) {
+  // world.actors: nine numbers (0.1.11's), a name missing, more actors than found, a flag past 511, no count, an id
+  // that isn't a whole number in int's range.
+  for (const char* bad : {"1|1 2 3 4 5 6 7 8 0|a|b", "1|1 2 3 4 5 6 7 8 0 1|a", "0|1 2 3 4 5 6 7 8 0 1|a|b",
+                          "1|1 2 3 4 5 6 7 8 512 1|a|b", "|1 2 3 4 5 6 7 8 0 1|a|b", "1|1 2 3 4 5 6 7 8 0 1.5|a|b",
+                          "1|1 2 3 4 5 6 7 8 0 2147483648|a|b"}) {
     Send(h, R"({"id":29,"ttl_ms":5000,"verb":"world.actors","radius":30,"max":20})" "\n");
     CHECK(g_reply(_wtoi(NextWait().c_str()), true, "", bad) == 0);
     CHECK(ReadLine(h) == R"({"id":29,"ok":false,"text":"modQuen's read-back did not parse: )" + std::string(bad) + "\"}");

@@ -38,7 +38,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// sets another for its client; 0 waits for every call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 15] = [
+const LONG: [&str; 16] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -47,6 +47,7 @@ const LONG: [&str; 15] = [
     "game_keys",
     "game_screenshot",
     "measure_presentmon",
+    "measure_trace",
     "measure_ab",
     "mem_scan",
     "mem_find",

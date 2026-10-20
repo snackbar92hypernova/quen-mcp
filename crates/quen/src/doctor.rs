@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.12: world.actors' tag and class, and each one's id and actor flag (measure_trace, measure_ab's trace).
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.12",
+        sha256: "2fe14569a09db76a0c6445adb71db687044d6b9338b7f885b072522f191b3879",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.12",
+        sha256: "a2caa723d08d638e2d7c5afc648b9b25ecd121f9ad693a3de2c70f16b956ff5f",
+        exact: true,
+    },
     // 0.1.11: world.actors' entity up to 255 characters (0.1.10 cut it at 80), and entity_cut (finding 54).
     Pin {
         file: PACKAGE_ASI,
@@ -275,6 +288,22 @@ pub(crate) const BEFORE_ITEMS: &[&str] = &[
     "quen-w3 0.1.9",
 ];
 
+/// The package releases from before world.actors' tag, class and ids (quen-w3 0.1.12): world_actors with tag or class,
+/// and a trace that needs them, refuse them with needs.
+pub(crate) const BEFORE_ENTITIES: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+    "quen-w3 0.1.9",
+    "quen-w3 0.1.10",
+    "quen-w3 0.1.11",
+];
+
 /// Refused with needs, nothing sent, while quen's package in the game is one of `before`: releases without what
 /// `tool` needs, which came in quen-w3 `since`. An unpinned package (a dev build) goes on: its ASI refuses a verb it
 /// doesn't know.
@@ -377,7 +406,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         and (from quen-w3 0.1.2) sweep_play; from quen-w3 0.1.3, session_launch profiler tracy:NAME; from quen-w3 \
         0.1.4, game_save; from quen-w3 0.1.5, world_get; from quen-w3 0.1.6, the menu focus to game closes; from \
         quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo; from quen-w3 0.1.10, \
-        game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters",
+        game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters; from quen-w3 \
+        0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them)",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

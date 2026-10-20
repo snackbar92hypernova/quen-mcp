@@ -54,6 +54,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../schema/0011_play_sessions.sql"),
     include_str!("../../../schema/0012_pose_yaw_optional.sql"),
     include_str!("../../../schema/0013_captures_deleted.sql"),
+    include_str!("../../../schema/0014_boot_samplers.sql"),
 ];
 
 /// The schema version this build migrates to.
