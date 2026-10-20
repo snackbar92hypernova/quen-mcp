@@ -390,6 +390,62 @@ fn a_rewrite_only_in_ignored_keys_is_not_kept() {
     assert_eq!(user_files(&fs), user_files(&user_state()));
 }
 
+/// Finding 82: at the end the game's copy differs from the user's only in what the launch wrote (forced keys, a
+/// `settings` override, VSync, an appended section the game moved) and LastGameVersion: not kept. A value the game
+/// changed besides (a mod menu's) is kept.
+#[test]
+fn a_copy_holding_only_the_launchs_own_settings_is_not_kept() {
+    use quen_core::boot::{self, Inputs};
+    let user = "[Rendering]\r\nDLSSGMode=2\r\nVSync=true\r\nMotionBlur=true\r\n[Gameplay]\r\nCameraAutoRotX=true\r\n\
+                CameraAutoRotY=true\r\n[Version]\r\nConfigVersion=7\r\nLastGameVersion=5.00\r\n";
+    let inputs = Inputs {
+        game_dir: Path::new("GAME"),
+        documents: Path::new("DOCS"),
+        backups: &Path::new(DATA).join("backup"),
+        fg: false,
+        vsync: false,
+        flat: "MotionBlur=false",
+        sections: "QuenLiveCheck:Probe=1",
+        park: "",
+        keep: "",
+        never_park: park::W3_NEVER_PARK,
+        pairs: park::W3_PAIRS,
+        mods: &[],
+        bin: &[],
+        renodx: None,
+        load_from_dll_main: None,
+        play: false,
+    };
+    for (game_changed, kept) in [(false, 0), (true, 1)] {
+        let fs = MemFs::default();
+        fs.put(SETTINGS, user);
+        fs.put("GAME/bin/config/base/general.ini", "[General]\r\nX=1\r\n");
+        let changes = boot::plan(&fs, &inputs).unwrap();
+        let mut journal = Journal::create(&fs, Path::new(JOURNAL)).unwrap();
+        boot::apply(&fs, &mut journal, &changes, &|| false).unwrap();
+        // The game rewrites it: the appended section moved to the top, its version stamp, and maybe a menu value.
+        let written = String::from_utf8(fs.read(Path::new(SETTINGS)).unwrap()).unwrap();
+        assert!(written.contains("[QuenLiveCheck]\r\nProbe=1"), "{written}");
+        let rest = written.replace("[QuenLiveCheck]\r\nProbe=1\r\n", "");
+        let mut by_game = format!("[QuenLiveCheck]\r\nProbe=1\r\n{rest}").replace("5.00", "5.01");
+        if game_changed {
+            by_game = by_game.replace(
+                "CameraAutoRotX=false",
+                "CameraAutoRotX=false\r\nMenuOption=2",
+            );
+        }
+        fs.put(SETTINGS, by_game);
+        let report = replay(&fs.read(Path::new(JOURNAL)).unwrap(), &fs);
+        assert!(report.clean(), "{report:#?}");
+        assert_eq!(
+            report.kept.len(),
+            kept,
+            "game changed {game_changed}: {report:#?}"
+        );
+        assert_eq!(fs.read(Path::new(SETTINGS)).unwrap(), user.as_bytes());
+    }
+}
+
 /// An atomic write a crash cut off leaves `<file>.quen-tmp` beside a file the journal names; the replay sends it to
 /// the Recycle Bin.
 #[test]

@@ -10,9 +10,11 @@ use std::fmt::{self, Write as _};
 
 /// The fastest sampling rate: each sample is one or two channel verbs, each answered on a game tick.
 pub const MAX_HZ: f64 = 10.0;
-/// Contact: entering within `CONTACT_IN_M` of the reference, over again only after leaving past `CONTACT_OUT_M`.
-pub const CONTACT_IN_M: f64 = 0.65;
-pub const CONTACT_OUT_M: f64 = 0.80;
+/// Contact: entering within the sampler's `contact_m` of the reference, over again only after leaving past it plus
+/// `CONTACT_LEAVE_M`. Default `CONTACT_M`: in boot 187 (collisions on), NPCs that pushed the player came no closer than
+/// 0.699 m centre to centre, and 9 tracks stopped between 0.70 and 0.83 m (finding 84; 0.65 m counted none of them).
+pub const CONTACT_M: f64 = 0.75;
+pub const CONTACT_LEAVE_M: f64 = 0.15;
 /// A pass: a run of a subject's samples within `PASS_M` of the reference; also what exposes the reference to a push.
 pub const PASS_M: f64 = 3.0;
 /// Moving above `MOVING_MPS`; gliding when the speed across the heading is above `GLIDE_MPS` too.
@@ -52,6 +54,8 @@ pub struct Sampler {
     pub tag: Option<String>,
     pub class: Option<String>,
     pub reference: Reference,
+    /// Metres: a contact's distance (`CONTACT_M` unless given).
+    pub contact: f64,
 }
 
 /// A tag or class name: 1 to 64 letters, digits and `_`.
@@ -60,12 +64,21 @@ pub fn plain_name(s: &str) -> bool {
 }
 
 impl Sampler {
-    /// `{hz, radius, max, tag, class, reference_id}`, each optional: 10 Hz, 8 m, 20, no tag, alive actors, the player.
-    /// Radius and max are `world.actors`' caps.
+    /// `{hz, radius, max, tag, class, reference_id, contact_m}`, each optional: 10 Hz, 8 m, 20, no tag, alive actors,
+    /// the player, [`CONTACT_M`]. Radius and max are `world.actors`' caps.
     pub fn parse(v: &Value, max_radius: f64, max_count: u32) -> Result<Sampler, String> {
         let map = v.as_object().ok_or("trace is an object")?;
         if let Some(k) = map.keys().find(|k| {
-            !["hz", "radius", "max", "tag", "class", "reference_id"].contains(&k.as_str())
+            ![
+                "hz",
+                "radius",
+                "max",
+                "tag",
+                "class",
+                "reference_id",
+                "contact_m",
+            ]
+            .contains(&k.as_str())
         }) {
             return Err(format!("trace: unknown key {k:?}"));
         }
@@ -104,6 +117,12 @@ impl Sampler {
                     .ok_or("trace: reference_id is a whole number, an id world_actors read")?,
             ),
         };
+        let contact = number(
+            "contact_m",
+            CONTACT_M,
+            &|x| (0.1..=PASS_M).contains(&x),
+            "metres from 0.1 to 3",
+        )?;
         Ok(Sampler {
             hz,
             radius,
@@ -111,6 +130,7 @@ impl Sampler {
             tag: name("tag")?,
             class: name("class")?,
             reference,
+            contact,
         })
     }
 
@@ -120,7 +140,8 @@ impl Sampler {
     }
 }
 
-/// `actor_trace 10 Hz r8 max20 ref player`, with ` tag X` and ` class Y` when set: how rows and results name it.
+/// `actor_trace 10 Hz r8 max20 ref player contact 0.75`, with ` tag X` and ` class Y` when set: how rows and results
+/// name it.
 impl fmt::Display for Sampler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -137,7 +158,8 @@ impl fmt::Display for Sampler {
         match self.reference {
             Reference::Player => write!(f, " ref player"),
             Reference::Id(id) => write!(f, " ref id {id}"),
-        }
+        }?;
+        write!(f, " contact {}", self.contact)
     }
 }
 
@@ -339,6 +361,8 @@ pub struct Metrics {
     pub glide_share: Option<f64>,
     pub blocked_s_per_min: f64,
     pub push_m: Option<f64>,
+    /// What `push_m`'s jitter floor came from: `calm steps`, or `the median step` when every step was exposed.
+    pub push_floor: Option<&'static str>,
     pub push_chains: u32,
     pub passes: u32,
     pub subject_minutes: f64,
@@ -378,16 +402,24 @@ impl Metrics {
     }
 }
 
-/// The 10th percentile, linear between ranks (numpy's default, as stats.rs).
-fn p10(mut v: Vec<f64>) -> Option<f64> {
+/// The `q` quantile, linear between ranks (numpy's default, as stats.rs).
+fn quantile(mut v: Vec<f64>, q: f64) -> Option<f64> {
     v.sort_by(f64::total_cmp);
-    let rank = 0.1 * (v.len().checked_sub(1)?) as f64;
+    let rank = q * (v.len().checked_sub(1)?) as f64;
     let (lo, hi) = (v[rank.floor() as usize], v[rank.ceil() as usize]);
     Some(lo + (hi - lo) * rank.fract())
 }
 
-/// The window's metrics. Errs with fewer than two samples.
-pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
+fn p10(v: Vec<f64>) -> Option<f64> {
+    quantile(v, 0.1)
+}
+
+fn median(v: Vec<f64>) -> Option<f64> {
+    quantile(v, 0.5)
+}
+
+/// The window's metrics, contacts within `contact` m. Errs with fewer than two samples.
+pub fn metrics(samples: &[Sample], contact: f64) -> Result<Metrics, String> {
     let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
         return Err("no sample".into());
     };
@@ -402,7 +434,7 @@ pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
     let of = tracks(samples);
     let n_tracks = of.iter().flatten().max().map_or(0, |m| m + 1);
     // Per track: in contact, in a pass (its minimum so far), has moved, a still stretch's start and last time.
-    let mut contact = vec![false; n_tracks];
+    let mut touching = vec![false; n_tracks];
     let mut pass: Vec<Option<f64>> = vec![None; n_tracks];
     let mut moved = vec![false; n_tracks];
     let mut still: Vec<Option<(f64, f64)>> = vec![None; n_tracks];
@@ -426,10 +458,10 @@ pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
         let seen: Vec<usize> = tracks.clone();
         for (b, &k) in s.subjects.iter().zip(tracks) {
             let d = flat(b.pos, r.pos);
-            if !contact[k] && d < CONTACT_IN_M {
-                (contact[k], contacts) = (true, contacts + 1);
-            } else if contact[k] && d > CONTACT_OUT_M {
-                contact[k] = false;
+            if !touching[k] && d < contact {
+                (touching[k], contacts) = (true, contacts + 1);
+            } else if touching[k] && d > contact + CONTACT_LEAVE_M {
+                touching[k] = false;
             }
             match (pass[k], d <= PASS_M) {
                 (Some(m), true) => pass[k] = Some(m.min(d)),
@@ -466,12 +498,13 @@ pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
             .as_ref()
             .is_some_and(|r| s.subjects.iter().any(|b| flat(b.pos, r.pos) <= PASS_M))
     };
-    let (mut exposed, mut calm) = ((0.0, 0u32), (0.0, 0u32));
+    let (mut exposed, mut calm, mut steps) = ((0.0, 0u32), (0.0, 0u32), Vec::new());
     for w in samples.windows(2) {
         let (Some(a), Some(b)) = (&w[0].reference, &w[1].reference) else {
             continue;
         };
         let step = flat(a.pos, b.pos);
+        steps.push(step);
         let bin = if near(&w[0]) || near(&w[1]) {
             &mut exposed
         } else {
@@ -479,8 +512,13 @@ pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
         };
         (bin.0, bin.1) = (bin.0 + step, bin.1 + 1);
     }
-    let push_m =
-        (calm.1 > 0).then(|| exposed.0 - f64::from(exposed.1) * calm.0 / f64::from(calm.1));
+    // The jitter floor: the calm steps' mean; with none (a crowd around the reference throughout, finding 81), the
+    // median step, which a push moving the reference in under half the steps leaves at its standing jitter.
+    let floor = match calm.1 {
+        0 => median(steps).map(|m| (m, "the median step")),
+        n => Some((calm.0 / f64::from(n), "calm steps")),
+    };
+    let push_m = floor.map(|(f, _)| exposed.0 - f64::from(exposed.1) * f);
     // Push events: a sample from which the reference is over PUSH_M away PUSH_S later; a run of them is one event.
     let refs: Vec<(f64, [f64; 3])> = samples
         .iter()
@@ -523,6 +561,7 @@ pub fn metrics(samples: &[Sample]) -> Result<Metrics, String> {
         glide_share: (moving > 0).then(|| f64::from(gliding) / f64::from(moving)),
         blocked_s_per_min: per_min(blocked),
         push_m,
+        push_floor: floor.map(|(_, from)| from),
         push_chains: chains,
         passes: minima.len() as u32,
         subject_minutes,
@@ -648,6 +687,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn metrics_(samples: &[Sample]) -> Result<Metrics, String> {
+        metrics(samples, CONTACT_M)
+    }
+
     fn body(id: Option<i64>, x: f64, y: f64, heading: f64, v: Option<[f64; 2]>) -> Body {
         Body {
             id,
@@ -683,7 +726,7 @@ mod tests {
     #[test]
     fn a_scripted_pass_gives_its_closest_approach_and_one_contact() {
         let near = walker(None, 0.5);
-        let m = metrics(&trace(10.0, |t| vec![near(t)])).unwrap();
+        let m = metrics_(&trace(10.0, |t| vec![near(t)])).unwrap();
         assert_eq!(m.passes, 1);
         assert!((m.closest_m_min.unwrap() - 0.5).abs() < 1e-9, "{m:?}");
         assert_eq!(m.contacts_per_min, 6.0, "one contact in 10 s");
@@ -691,8 +734,13 @@ mod tests {
         assert_eq!(m.push_m, Some(0.0));
         // A pass at 1 m: no contact, the closest 1 m.
         let far = walker(None, 1.0);
-        let m = metrics(&trace(10.0, |t| vec![far(t)])).unwrap();
+        let m = metrics_(&trace(10.0, |t| vec![far(t)])).unwrap();
         assert_eq!((m.contacts_per_min, m.closest_m_min), (0.0, Some(1.0)));
+        // Finding 84: a pass at 0.70 m, where bodies touched in boot 187, is a contact by default, not at 0.65 m.
+        let touch = walker(None, 0.7);
+        let samples = trace(10.0, |t| vec![touch(t)]);
+        assert_eq!(metrics(&samples, CONTACT_M).unwrap().contacts_per_min, 6.0);
+        assert_eq!(metrics(&samples, 0.65).unwrap().contacts_per_min, 0.0);
     }
 
     #[test]
@@ -709,7 +757,7 @@ mod tests {
                 found: 1,
             })
             .collect();
-        let m = metrics(&samples).unwrap();
+        let m = metrics_(&samples).unwrap();
         assert_eq!(m.contacts_per_min, 2.0 * 60.0 / 6.0);
     }
 
@@ -717,7 +765,7 @@ mod tests {
     fn sideways_motion_is_glide_and_a_blocked_walker_counts() {
         // Pushed sideways: velocity along +x, heading along +y (h = 0).
         let side = |t: f64| vec![body(None, -2.0 + t * 0.5, 1.0, 0.0, Some([0.5, 0.0]))];
-        let m = metrics(&trace(5.0, side)).unwrap();
+        let m = metrics_(&trace(5.0, side)).unwrap();
         assert_eq!(m.glide_share, Some(1.0));
         // Walks in for 2 s, then stands at 1 m from t = 2 to 5: blocked 3 s in 5 s.
         let stop = |t: f64| {
@@ -725,11 +773,11 @@ mod tests {
             let v = if t < 2.0 { 1.0 } else { 0.0 };
             vec![body(None, x, 0.0, -90.0, Some([v, 0.0]))]
         };
-        let m = metrics(&trace(5.0, stop)).unwrap();
+        let m = metrics_(&trace(5.0, stop)).unwrap();
         assert!((m.blocked_s_per_min - 3.0 * 12.0).abs() < 1e-6, "{m:?}");
         // One that never moved isn't blocked.
         let idle = |_: f64| vec![body(None, 1.0, 0.0, 0.0, Some([0.0, 0.0]))];
-        assert_eq!(metrics(&trace(5.0, idle)).unwrap().blocked_s_per_min, 0.0);
+        assert_eq!(metrics_(&trace(5.0, idle)).unwrap().blocked_s_per_min, 0.0);
     }
 
     #[test]
@@ -755,14 +803,27 @@ mod tests {
                 }
             })
             .collect();
-        let m = metrics(&samples).unwrap();
+        let m = metrics_(&samples).unwrap();
         // 51 exposed steps from t = 4.9 (2 m pushed, 0.31 m of jitter) less 51 times the calm steps' 1 cm floor: the
         // floor is taken from the 20 pushing steps too, whose jitter cancels out.
         assert!((m.push_m.unwrap() - 1.8).abs() < 1e-9, "{m:?}");
         assert_eq!(m.push_chains, 1, "{m:?}");
-        // No calm step: no floor, no push.
+        assert_eq!(m.push_floor, Some("calm steps"));
+        // Finding 81: crowded throughout, no calm step: the floor is the median step, the 1 cm jitter (30 of the 50
+        // steps from t = 5; the 20 pushing ones are 9 and 11 cm): 2.3 m of path less 50 x 1 cm.
         let crowded: Vec<Sample> = samples.into_iter().filter(|s| s.t >= 5.0).collect();
-        assert_eq!(metrics(&crowded).unwrap().push_m, None);
+        let m = metrics_(&crowded).unwrap();
+        assert_eq!(m.push_floor, Some("the median step"));
+        assert!((m.push_m.unwrap() - 1.8).abs() < 1e-6, "{m:?}");
+        // A reference that never moved in a crowd: no push.
+        let still: Vec<Sample> = crowded
+            .iter()
+            .map(|s| Sample {
+                reference: Some(body(None, 0.0, 0.0, 0.0, None)),
+                ..s.clone()
+            })
+            .collect();
+        assert_eq!(metrics_(&still).unwrap().push_m, Some(0.0));
     }
 
     #[test]
@@ -776,7 +837,7 @@ mod tests {
             of.iter().all(|k| k == &vec![0, 1]),
             "ids keep the tracks through the crossing"
         );
-        let m = metrics(&samples).unwrap();
+        let m = metrics_(&samples).unwrap();
         assert_eq!(m.passes, 2);
         // A walker that vanishes for 2 s comes back as a new track: two passes.
         let gap = |t: f64| {
@@ -786,12 +847,12 @@ mod tests {
                 vec![walker(None, 0.5)(t)]
             }
         };
-        assert_eq!(metrics(&trace(10.0, gap)).unwrap().passes, 2);
+        assert_eq!(metrics_(&trace(10.0, gap)).unwrap().passes, 2);
     }
 
     #[test]
     fn verdicts_follow_measure_ab_s_rule_per_metric() {
-        let base = metrics(&trace(10.0, |t| {
+        let base = metrics_(&trace(10.0, |t| {
             (0..12)
                 .map(|k| walker(None, 0.5 + k as f64 * 3.0)(t))
                 .collect()
@@ -867,12 +928,15 @@ mod tests {
     #[test]
     fn sampler_parses_its_defaults_caps_and_names() {
         let s = Sampler::parse(&json!({}), 100.0, 50).unwrap();
-        assert_eq!(s.to_string(), "actor_trace 10 Hz r8 max20 ref player");
-        assert!(!s.needs_ids());
-        let s = Sampler::parse(&json!({"hz": 5, "radius": 12.5, "max": 50, "tag": "q1", "class": "CNewNPC", "reference_id": -3}), 100.0, 50).unwrap();
         assert_eq!(
             s.to_string(),
-            "actor_trace 5 Hz r12.5 max50 tag q1 class CNewNPC ref id -3"
+            "actor_trace 10 Hz r8 max20 ref player contact 0.75"
+        );
+        assert!(!s.needs_ids());
+        let s = Sampler::parse(&json!({"hz": 5, "radius": 12.5, "max": 50, "tag": "q1", "class": "CNewNPC", "reference_id": -3, "contact_m": 0.9}), 100.0, 50).unwrap();
+        assert_eq!(
+            s.to_string(),
+            "actor_trace 5 Hz r12.5 max50 tag q1 class CNewNPC ref id -3 contact 0.9"
         );
         assert!(s.needs_ids());
         for bad in [
@@ -885,6 +949,8 @@ mod tests {
             json!({"class": ""}),
             json!({"reference_id": "player"}),
             json!({"reference_id": 1.5}),
+            json!({"contact_m": 0.05}),
+            json!({"contact_m": 3.5}),
             json!({"every": 1}),
         ] {
             assert!(Sampler::parse(&bad, 100.0, 50).is_err(), "{bad}");

@@ -14,15 +14,15 @@
 //!   agent's next call of a tool that needs the game in front brings it back first ([`back`]).
 //! - **The agent at work** (a call in flight, or within [`IDLE`] of one): nothing shown.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::protocol::Verb;
 use serde_json::{Value, json};
 
-use crate::channel::REPLY_MAX;
+use crate::channel::{Channel, REPLY_MAX};
 use crate::game::{self, Ctx, Fields};
 use crate::hands::Hands;
-use crate::session::{Call, Done, Live, Session};
+use crate::session::{Call, Done, Live, Session, utc_ms};
 use crate::{boot, doctor, focus, input, measure};
 
 /// How long the agent may make no call, with the controls and the game in front, before quen counts it as waiting
@@ -40,52 +40,79 @@ const WAITING: &str = "quen: the agent is waiting for you in the chat (Alt+Tab).
 
 /// Shows `text` in the game for 8 s: the game's reply, or why it wasn't shown.
 pub(crate) fn show(cx: &Ctx, text: &str) -> Result<String, String> {
+    show_on(cx, None, text)
+}
+
+/// [`show`] on `held`, a connection the caller opened, or a new one. The ASI serves one connection at a time, so a
+/// second one beside a held one finds every instance busy (finding 80: sweep_play's).
+fn show_on(cx: &Ctx, held: Option<Channel>, text: &str) -> Result<String, String> {
     let old = doctor::package_version(cx.config).filter(|v| doctor::BEFORE_NOTICE.contains(v));
     if let Some(old) = old {
         return Err(format!(
             "not shown: {old} has no notice (quen-w3 0.1.8 or later)"
         ));
     }
-    let channel = cx.channel()?;
-    // Before the call: a reply that times out may still come with the notice on screen.
-    cx.live.notice_at.set(Some(Instant::now()));
+    let channel = match held {
+        Some(channel) => channel,
+        None => cx.channel()?,
+    };
     let verb = Verb::Notice { text: text.into() };
-    channel
+    let sent = channel
         .call(verb, REPLY_MAX)
         .map(|reply| reply.text)
-        .map_err(|e| e.why().to_string())
+        .map_err(|e| e.why().to_string());
+    // After the call, failed or not: the game shows the notice on the tick that replies, or, when no reply came, may
+    // still show it up to then. The gap counts from the latest the notice can have appeared.
+    cx.live.notice_at.set(Some(Instant::now()));
+    sent
 }
 
-/// Waits until [`CLEAR`] after quen's last notice, so none is in a capture or a PresentMon window. A cancel ends the
-/// wait; the caller's own checks then stop it.
-pub(crate) fn clear(live: &Live, call: &mut Call) {
+/// Waits until [`CLEAR`] after quen's last notice, so none is in a capture or a PresentMon window. Err, nothing to
+/// capture or measure then: the call was stopped (a cancel) before the gap ended (finding 79: the window started 3 s
+/// after the notice).
+pub(crate) fn clear(live: &Live, call: &mut Call) -> Result<(), String> {
     let left = live
         .notice_at
         .get()
         .map_or(Duration::ZERO, |at| CLEAR.saturating_sub(at.elapsed()));
-    if !left.is_zero() {
-        measure::settle(call, left, "quen's notice in the game");
-        call.lap("notice_clear");
+    if left.is_zero() {
+        return Ok(());
+    }
+    let waited = measure::settle(call, left, "quen's notice in the game");
+    call.lap("notice_clear");
+    match waited {
+        true => Ok(()),
+        false => Err(format!(
+            "{} during the {} s after quen's notice in the game: nothing captured or measured",
+            call.stop_cause(),
+            CLEAR.as_secs()
+        )),
     }
 }
 
 /// The measuring notice, before a call's first window, when the agent has the controls and the call takes `secs` or
-/// more: the game's reply, or why it wasn't shown. None: no notice for it.
-pub(crate) fn measuring(cx: &Ctx, call: &mut Call, secs: u64) -> Option<String> {
+/// more: the game's reply, or why it wasn't shown. None: no notice for it. It goes on `held` when the caller holds the
+/// connection (taking it), else on a connection of its own.
+pub(crate) fn measuring(
+    cx: &Ctx,
+    call: &mut Call,
+    secs: u64,
+    held: &mut Option<Channel>,
+) -> Option<String> {
     if cx.hands != Some(Hands::Agent) || secs < MEASURING_MIN {
         return None;
     }
     let text = format!(
         "quen: measuring for about {secs} s. Please keep off the mouse and keys until it ends."
     );
-    let shown = show(cx, &text).unwrap_or_else(|why| why);
+    let shown = show_on(cx, held.take(), &text).unwrap_or_else(|why| why);
     call.lap("notice");
     Some(shown)
 }
 
 /// The session thread, between messages: the agent waiting ([`IDLE`] without a call from the connection that
 /// launched, the agent's controls, the game in front in gameplay or photo mode), once per stretch without calls. What
-/// it did goes to the daemon's log.
+/// it did goes to the daemon's log, with the time (UTC).
 pub(crate) fn idle(session: &Session) {
     let Some(live) = &session.live else {
         return;
@@ -117,7 +144,8 @@ pub(crate) fn idle(session: &Session) {
             Ok(_) => {
                 live.away.set(true);
                 return eprintln!(
-                    "quen: no call for {} s with the game in front: {name} brought forward",
+                    "{} quen: no call for {} s with the game in front: {name} brought forward",
+                    utc_ms(SystemTime::now()),
                     IDLE.as_secs()
                 );
             }
@@ -128,7 +156,8 @@ pub(crate) fn idle(session: &Session) {
     };
     let shown = show(&cx, WAITING).unwrap_or_else(|why| why);
     eprintln!(
-        "quen: no call for {} s with the game in front, the client not brought forward ({why}); the notice: {shown}",
+        "{} quen: no call for {} s with the game in front, the client not brought forward ({why}); the notice: {shown}",
+        utc_ms(SystemTime::now()),
         IDLE.as_secs()
     );
 }
@@ -143,7 +172,7 @@ fn needs_front(tool: &str) -> bool {
 
 /// After [`idle`] brought the client forward: a call of `tool` that needs the game in front, with the session's token,
 /// brings it back first, as `focus` to game does, once; never while the user has the controls. What that did
-/// (`game_back` in the result), or why it failed: the call's result then.
+/// (`game_back` in the result), or why it failed: the call's result then. The daemon's log says which, with the time.
 pub(crate) fn back(
     session: &Session,
     call: &Call,
@@ -165,7 +194,16 @@ pub(crate) fn back(
         live,
         hands: session.shared.hands(),
     };
-    focus::to_game(&cx, call).map(Some)
+    let back = focus::to_game(&cx, call);
+    let how = match &back {
+        Ok(fields) => format!("the game brought back: {}", json!(fields)),
+        Err(done) => format!("bringing the game back failed: {}", boot::reason(done)),
+    };
+    eprintln!(
+        "{} quen: {tool} after idle focus: {how}",
+        utc_ms(SystemTime::now())
+    );
+    back.map(Some)
 }
 
 /// `done` with what [`back`] did, as `game_back`.
@@ -215,10 +253,16 @@ mod tests {
             live,
             hands,
         };
-        assert_eq!(measuring(&cx(Some(Hands::User)), &mut call, 60), None);
-        assert_eq!(measuring(&cx(Some(Hands::Agent)), &mut call, 29), None);
+        assert_eq!(
+            measuring(&cx(Some(Hands::User)), &mut call, 60, &mut None),
+            None
+        );
+        assert_eq!(
+            measuring(&cx(Some(Hands::Agent)), &mut call, 29, &mut None),
+            None
+        );
         assert!(live.notice_at.get().is_none(), "nothing shown");
-        let shown = measuring(&cx(Some(Hands::Agent)), &mut call, 30);
+        let shown = measuring(&cx(Some(Hands::Agent)), &mut call, 30, &mut None);
         assert_eq!(shown.as_deref(), Some("notice shown"));
         let sent = server.join().unwrap();
         let want =
@@ -228,15 +272,49 @@ mod tests {
         live.notice_at
             .set(Some(Instant::now() - CLEAR + Duration::from_millis(300)));
         let t = Instant::now();
-        clear(live, &mut call);
+        assert_eq!(clear(live, &mut call), Ok(()));
         assert!(
             t.elapsed() >= Duration::from_millis(250),
             "{:?}",
             t.elapsed()
         );
         let t = Instant::now();
-        clear(live, &mut call);
+        assert_eq!(clear(live, &mut call), Ok(()));
         assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+        // Finding 79: a cancel inside the gap ends it with an error, so no window starts with the notice up.
+        live.notice_at.set(Some(Instant::now()));
+        fx.shared.cancel(0, &Value::Null);
+        let cut = clear(live, &mut call).unwrap_err();
+        assert!(
+            cut.starts_with("the call was cancelled during the 9 s"),
+            "{cut}"
+        );
+    }
+
+    /// Finding 80: a caller holding the game's only connection (sweep_play's first pose) gets the notice on it; a
+    /// second connection beside it would find every pipe instance busy.
+    #[test]
+    fn the_notice_goes_on_a_held_connection() {
+        let fx = served("notice-held");
+        let server = fake_game(
+            &token(&fx),
+            1,
+            Box::new(|r| vec![reply(r.id, true, "notice shown", None)]),
+        );
+        let session = fx.session();
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let live = session.live.as_ref().unwrap();
+        let cx = Ctx {
+            config: session.config().unwrap(),
+            live,
+            hands: Some(Hands::Agent),
+        };
+        let mut held = Some(cx.channel().unwrap());
+        let shown = measuring(&cx, &mut call, 30, &mut held);
+        assert_eq!(shown.as_deref(), Some("notice shown"));
+        assert!(held.is_none(), "the held connection carried it");
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(live.notice_at.get().is_some_and(|at| at.elapsed() < CLEAR));
     }
 
     /// After quen brought the client forward, only a call that needs the game in front, with the session's token and the

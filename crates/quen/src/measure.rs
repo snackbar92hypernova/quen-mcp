@@ -62,6 +62,7 @@ pub fn tools() -> Vec<Value> {
             "tag": {"type": "string", "description": "only subjects with this tag: 1 to 64 letters, digits and _ (quen-w3 0.1.12)"},
             "class": {"type": "string", "description": "the gameplay entities of this class instead of the alive actors, e.g. CNewNPC (quen-w3 0.1.12)"},
             "reference_id": {"type": "integer", "description": "measure against the subject with this id (world_actors' id, quen-w3 0.1.12) instead of the player"},
+            "contact_m": {"type": "number", "minimum": 0.1, "maximum": 3, "description": "a contact's centre distance in metres, default 0.75 (bodies touched at 0.70 in boot 187)"},
         },
         "additionalProperties": false,
     });
@@ -331,7 +332,7 @@ impl PresentMon {
         secs: u32,
         front: Option<HWND>,
     ) -> Result<(Stats, Fields), Done> {
-        notice::clear(cx.live, call);
+        notice::clear(cx.live, call).map_err(Done::Refused)?;
         let pid = cx.game_pid()?;
         let exe = self.exe.to_string_lossy();
         let argv = stats::presentmon_args(&exe, pid, secs, &dest.to_string_lossy(), &self.flags)?;
@@ -349,12 +350,19 @@ impl PresentMon {
             Instant::now(),
             false,
         );
+        // Looked at every FRONT_POLL: the front while the user plays, and a cancel, which kills PresentMon (finding 79:
+        // a cancelled window ran on and answered ok).
         let code = loop {
-            let slice = match front {
-                Some(_) => FRONT_POLL.min(max.saturating_sub(t.elapsed())),
-                None => max,
-            };
-            match child.wait(slice) {
+            match child.wait(FRONT_POLL.min(max.saturating_sub(t.elapsed()))) {
+                Ok(None) if call.stopped() => {
+                    let _ = job.kill();
+                    let why = format!(
+                        "{} {:.1} s into the {secs} s window: PresentMon was killed; no ledger rows, the CSV may be cut",
+                        call.stop_cause(),
+                        t.elapsed().as_secs_f32()
+                    );
+                    return Err(failed(why));
+                }
                 Ok(None) if t.elapsed() < max => {
                     left |= front.is_some_and(|w| !input::in_front(w));
                 }
@@ -585,9 +593,14 @@ fn record(
                     .find(|v| v.metric == metric)
                     .map_or(String::new(), |v| {
                         let v = json!({"verdict": v.verdict, "diff": v.diff, "drift": v.drift});
-                        format!("verdict {v}; ")
+                        format!("{metric} verdict {v}; ")
                     });
-            let note = format!("{sampled}; {about}{verdict}{checked}");
+            // The metric's own verdict first, before the run's (finding 85).
+            let floor = match (metric, m.push_floor) {
+                ("push_m", Some(from)) => format!("jitter floor from {from}; "),
+                _ => String::new(),
+            };
+            let note = format!("{sampled}; {verdict}{floor}{about}{checked}");
             add(
                 metric.into(),
                 value,
@@ -625,7 +638,7 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let pm = PresentMon::new(&cx, args)?;
     let quiet = quiet(flag(args, "strict")?, skewed(&cx))?;
     call.lap("check");
-    let notice = notice::measuring(&cx, call, secs.into());
+    let notice = notice::measuring(&cx, call, secs.into(), &mut None);
     let front = match cx.hands {
         Some(Hands::User) => Some(in_front(&cx, call)?),
         _ => None,
@@ -808,14 +821,21 @@ fn measure(
 
 /// A finished sampler run: its metrics, its CSV `<name>-trace.csv` in the session's capture folder and the CSV's
 /// captures row (method actor_trace). Err: it stopped early or has too few samples; nothing written.
-fn traced(cx: &Ctx, call: &mut Call, sampled: &Sampled, name: &str) -> Result<Traced, String> {
+fn traced(
+    cx: &Ctx,
+    call: &mut Call,
+    sampled: &Sampled,
+    sampler: &Sampler,
+    name: &str,
+) -> Result<Traced, String> {
     if let Some(why) = &sampled.stopped {
         return Err(format!(
             "trace: {why}, after {} samples",
             sampled.samples.len()
         ));
     }
-    let metrics = trace::metrics(&sampled.samples).map_err(|why| format!("trace: {why}"))?;
+    let metrics =
+        trace::metrics(&sampled.samples, sampler.contact).map_err(|why| format!("trace: {why}"))?;
     let csv = captures(cx).join(format!("{name}-trace.csv"));
     let text = trace::csv(&sampled.samples);
     fs::create_dir_all(captures(cx))
@@ -892,8 +912,8 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
     let mut fields = Map::new();
     fields.insert("utc".into(), json!(sampled.utc));
     fields.insert("samples".into(), json!(sampled.samples.len()));
-    let traced =
-        traced(&cx, call, &sampled, tag).map_err(|why| Done::Failed(why, fields.clone()))?;
+    let traced = traced(&cx, call, &sampled, &sampler, tag)
+        .map_err(|why| Done::Failed(why, fields.clone()))?;
     let window = Window {
         label: tag.into(),
         pm: None,
@@ -1178,7 +1198,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     call.lap("check");
     // About as long as the tool's description says a run takes.
     let secs = run.order.len() as u64 * (run.settle.as_secs() + u64::from(run.secs) + 5);
-    let notice = notice::measuring(&cx, call, secs);
+    let notice = notice::measuring(&cx, call, secs, &mut None);
     // From the first action on, every exit path restores (step 4).
     let mut windows = Vec::new();
     let mut entered = run.order[0];
@@ -1352,11 +1372,14 @@ fn windows_of(
         let pm = measured
             .map(|m| m.map_err(|d| format!("{at}: {}", why(d))))
             .transpose()?;
-        let traced = match &sampled {
-            Some(sampled) => {
+        let traced = match sampled.as_ref().zip(run.traced(i)) {
+            Some((sampled, sampler)) => {
                 utc.extend(sampled.utc.clone());
                 let name = run.window(i);
-                Some(traced(cx, call, sampled, &name).map_err(|why| format!("{at}: {why}"))?)
+                Some(
+                    traced(cx, call, sampled, sampler, &name)
+                        .map_err(|why| format!("{at}: {why}"))?,
+                )
             }
             None => None,
         };
@@ -1439,7 +1462,7 @@ fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::tests::{fake_game_until, reply, served, token};
+    use crate::channel::tests::{fake_game, fake_game_until, reply, served, token};
     use crate::game::tests::Fake;
     use quen_core::protocol::Request;
     use std::sync::Arc;
@@ -1448,6 +1471,7 @@ mod tests {
     /// writes its argv to argv.txt. Then it exits with the code in exit.txt, writing nothing, or writes the CSV: 5 warm-up
     /// rows and frames whose time is the dummy game's cvar as the journal's last write left it (20 ms, its default, before
     /// any), in the PresentMode of mode.txt (default Independent Flip). A mode_after.txt becomes mode.txt for the next window.
+    /// With sleep.txt it first sleeps that many ms.
     const FAKE_PRESENTMON: &str = r#"
 use std::{env, fs, io::Write, path::Path, process};
 fn main() {
@@ -1460,6 +1484,9 @@ fn main() {
     let mut calls = fs::OpenOptions::new().create(true).append(true).open(here.join("calls.txt")).unwrap();
     writeln!(calls, "presentmon {csv} {}", arg("--timed")).unwrap();
     fs::write(here.join("argv.txt"), args.join("\n")).unwrap();
+    if let Some(ms) = read("sleep.txt") {
+        std::thread::sleep(std::time::Duration::from_millis(ms.trim().parse().unwrap()));
+    }
     if let Some(code) = read("exit.txt") {
         eprintln!("error: the fake failed");
         process::exit(code.trim().parse().unwrap());
@@ -1968,7 +1995,10 @@ fn main() {
         let closest = m["closest_m_min"].as_f64().unwrap();
         assert!((0.5..0.6).contains(&closest), "{out}");
         assert_eq!(out["budget"]["cost_ms_per_frame"], "unmeasured", "{out}");
-        assert_eq!(out["sampler"], "actor_trace 10 Hz r8 max20 ref player");
+        assert_eq!(
+            out["sampler"],
+            "actor_trace 10 Hz r8 max20 ref player contact 0.75"
+        );
         // Per sample world.get, then world.actors with the default radius and max.
         assert_eq!(reads.len(), 42);
         assert_eq!(reads[0].verb, Verb::WorldGet {});
@@ -2007,7 +2037,7 @@ fn main() {
         let note = rows(&fx, sql)[0][0].as_str().unwrap().to_owned();
         assert!(
             note.starts_with(
-                "s1/walk-trace.csv; actor_trace 10 Hz r8 max20 ref player; 21 samples over "
+                "s1/walk-trace.csv; actor_trace 10 Hz r8 max20 ref player contact 0.75; 21 samples over "
             ),
             "{note}"
         );
@@ -2015,7 +2045,7 @@ fn main() {
         assert_eq!(
             samplers,
             [[
-                json!(r#"["actor_trace 10 Hz r8 max20 ref player"]"#),
+                json!(r#"["actor_trace 10 Hz r8 max20 ref player contact 0.75"]"#),
                 Value::Null
             ]]
         );
@@ -2025,6 +2055,63 @@ fn main() {
 
     /// The runner design's Q2 and Q4: the same trace beside PresentMon in every window, its sampler named on the frame
     /// rows and in the verdict, per metric a behaviour verdict; or the trace alone, without PresentMon at all.
+    /// Finding 79: job_cancel's flag (a cancel of a `wait: false` call: it sets the flag the session thread's call
+    /// checks) during the gap after the measuring notice starts no window, and one during the window kills PresentMon;
+    /// both fail and say when. The live check saw the window start 3 s after the notice and run on to a plain ok.
+    #[test]
+    fn a_cancel_in_the_notice_gap_or_the_window_measures_nothing() {
+        let cancel_after = |fx: &Fake, ms, tool, args: Value| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    sleep(Duration::from_millis(ms));
+                    fx.shared.cancel(0, &Value::Null);
+                });
+                let t = Instant::now();
+                (fx.run(tool, args), t.elapsed())
+            })
+        };
+        let fx = served("pmcancel-gap");
+        fake_presentmon(&fx);
+        fx.shared.set_hands(Some(Hands::Agent));
+        let notice = Box::new(|r: &Request| vec![reply(r.id, true, "notice shown", None)]);
+        let server = fake_game(&token(&fx), 1, notice);
+        let args = json!({"token": "tok", "tag": "gap", "secs": 30});
+        let (out, took) = cancel_after(&fx, 500, "measure_presentmon", args);
+        assert_eq!(server.join().unwrap().len(), 1, "the notice went out");
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["ok"] == false
+                && reason.starts_with("the call was cancelled during the 9 s after quen's notice"),
+            "{out}"
+        );
+        assert!(fx.calls().is_empty(), "a window started: {:?}", fx.calls());
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        // During the window: PresentMon killed, no rows.
+        let fx = served("pmcancel-window");
+        fake_presentmon(&fx);
+        fs::write(fx.dir.join("harness/sleep.txt"), "20000").unwrap();
+        let args = json!({"token": "tok", "tag": "mid", "secs": 10});
+        let (out, took) = cancel_after(&fx, 700, "measure_presentmon", args);
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["ok"] == false
+                && reason.starts_with("the call was cancelled ")
+                && reason.contains("s into the 10 s window: PresentMon was killed"),
+            "{out}"
+        );
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(fx.calls(), ["presentmon mid.csv 10"]);
+        let db = Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
+        let none = db
+            .query(
+                "SELECT count(*) FROM measurements",
+                &[],
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(none.rows, [[json!(0)]]);
+    }
+
     #[test]
     fn ab_traces_every_window_beside_or_instead_of_presentmon() {
         let fx = served("abtrace");
@@ -2059,7 +2146,7 @@ fn main() {
         );
         assert_eq!(
             out["budget"]["sampler"],
-            "actor_trace 5 Hz r10 max4 ref player"
+            "actor_trace 5 Hz r10 max4 ref player contact 0.75"
         );
         let utc = &out["states"][0]["utc"];
         assert!(
@@ -2100,12 +2187,19 @@ fn main() {
             "SELECT note FROM measurements WHERE run_id = 's1-both' AND metric = 'frame_ms_mean'";
         let note = rows(&fx, sql)[0][0].as_str().unwrap().to_owned();
         assert!(
-            note.contains("sampler actor_trace 5 Hz r10 max4 ref player in every window"),
+            note.contains(
+                "sampler actor_trace 5 Hz r10 max4 ref player contact 0.75 in every window"
+            ),
             "{note}"
         );
         let sql = "SELECT note FROM measurements WHERE run_id = 's1-both' AND metric = 'passes'";
         let note = rows(&fx, sql)[0][0].as_str().unwrap().to_owned();
-        assert!(note.contains("verdict {\"diff\":0.0,"), "{note}");
+        assert!(note.contains("; passes verdict {\"diff\":0.0,"), "{note}");
+        // Finding 85: the metric's own verdict before the run's frame-time one.
+        assert!(
+            note.find("passes verdict") < note.find("; verdict {"),
+            "{note}"
+        );
         // The overhead boot's A/B: the trace only in B's windows, its frame-time cost as the verdict; no behaviour.
         let (server, stop) = tracing(&fx);
         // The overhead boot's own call: two states that do nothing, the trace in one.
@@ -2125,7 +2219,7 @@ fn main() {
         assert_eq!(traced, [false, true, false, true]);
         let sampler = cost["sampler"].as_str().unwrap();
         assert!(
-            sampler.ends_with("ref player in the B windows only"),
+            sampler.ends_with("ref player contact 0.75 in the B windows only"),
             "{cost}"
         );
         for bad in [json!("C"), json!(1)] {
