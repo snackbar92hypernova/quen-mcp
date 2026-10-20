@@ -743,6 +743,72 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
     assert!(!bin.join("W3Test.asi").exists());
 }
 
+/// Finding 61: session_launch again ends the session and launches its spec again, the staged file copied anew from its
+/// path (a rebuilt one is taken), then makes the setup calls that succeeded after the last launch. Refused, nothing
+/// changed and the session live: no launch to repeat, another argument, a wrong token, a staged path gone.
+#[test]
+fn again_relaunches_the_last_spec_with_rebuilt_files_and_its_setup() {
+    let fx = Fixture::new();
+    let mut quen = Quen::start(&fx);
+    let again = |token: &Value| json!({"again": true, "user_ok": true, "token": token});
+    let none = quen.tool("session_launch", again(&Value::Null));
+    assert_eq!(none["refused"], true, "{none}");
+    let asi = fx.path("pc/W3Test.asi");
+    fs::create_dir_all(asi.parent().unwrap()).unwrap();
+    fs::write(&asi, "build 1").unwrap();
+    let launched = launch_with(&mut quen, json!({"stage": [asi.display().to_string()]}));
+    let token = launched["token"].clone();
+    let load = quen.tool("game_load", json!({"token": token, "save": "QuickSave"}));
+    assert_eq!(load["ok"], true, "{load}");
+    fs::write(&asi, "build 2").unwrap();
+    let mut extra = again(&token);
+    extra["save"] = json!("QuickSave");
+    let moved = fx.path("pc/moved.asi");
+    for (args, why) in [
+        (extra, "\"save\" with again"),
+        (again(&json!("not-it")), "wrong or missing token"),
+        (again(&token), "can't be repeated: stage"),
+    ] {
+        if why.starts_with("can't") {
+            fs::rename(&asi, &moved).unwrap();
+        }
+        let out = quen.tool("session_launch", args);
+        assert!(
+            out["refused"] == true && out["reason"].as_str().unwrap().contains(why),
+            "{why}: {out}"
+        );
+        assert_eq!(out["state"]["game"]["running"], true, "{out}");
+    }
+    fs::rename(&moved, &asi).unwrap();
+    let relaunched = quen.tool("session_launch", again(&token));
+    assert_eq!(relaunched["ok"], true, "{relaunched}");
+    assert_eq!(relaunched["ended"]["ok"], true, "{relaunched}");
+    assert_ne!(relaunched["token"], token);
+    assert_eq!(fx.read("game/bin/x64_dx12/W3Test.asi"), "build 2");
+    let setup = &relaunched["setup"];
+    assert_eq!(
+        (&setup[0]["tool"], &setup[0]["args"], &setup[0]["ok"]),
+        (
+            &json!("game_load"),
+            &json!({"save": "QuickSave"}),
+            &json!(true)
+        ),
+        "{relaunched}"
+    );
+    let loads = fx.calls();
+    let loads = loads.iter().filter(|c| *c == "console quenload(QuickSave)");
+    assert_eq!(loads.count(), 2, "{:?}", fx.calls());
+    let ended = quen.tool("session_end", json!({"token": relaunched["token"]}));
+    assert_eq!(ended["ok"], true, "{ended}");
+    fx.assert_restored();
+    let boots = fx.ledger("SELECT outcome FROM boots ORDER BY id");
+    assert_eq!(boots, [[json!("ok")], [json!("ok")]]);
+    // After the end the plan shows what again would do: the same save, the staged file, the setup.
+    let plan = quen.tool("session_plan", json!({"again": true}));
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["setup"].as_array().unwrap().len(), 1, "{plan}");
+}
+
 /// The daemon killed mid-session leaves the game to die with the job; the next daemon to start takes the lock,
 /// replays the journal and gives everything back, a staged file and its mod's log included (the log copied first).
 /// Kill points: the boot half done (files changed, the game running, the intros being skipped), and the boot done.

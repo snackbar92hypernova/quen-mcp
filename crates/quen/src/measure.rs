@@ -12,6 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::bridge_log::{VALID, in_photo};
+use quen_core::drift::{self, Fingerprint};
 use quen_core::journal::sha256_hex;
 use quen_core::ledger::{Capture, Ledger, Measurement, Tag};
 use quen_core::protocol::{MAX_ACTORS, MAX_ACTORS_RADIUS, Verb};
@@ -124,14 +125,14 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "measure_ab",
             "description": "Within-boot A/B/A/B (quen_guide: a second method). Per window: apply its state's \
-                actions, settle, one PresentMon window (PresentMon 2.x; else needs), and with trace an actor trace \
+                actions, settle, one PresentMon window (else needs), and with trace an actor trace \
                 beside it, the same each window (presentmon false: alone). Every action is checked before any runs. cvar and asi actions run before each of their state's \
                 windows; keys and console lines (toggles) only on a switch of state. Window 1 measures the game as it \
                 is: with toggles, the first state must be the current one. Both states name the same cvars and ASIs, \
                 and both or neither toggle. Returns per window frame time median / mean / p95, GPU and CPU busy, \
-                PresentMode, utc; drift per state (the spread of its windows' means), diff = mean(second state) - \
-                mean(first), verdict 'outside drift' only if |diff| exceeds every drift; with trace, sampler and \
-                behaviour (quen_guide). Another PresentMode than window 1's stops the run. At the \
+                PresentMode, utc, world; drift per state (the spread of its windows' means), diff = \
+                mean(second) - mean(first), verdict 'outside drift' only if |diff| exceeds every drift; drift_guard, \
+                and with trace sampler and behaviour (quen_guide). Another PresentMode than window 1's stops the run. At the \
                 end, and on any failure, cvars go back (game_cvar restore), ASI modes that took and toggles to the \
                 first state.",
             "inputSchema": {
@@ -451,12 +452,14 @@ fn in_front(cx: &Ctx, call: &Call) -> Result<HWND, Done> {
     Ok(window)
 }
 
-/// One window: its label, PresentMon's stats and CSV (none without PresentMon), its UTC times, and its trace.
+/// One window: its label, PresentMon's stats and CSV (none without PresentMon), its UTC times, its trace, and
+/// measure_ab's world fingerprint before and after it.
 struct Window {
     label: String,
     pm: Option<(Stats, PathBuf)>,
     utc: Fields,
     trace: Option<Traced>,
+    world: [Option<Fingerprint>; 2],
 }
 
 /// A window's trace: its metrics, its CSV and the CSV's captures row.
@@ -479,6 +482,9 @@ fn shown(n: usize, w: &Window) -> Value {
     }
     if let Some(t) = &w.trace {
         out["trace"] = json!({"metrics": t.metrics, "csv": t.csv, "capture_id": t.capture_id});
+    }
+    if w.world.iter().any(Option::is_some) {
+        out["world"] = json!({"before": w.world[0], "after": w.world[1]});
     }
     out
 }
@@ -650,6 +656,7 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
         pm: Some((stats, dest)),
         utc,
         trace: None,
+        world: [None, None],
     };
     let mut fields = Map::new();
     fields.insert("presentmon".into(), json!(pm.exe));
@@ -673,19 +680,19 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     Ok(fields)
 }
 
-/// A trace's checks before anything is read: quen's package at the version the sampler needs, a loaded game in quen's
-/// state; then the pid that serves the channel.
-fn trace_ready(cx: &Ctx, sampler: &Sampler, tool: &str) -> Result<u32, Done> {
+/// A trace's (or the drift guard's) checks before anything is read: quen's package at the version its reads need
+/// (`ids`: a sampler's tag, class or reference_id), a loaded game in quen's state; then the pid that serves the channel.
+fn trace_ready(cx: &Ctx, ids: bool, tool: &str) -> Result<u32, Done> {
     doctor::installed(&[&doctor::PACKAGE], cx.config, tool)?;
     doctor::package_at_least(cx.config, doctor::BEFORE_ITEMS, tool, "0.1.10")?;
-    if sampler.needs_ids() {
+    if ids {
         let what = format!("{tool} with tag, class or reference_id");
         doctor::package_at_least(cx.config, doctor::BEFORE_ENTITIES, &what, "0.1.12")?;
     }
     let last = cx.last_flags();
     if last.is_none_or(|f| f & VALID == 0) {
         let why = format!(
-            "quen's state shows {}: a trace needs a loaded game. Nothing read",
+            "quen's state shows {}: {tool} needs a loaded game. Nothing read",
             game::shown(last)
         );
         return Err(why.into());
@@ -890,6 +897,32 @@ fn budget(sampler: &Sampler, windows: &[Window]) -> Value {
     })
 }
 
+/// measure_ab's world fingerprint (drift.rs): read before and after each window, never inside one, on the channel's
+/// server; once a read fails, none for the rest of the run, `server` saying why.
+struct Guard {
+    server: Result<u32, String>,
+}
+
+impl Guard {
+    fn read(&mut self, cx: &Ctx) -> Option<Fingerprint> {
+        let server = *self.server.as_ref().ok()?;
+        let read = |verb| channel::read(&cx.live.channel, server, verb);
+        let actors = Verb::WorldActors {
+            radius: drift::RADIUS_M,
+            max: 1,
+            tag: None,
+            class: None,
+        };
+        let fingerprint = read(Verb::WorldGet {}).and_then(|world| {
+            let camera = read(Verb::CamGet {})?;
+            Fingerprint::new(&world, &camera, &read(actors)?)
+        });
+        fingerprint
+            .map_err(|why| self.server = Err(format!("world fingerprint: {why}; none after it")))
+            .ok()
+    }
+}
+
 /// measure_trace: one trace window, `secs` long.
 fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &["tag", "secs", "trace"])?;
@@ -904,7 +937,7 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
     if csv.exists() {
         return Err(format!("{} exists: pick a tag new in this session", csv.display()).into());
     }
-    let server = trace_ready(&cx, &sampler, "measure_trace")?;
+    let server = trace_ready(&cx, sampler.needs_ids(), "measure_trace")?;
     call.lap("check");
     let (_, sampled) = measure(&cx, call, None, Some((&sampler, server)), secs, None);
     let sampled = sampled.expect("a trace ran");
@@ -919,6 +952,7 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
         pm: None,
         utc: sampled.utc,
         trace: Some(traced),
+        world: [None, None],
     };
     fields.insert("sampler".into(), json!(sampler.to_string()));
     fields.insert("window".into(), shown(1, &window));
@@ -1169,8 +1203,13 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
             .into());
     }
     let server = match &run.sampler {
-        Some(sampler) => Some(trace_ready(&cx, sampler, "measure_ab trace")?),
+        Some(sampler) => Some(trace_ready(&cx, sampler.needs_ids(), "measure_ab trace")?),
         None => None,
+    };
+    // Finding 73: without the reads it needs, the run goes on, the guard judging frame times alone.
+    let mut guard = Guard {
+        server: trace_ready(&cx, false, "measure_ab's world fingerprint")
+            .map_err(|d| format!("world fingerprint unread: {}", why(d))),
     };
     // Each action checked before any runs (feature tests 1: five *_SetMode exports failed at window 1): the
     // ASI's export, the cvar's set without its write, the keys' plan and RenderDoc's capture key.
@@ -1212,6 +1251,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         &mut windows,
         &mut entered,
         &mut accepted,
+        &mut guard,
     )
     .err();
     let restored = restore(&cx, call, &run, entered, &accepted);
@@ -1264,6 +1304,35 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         let v = json!({"verdict": v.verdict, "diff_ms": v.diff_ms, "drift_ms": v.drift_ms});
         about.push(format!("verdict {v}"));
     }
+    // Finding 73's drift guard: window 1 against the rest, and each state's world fingerprint.
+    let means: Vec<(&str, f64)> = windows
+        .iter()
+        .filter_map(|w| {
+            w.pm.as_ref()
+                .map(|(s, _)| (w.label.as_str(), s.frame_ms.mean))
+        })
+        .collect();
+    let reads: Vec<(&str, String, &Fingerprint)> = windows
+        .iter()
+        .enumerate()
+        .flat_map(|(i, w)| {
+            let at = move |when| format!("window {} ({}) {when}", i + 1, w.label);
+            ["before", "after"]
+                .into_iter()
+                .zip(&w.world)
+                .filter_map(move |(when, fp)| Some((w.label.as_str(), at(when), fp.as_ref()?)))
+        })
+        .collect();
+    let guarded: Vec<String> = guard
+        .server
+        .err()
+        .into_iter()
+        .chain(drift::first_window(&means))
+        .chain(drift::world_changes(&reads))
+        .collect();
+    if !guarded.is_empty() {
+        about.push(format!("drift guard: {}", guarded.join("; ")));
+    }
     // The runner design's §4.2: a frame-time verdict with a sampler in its windows is scoped by it.
     let sampled = run.sampler.as_ref().map(|s| match run.trace_only {
         None => format!("sampler {s} in every window: its cost unmeasured"),
@@ -1286,6 +1355,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         ),
     );
     fields.insert("quiet".into(), quiet);
+    fields.insert("drift_guard".into(), json!(guarded));
     if let Some(sampler) = sampler {
         if run.trace_only.is_none() {
             fields.insert("behaviour".into(), json!(behaviour));
@@ -1328,6 +1398,7 @@ fn windows_of(
     windows: &mut Vec<Window>,
     entered: &mut usize,
     accepted: &mut Vec<String>,
+    guard: &mut Guard,
 ) -> Result<(), String> {
     for (i, &s) in run.order.iter().enumerate() {
         let (label, actions) = &run.states[s];
@@ -1367,7 +1438,9 @@ fn windows_of(
         let csv = run.csv(cx, i);
         let trace = run.traced(i).zip(server);
         let pm_csv = pm.map(|pm| (pm, csv.as_path()));
+        let before = guard.read(cx);
         let (measured, sampled) = measure(cx, call, pm_csv, trace, run.secs, None);
+        let after = guard.read(cx);
         call.lap(&format!("{}{label}_measure", i + 1));
         let pm = measured
             .map(|m| m.map_err(|d| format!("{at}: {}", why(d))))
@@ -1395,6 +1468,7 @@ fn windows_of(
             pm,
             utc,
             trace: traced,
+            world: [before, after],
         });
         let first = windows[0].pm.as_ref().map(|(s, _)| &s.present_mode);
         if let (Some((mode, mixed)), Some(first)) = (mode, first)
@@ -1751,6 +1825,74 @@ fn main() {
             json!({"token": "tok", "name": "QuenTest/FrameMs"}),
         );
         assert_eq!(now["var"]["live"], 20.0, "{now}");
+        // No loaded game in quen's state, so no world fingerprint: the run went on, and says so.
+        let unread = out["drift_guard"][0].as_str().unwrap_or_default();
+        assert!(unread.starts_with("world fingerprint unread: "), "{out}");
+        assert!(
+            note.contains(&format!("; drift guard: {unread}; ")),
+            "{note}"
+        );
+    }
+
+    /// Finding 73: the world fingerprint before and after each window, outside it; a read of one state that differs from
+    /// that state's first is a drift_guard note, on the result and every row, the verdict as it was.
+    #[test]
+    fn ab_notes_a_world_that_changed_within_a_state() {
+        use std::sync::atomic::AtomicUsize;
+        let fx = served("abguard");
+        fake_presentmon(&fx);
+        // The player stands at the origin for the first four world reads (windows 1 and 2), then 5 m off.
+        let worlds = AtomicUsize::new(0);
+        let answer = Box::new(move |r: &Request| {
+            let data = match r.verb {
+                Verb::WorldGet {} => {
+                    let x = if worlds.fetch_add(1, Ordering::Relaxed) < 4 {
+                        0
+                    } else {
+                        5
+                    };
+                    json!({"player": {"pos": [x, 0, 0], "heading": 0}, "weather": "WT_Clear"})
+                }
+                Verb::CamGet {} => json!({"pos": [0, -3, 2], "rot": [0, 0, 0], "fov": 60}),
+                Verb::WorldActors { .. } => json!({"found": 9, "actors": []}),
+                _ => panic!("{:?}", r.verb),
+            };
+            vec![reply(r.id, true, "read", Some(data))]
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = fake_game_until(&token(&fx), answer, stop.clone());
+        let mut args = ab_args(json!(["A", "B", "A", "B"]));
+        args["states"][0]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 20}]);
+        args["states"][1]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 23}]);
+        let out = fx.run("measure_ab", args);
+        stop.store(true, Ordering::Relaxed);
+        let reads: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["verdict"], "outside drift", "{out}");
+        // Per window, before and after it: world.get, cam.get, then the actors within 30 m (their count).
+        let actors = Verb::WorldActors {
+            radius: 30.0,
+            max: 1,
+            tag: None,
+            class: None,
+        };
+        assert_eq!(reads.len(), 4 * 2 * 3, "{reads:?}");
+        assert_eq!(reads[..3], [Verb::WorldGet {}, Verb::CamGet {}, actors]);
+        assert_eq!(out["states"][0]["world"]["before"]["actors"], 9, "{out}");
+        assert_eq!(
+            out["drift_guard"],
+            json!([
+                "window 3 (A) before differs from window 1 (A) before: the player moved 5.00 m",
+                "window 4 (B) before differs from window 2 (B) before: the player moved 5.00 m"
+            ]),
+            "{out}"
+        );
+        let sql = "SELECT note FROM measurements WHERE metric = 'frame_ms_mean' ORDER BY id";
+        let note = rows(&fx, sql)[3][0].as_str().unwrap().to_owned();
+        assert!(
+            note.contains("; drift guard: window 3 (A) before differs from window 1 (A) before: "),
+            "{note}"
+        );
     }
 
     /// Finding 59: console lines toggle like keys, each followed by its script-log line; one that doesn't show (only
@@ -1938,14 +2080,18 @@ fn main() {
         assert_eq!(tried[0]["ok"], false, "{tried:?}");
     }
 
-    /// A stand-in game for traces, until the flag is set: world.get answers the player standing at the origin, and
-    /// world.actors one walker (id 9) passing along y = 0.5 at 1 m/s, from x = -1 at the first read.
+    /// A stand-in game for traces, until the flag is set: world.get answers the player standing at the origin, cam.get a
+    /// camera behind him, and world.actors one walker (id 9) passing along y = 0.5 at 1 m/s, from x = -1 at the first
+    /// read.
     fn tracing(fx: &Fake) -> (std::thread::JoinHandle<Vec<Request>>, Arc<AtomicBool>) {
         let stop = Arc::new(AtomicBool::new(false));
         let start = std::sync::OnceLock::new();
         let answer = Box::new(move |r: &Request| {
             let data = match r.verb {
-                Verb::WorldGet {} => json!({"player": {"pos": [0, 0, 0], "heading": 0}}),
+                Verb::WorldGet {} => {
+                    json!({"player": {"pos": [0, 0, 0], "heading": 0}, "weather": "WT_Clear"})
+                }
+                Verb::CamGet {} => json!({"pos": [0, -3, 2], "rot": [0, 0, 0], "fov": 60}),
                 Verb::WorldActors { .. } => {
                     let x = -1.0 + start.get_or_init(Instant::now).elapsed().as_secs_f64();
                     json!({"found": 1, "actors": [{"id": 9, "pos": [x, 0.5, 0], "heading": -90,
@@ -2138,6 +2284,9 @@ fn main() {
             out.get("verdict").is_none() && out.get("presentmon").is_none(),
             "{out}"
         );
+        // The fingerprint around each window, outside the trace's: the same world throughout.
+        assert_eq!(out["drift_guard"], json!([]), "{out}");
+        assert_eq!(out["states"][3]["world"]["after"]["actors"], 1, "{out}");
         let behaviour = out["behaviour"].as_array().unwrap();
         assert_eq!(behaviour.len(), trace::METRICS.len(), "{out}");
         assert_eq!(

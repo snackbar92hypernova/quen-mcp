@@ -135,13 +135,16 @@ impl Shared {
             .and_then(|(boot, t, _)| (t == token).then_some(*boot))
     }
 
-    /// Why a session-thread call `tool` from connection `conn` is refused while a session is live, if it is: a launch or
-    /// plan while any session is, anything else from a connection other than the one that launched it. The
+    /// Why a session-thread call `tool` with `args` from connection `conn` is refused while a session is live, if it is: a
+    /// launch or plan while any session is (but the launcher's launch with `again`, which ends it first), anything else
+    /// from a connection other than the one that launched it. The
     /// session thread asks before every call, and the connection threads before queueing one, so another agent's
     /// refusal never waits behind the call in progress.
-    pub fn refusal(&self, conn: u64, tool: &str) -> Option<String> {
+    pub fn refusal(&self, conn: u64, tool: &str, args: &Value) -> Option<String> {
         let owner = locked(&self.boot).as_ref()?.2;
-        if matches!(tool, "session_launch" | "session_plan") {
+        // Its launcher's session_launch again ends it first.
+        let again = tool == "session_launch" && args["again"] == true && owner == conn;
+        if matches!(tool, "session_launch" | "session_plan") && !again {
             return Some(
                 "a session is live: session_end first (only the connection that launched it can); plan before a \
                  launch or after its end, while the game's files are the user's"
@@ -391,10 +394,52 @@ impl Live {
     }
 }
 
+/// The calls `session_launch again` replays after its launch (finding 61), each as it succeeded: the agent's writes to
+/// the game that a fresh load undoes. Not keys (they act on whatever is in front), saves, pauses, memory patches (each
+/// the user's OK), sweeps, or reads ([`hands::user_may`]).
+const SETUP: [&str; 9] = [
+    "game_load",
+    "game_teleport",
+    "game_settime",
+    "game_weather",
+    "game_console",
+    "game_items",
+    "game_cvar",
+    "game_photo",
+    "game_camera",
+];
+
+/// This quen serve's last test launch, for `session_launch again`: the connection that made it, its arguments (the save
+/// pinned to the file it loaded, no user_ok) and the [`SETUP`] calls since, in order, each `{tool, args}`.
+struct Again {
+    owner: u64,
+    args: Value,
+    setup: Vec<Value>,
+}
+
+impl Again {
+    fn new(owner: u64, args: &Value, save: Option<&Path>) -> Again {
+        let mut args = args.clone();
+        if let Some(map) = args.as_object_mut() {
+            map.remove("user_ok");
+            if let Some(file) = save.and_then(Path::file_name) {
+                map.insert("save".into(), json!(file.to_string_lossy()));
+            }
+        }
+        Again {
+            owner,
+            args,
+            setup: Vec::new(),
+        }
+    }
+}
+
 /// The session thread's own state.
 pub(crate) struct Session<'a> {
     pub(crate) shared: &'a Shared,
     pub(crate) live: Option<Live>,
+    /// What `session_launch again` repeats; it outlives the session's end.
+    again: Option<Again>,
     /// File hashes for the mod sets, kept while quen runs.
     pub(crate) cache: HashCache,
     /// The config in use, as the session thread's calls see it: changed only by [`Session::reload`].
@@ -438,7 +483,7 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                 let mut call = session.call(conn.clone(), id.clone(), progress);
                 call.job = Some(job.clone());
                 // Only the connection that launched the session drives and ends it, and only while the user lets it.
-                let refused = shared.refusal(conn.id, &name).or_else(|| {
+                let refused = shared.refusal(conn.id, &name, &args).or_else(|| {
                     let user = shared.hands() == Some(Hands::User);
                     (user && !hands::user_may(&name, &args)).then(|| hands::user_has(&name))
                 });
@@ -737,6 +782,7 @@ impl<'a> Session<'a> {
         Session {
             shared,
             live: None,
+            again: None,
             cache: HashCache::default(),
             config: shared.config(),
             text,
@@ -835,7 +881,7 @@ impl<'a> Session<'a> {
 
     /// Runs session-thread tool `name`, once it isn't refused.
     fn run(&mut self, call: &mut Call, name: &str, args: &Value) -> Done {
-        match name {
+        let done = match name {
             "session_launch" => self.launch(call, args, false),
             "session_plan" => self.launch(call, args, true),
             "session_end" => self.end(call, args),
@@ -859,6 +905,23 @@ impl<'a> Session<'a> {
             n if n.starts_with("mem_") => mem::call(self, call, n, args),
             n @ ("data_read" | "data_scan" | "script_compile") => data::call(self, call, n, args),
             _ => self.recover(call, true),
+        };
+        if matches!(done, Done::Ok(_)) {
+            self.note_setup(name, args);
+        }
+        done
+    }
+
+    /// Notes a successful call of `tool` that the next `session_launch again` replays ([`SETUP`]): where run_plan's
+    /// setup steps go too.
+    pub(crate) fn note_setup(&mut self, tool: &str, args: &Value) {
+        let replayed = SETUP.contains(&tool) && !hands::user_may(tool, args);
+        if let Some(again) = self.again.as_mut().filter(|_| replayed) {
+            let mut args = args.clone();
+            if let Some(map) = args.as_object_mut() {
+                map.remove("token");
+            }
+            again.setup.push(json!({"tool": tool, "args": args}));
         }
     }
 
@@ -1051,6 +1114,9 @@ impl<'a> Session<'a> {
     /// client prompts for every launch, so the plan is a tool of its own that subagents may call).
     /// While a session is live, both are refused before they get here (`Shared::refusal`).
     fn launch(&mut self, call: &mut Call, args: &Value, plan: bool) -> Done {
+        if args.get("again").is_some() {
+            return self.relaunch(call, args, plan);
+        }
         let config = match self.config() {
             Ok(config) => config.clone(),
             Err(why) => return why.into(),
@@ -1393,7 +1459,138 @@ impl<'a> Session<'a> {
         if !warnings.is_empty() {
             fields.insert("warnings".into(), json!(warnings));
         }
+        if !spec.play {
+            self.again = Some(Again::new(call.conn.id, args, spec.save.as_deref()));
+        }
         Done::Ok(fields)
+    }
+
+    /// `session_launch` (with `plan` `session_plan`) with `again: true` (finding 61): this connection's last test launch
+    /// again, its staged files and mods copied anew from their paths, so a rebuilt one is taken. Its session, if live (its
+    /// token), ends first, once its save and staged paths are checked to be still there; then the launch, then the setup:
+    /// the [`SETUP`] calls that succeeded after the last launch, in order. A setup call that doesn't succeed stops the
+    /// rest. The plan plans that launch and lists the setup.
+    // ponytail: no way to skip or edit the setup; add `replay: false` (or a list) when asked: session_launch's schema is
+    // at the portable 5000-byte cap.
+    fn relaunch(&mut self, call: &mut Call, args: &Value, plan: bool) -> Done {
+        let known: &[&str] = match plan {
+            true => &["again"],
+            false => &["again", "token", "user_ok"],
+        };
+        let extra = args
+            .as_object()
+            .map(|a| a.keys().find(|k| !known.contains(&k.as_str())));
+        match extra {
+            None => return "arguments must be an object".to_string().into(),
+            Some(Some(key)) => {
+                return format!(
+                    "{key:?} with again: again repeats the last launch's arguments as they were"
+                )
+                .into();
+            }
+            Some(None) => {}
+        }
+        if args["again"] != true {
+            return "again must be true (it repeats the last launch); leave it out for a new one"
+                .to_string()
+                .into();
+        }
+        let Some(last) = self.again.as_ref().filter(|a| a.owner == call.conn.id) else {
+            return "no test launch of this connection's to repeat in this quen serve"
+                .to_string()
+                .into();
+        };
+        let (setup, mut repeat) = (last.setup.clone(), last.args.clone());
+        if plan {
+            let mut done = self.launch(call, &repeat, true);
+            if let Done::Ok(fields) = &mut done {
+                fields.insert("setup".into(), json!(setup));
+            }
+            return done;
+        }
+        if args["user_ok"] != true {
+            return Done::Refused(
+                "user_ok: tell the user the game is about to launch again and get their OK first"
+                    .into(),
+            );
+        }
+        repeat["user_ok"] = json!(true);
+        if let Some(live) = &self.live {
+            if live.play {
+                return "again repeats a test session's launch: a play session ends when the user quits the game"
+                    .to_string()
+                    .into();
+            }
+            if args["token"].as_str() != Some(live.token.as_str()) {
+                return "wrong or missing token: again ends the live session first, with its token"
+                    .to_string()
+                    .into();
+            }
+        }
+        let config = match self.config() {
+            Ok(config) => config.clone(),
+            Err(why) => return why.into(),
+        };
+        if let Err(why) = boot::reproducible(&config, &repeat) {
+            return format!("the last launch can't be repeated: {why}").into();
+        }
+        if call.stopped() {
+            return Done::Refused("cancelled before anything was changed".into());
+        }
+        let mut fields = Map::new();
+        if self.live.is_some() {
+            let end = self.finish(call, "session_launch again", false);
+            let ended = matches!(end, Done::Ok(_));
+            fields.insert("ended".into(), self.envelope_fields(end));
+            if !ended {
+                let why = "the end before the launch failed (ended says why): nothing launched";
+                return Done::Failed(why.into(), fields);
+            }
+        }
+        let mut launched = match self.launch(call, &repeat, false) {
+            Done::Ok(launched) => launched,
+            done if fields.is_empty() => return done,
+            done => {
+                let why = format!(
+                    "the session ended, then the launch: {}",
+                    boot::reason(&done)
+                );
+                fields.insert("launch".into(), self.envelope_fields(done));
+                return Done::Failed(why, fields);
+            }
+        };
+        launched.extend(fields);
+        // Each setup call on a call of its own, so its laps are its own; the new session records it again.
+        let mut ran = Vec::new();
+        for (n, step) in setup.iter().enumerate() {
+            let tool = step["tool"].as_str().unwrap_or_default();
+            let mut step_args = step["args"].clone();
+            step_args["token"] = launched["token"].clone();
+            let mut each = self.call(call.conn.clone(), call.id.clone(), None);
+            each.job = call.job.clone();
+            let done = match call.stopped() {
+                true => Done::Refused(format!("{} before it", call.stop_cause())),
+                false => self.run(&mut each, tool, &step_args),
+            };
+            let mut row = step.clone();
+            row["ok"] = json!(matches!(done, Done::Ok(_)));
+            row["timing_s"] = json!(each.timing);
+            if row["ok"] == false {
+                let why = boot::reason(&done);
+                row["result"] = self.envelope_fields(done);
+                ran.push(row);
+                launched.insert("setup".into(), json!(ran));
+                let why = format!(
+                    "setup step {} ({tool}): {why}; the steps after it didn't run",
+                    n + 1
+                );
+                return Done::Failed(why, launched);
+            }
+            ran.push(row);
+        }
+        call.lap("setup");
+        launched.insert("setup".into(), json!(ran));
+        Done::Ok(launched)
     }
 
     /// A launch that changed something, then failed for `why`: the session ends (saves quiet, kill, replay), and the
