@@ -144,7 +144,7 @@ One launch of the game. `id`; `game_id` → games; `t_start`, `t_end` (NULL whil
 - `busy_with` (JSON array): what the quiet-machine checks found running that skews the numbers, such as compilers or
   RE analysis; `[]` when every check found the machine quiet, NULL when none was recorded (every boot before schema 5,
   and every boot quen measured before its measure tools recorded their checks).
-- `patches` (JSON array): every memory patch and data write of the boot, as its journal recorded them.
+- `patches` (JSON array): every memory patch and data write of the boot, as its journal recorded them. An instance patch's entry holds `writes` (each field written: `address`, `old`, `new`) and `instances` (the row's `name` and `class`, `vtable`, `offset`, and its counts).
 
 The end: `outcome` (`ok`, `failed`, or `recovered`: closed by a journal replay), `failure` (why, for failed),
 `journal_path`. `reviewed_at`: when the user looked at the boot's outputs. `harness_info` (JSON object): the info

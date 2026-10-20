@@ -1,5 +1,5 @@
-//! The live-memory tools: `mem_read`, `mem_scan`, `mem_find`, `mem_follow`, `mem_walk`, `mem_regions`, `mem_patch`
-//! and `mem_unpatch`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
+//! The live-memory tools: `mem_read`, `mem_scan`, `mem_find`, `mem_follow`, `mem_walk`, `mem_regions`, `mem_patch`,
+//! `mem_unpatch`, `mem_patch_instances` and `mem_unpatch_instances`, and the Windows half of quen-core's `mem`. [`Process`] reads the game through a handle with read
 //! access only, on the pid from the session's job (never "the first witcher3.exe"). [`Ctx::write`] journals a planned
 //! write, then makes it with a handle open for that write only. game_cvar and measure_ab's cvar actions (game.rs) go
 //! through the same two. Every result ends in [`result`]: where its addresses lie, its provenance, and a big one in a
@@ -34,10 +34,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
-use crate::doctor;
-use crate::game::{self, Ctx, Fields, ctx, flag, text};
+use crate::game::{self, Ctx, Fields, ctx, flag, hex_bytes, text};
 use crate::ledger::{self, INLINE_BYTES};
 use crate::session::{self, Call, Done, Session};
+use crate::{doctor, hands};
 
 /// A scan or find page's hits when the call gives no `limit`.
 const LIMIT: usize = 100;
@@ -93,6 +93,8 @@ pub fn tools() -> Vec<Value> {
         "ne": {"type": "string", "description": "the field doesn't hold this (0: nonzero)"},
     }, "required": ["field"], "additionalProperties": false});
     let name = json!({"type": "string", "description": "a patch's name in the KB's patches.tsv"});
+    let instances =
+        json!({"type": "string", "description": "a row's name in the KB's instance_patches.tsv"});
     let patch = |verb: &str, does: &str| {
         json!({
             "name": format!("mem_{verb}"),
@@ -232,6 +234,38 @@ pub fn tools() -> Vec<Value> {
             "unpatch",
             "Undo a mem_patch: the old bytes back, only while the live bytes are still the patched ones.",
         ),
+        json!({
+            "name": "mem_patch_instances",
+            "description": "Write a field in every live instance of a class, as a row of the KB's instance_patches.tsv \
+                defines it for the running build. The client asks the user on every call (user_ok is only your word): \
+                never route around a denial. Instances: the 8-byte-aligned qwords holding the class's vtable pointer \
+                in the image and private regions (mem_find's default scope), at most 1000. Each is written only in a \
+                writable region and while, read again right before its write, its first qword is the vtable pointer \
+                and its field holds the row's old value. Instances created later keep their value. counts: found, \
+                matched, written, already, left; instances: address, status, why. One journaled step; it taints saves. \
+                Refused, nothing written: no user_ok; no row of that name for the running build, boundaries-checked \
+                not set, a row that breaks the rules; the search stopped (deadline_s) or found over 1000; no instance \
+                written; with needs: no instance_patches.tsv. The rules: quen_guide. Numbers and provenance as \
+                mem_find's.",
+            // Claude Code prompts for this tool on every call, in every permission mode, as for session_launch.
+            "_meta": {"anthropic/requiresUserInteraction": true},
+            "inputSchema": schema(json!({
+                "name": instances,
+                "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation the row, the class, the field's old and new values and that every live instance found is written (the count comes back), and they agreed. Required."},
+                "deadline_s": deadline,
+            }), &["name", "user_ok"]),
+        }),
+        json!({
+            "name": "mem_unpatch_instances",
+            "description": "Undo this session's mem_patch_instances of a row: each field they wrote and nothing undid \
+                gets the value it held back, only while its instance's first qword is still the vtable pointer and the \
+                field still holds the row's new value, both read again right before the write. counts: applied, \
+                restored, left; instances: each one's address and status (restored, or left with why: freed or reused, \
+                rewritten by the game). A field it leaves stays in hands_give's applied. One journaled step. Refused, \
+                nothing written: no field of that row still applied in this session, or none restored (with counts and \
+                instances). Numbers and provenance as mem_read's; over 16 KB, as mem_find's.",
+            "inputSchema": schema(json!({"name": instances}), &["name"]),
+        }),
     ]
 }
 
@@ -245,6 +279,8 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "mem_regions" => regions(session, call, args),
         "mem_patch" => patch(session, call, args, Op::Patch),
         "mem_unpatch" => patch(session, call, args, Op::Unpatch),
+        "mem_patch_instances" => patch_instances(session, call, args),
+        "mem_unpatch_instances" => unpatch_instances(session, call, args),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
     };
     out.map_or_else(|done| done, Done::Ok)
@@ -483,6 +519,94 @@ impl Ctx<'_> {
             fields.insert("maybe_written".into(), json!(maybe));
             Done::Failed(format!("{what}: {why}"), fields.clone())
         })
+    }
+
+    /// Makes `writes` in instances of a class in `game` (a field `offset` bytes into each, whose first qword was
+    /// `vtable`), each only as [`mem::write_instances`] allows. They are journaled first as one step `what`, whose entry
+    /// on the session's patch list holds every one (`writes`) and `instances`: `meta` (the row's name and class, and
+    /// counts) with `vtable`, `offset` and, once done, `written`; then only the ones made. None made: the step is taken
+    /// back. Per write, in order, made or why it was left. Refused if the game can't be opened for writing or the
+    /// journal can't be written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_instances(
+        &self,
+        game: &Process,
+        what: &str,
+        vtable: u64,
+        offset: u64,
+        mut meta: Value,
+        writes: &[Write],
+        fields: &mut Fields,
+    ) -> Result<Vec<Result<(), String>>, Done> {
+        let handle = open(game.pid, PROCESS_VM_WRITE | PROCESS_VM_OPERATION)
+            .map_err(|e| format!("open pid {} for writing: {e}", game.pid))?;
+        meta["vtable"] = json!(format!("{vtable:#x}"));
+        meta["offset"] = json!(offset);
+        let entry = |writes: Value, meta: &Value| {
+            if let Some((_, p)) = self.live.patches.borrow_mut().last_mut() {
+                p["writes"] = writes;
+                p["instances"] = meta.clone();
+            }
+        };
+        let (mut journal, id) = self.journal(what, None, true)?;
+        entry(json!(writes), &meta);
+        let results = mem::write_instances(game, vtable, offset, writes, &mut |w| poke(&handle, w));
+        let made: Vec<&Write> = writes
+            .iter()
+            .zip(&results)
+            .filter(|(_, r)| r.is_ok())
+            .map(|(w, _)| w)
+            .collect();
+        meta["written"] = json!(made.len());
+        entry(json!(made), &meta);
+        if let Some(note) = self.settle(&mut journal, id, !made.is_empty()) {
+            fields.insert("journal_note".into(), json!(note));
+        }
+        Ok(results)
+    }
+
+    /// Undoes `writes` (each the undo of a field a mem_patch_instances wrote: its new bytes back to its old) of one
+    /// instance patch, whose patch-list entry's `instances` is `meta`, through [`Ctx::write_instances`] as one step
+    /// `what`: mem_unpatch_instances, and a dropped play session's undo.
+    pub(crate) fn undo_instances(
+        &self,
+        game: &Process,
+        what: &str,
+        meta: &Value,
+        writes: &[Write],
+        fields: &mut Fields,
+    ) -> Result<Vec<Result<(), String>>, Done> {
+        let vtable = meta["vtable"].as_str().and_then(mem::number);
+        let vtable = vtable.and_then(|n| u64::try_from(n).ok());
+        let (Some(vtable), Some(offset)) = (vtable, meta["offset"].as_u64()) else {
+            return Err(format!("{what}: its patch list entry has no vtable or offset").into());
+        };
+        let meta = json!({"name": meta["name"], "class": meta["class"], "applied": writes.len()});
+        self.write_instances(game, what, vtable, offset, meta, writes, fields)
+    }
+}
+
+/// Writes `w.new` at `w.address` with `handle` (write access), in a page that is writable: an instance field lies inside
+/// one aligned qword, so in one page, which WriteProcessMemory writes whole or not at all.
+fn poke(handle: &OwnedHandle, w: &Write) -> Result<(), String> {
+    let (at, len) = (w.address as *const c_void, w.new.len());
+    let mut wrote = 0;
+    // SAFETY: a handle opened for writing, owned by the caller; the source buffer holds `len` bytes.
+    let ok = unsafe {
+        WriteProcessMemory(
+            handle.as_raw_handle(),
+            at,
+            w.new.as_ptr().cast(),
+            len,
+            &mut wrote,
+        )
+    };
+    match ok != 0 && wrote == len {
+        true => Ok(()),
+        false => Err(format!(
+            "WriteProcessMemory wrote {wrote} of {len} bytes: {}",
+            io::Error::last_os_error()
+        )),
     }
 }
 
@@ -1004,6 +1128,148 @@ fn patch(session: &Session, call: &mut Call, args: &Value, op: Op) -> Result<Fie
     result(&cx, call, &game, tool, args, Value::Object(fields), None)
 }
 
+fn patch_instances(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let tool = "mem_patch_instances";
+    let cx = checked(session, args, &["name", "user_ok", "deadline_s"])?;
+    let name = text(args, "name")?;
+    if !flag(args, "user_ok")? {
+        let why = "user_ok: tell the user in this conversation the row, the class, the old and new values and that \
+                   every live instance found is written, and get their OK, first";
+        return Err(why.to_string().into());
+    }
+    let budget = deadline(args)?;
+    let rows = cx.kb(&doctor::KB_INSTANCES, tool, mem::from_instances_tsv)?;
+    let game = cx.game()?;
+    let image = &game.image;
+    let mut tick = ticker(call, budget);
+    let planned = mem::plan_instances(&rows, name, &image.stamp, image.base, &game, &mut tick);
+    drop(tick);
+    let (row, found) = planned.map_err(|r| format!("{name}: {r}"))?;
+    call.lap("search");
+    let total = found.writes.len() + found.already.len() + found.left.len();
+    let mut fields = Map::new();
+    let results = match found.writes.len() {
+        0 => Vec::new(),
+        n => {
+            let what = format!("{tool} {name}: {n} instances of {}", row.class);
+            let meta = json!({"name": row.name, "class": row.class, "found": total, "matched": n,
+                              "already": found.already.len()});
+            let (vtable, writes) = (found.vtable, &found.writes);
+            cx.write_instances(&game, &what, vtable, row.offset, meta, writes, &mut fields)?
+        }
+    };
+    call.lap("write");
+    let at = |address: u64| json!(format!("{address:#x}"));
+    let (mut done, mut left) = (Vec::new(), Vec::new());
+    for (w, r) in found.writes.iter().zip(&results) {
+        let address = at(w.address - row.offset);
+        match r {
+            Ok(()) => done.push(json!({"address": address, "status": "written"})),
+            Err(why) => left.push(json!({"address": address, "status": "left", "why": why})),
+        }
+    }
+    let written = done.len();
+    let searched = found.left.iter();
+    left.extend(searched.map(|(a, why)| json!({"address": at(*a), "status": "left", "why": why})));
+    let left_n = left.len();
+    done.extend(left);
+    let already = found.already.iter();
+    done.extend(already.map(|a| json!({"address": at(*a), "status": "already"})));
+    fields.insert("row".into(), row.json());
+    fields.insert("vtable".into(), at(found.vtable));
+    let counts = json!({"found": total, "matched": found.writes.len(), "written": written,
+                        "already": found.already.len(), "left": left_n});
+    fields.insert("counts".into(), counts);
+    fields.insert("instances".into(), json!(done));
+    let search =
+        json!({"bytes": found.bytes, "skipped": found.skipped, "left_out": found.left_out});
+    fields.insert("search".into(), search);
+    let out = result(
+        &cx,
+        call,
+        &game,
+        tool,
+        args,
+        Value::Object(fields),
+        Some("instances"),
+    )?;
+    if written == 0 {
+        let why = format!("{name}: no instance written (counts, instances): nothing changed");
+        return Err(Done::RefusedWith(why, out));
+    }
+    Ok(out)
+}
+
+fn unpatch_instances(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let tool = "mem_unpatch_instances";
+    let cx = checked(session, args, &["name"])?;
+    let name = text(args, "name")?;
+    // The fields this row's patches wrote that are still applied, newest first, each to go back to what it held.
+    let (meta, writes) = {
+        let patches = cx.live.patches.borrow();
+        let mine: Vec<[&Value; 5]> = hands::applied(&patches)
+            .into_iter()
+            .filter(|a| a[4]["name"] == name)
+            .collect();
+        let undo = |[address, old, new, ..]: &[&Value; 5]| {
+            Some(Write {
+                address: address.as_u64()?,
+                old: hex_bytes(new)?,
+                new: hex_bytes(old)?,
+            })
+        };
+        let writes: Option<Vec<Write>> = mine.iter().map(undo).collect();
+        (
+            mine.first().map(|a| a[4].clone()),
+            writes.unwrap_or_default(),
+        )
+    };
+    let Some(meta) = meta.filter(|_| !writes.is_empty()) else {
+        let why = format!(
+            "{name}: no field mem_patch_instances {name} wrote is still applied in this session: nothing to undo"
+        );
+        return Err(why.into());
+    };
+    let game = cx.game()?;
+    let offset = meta["offset"].as_u64().unwrap_or_default();
+    let what = format!("{tool} {name}: {} instances", writes.len());
+    let mut fields = Map::new();
+    let results = cx.undo_instances(&game, &what, &meta, &writes, &mut fields)?;
+    call.lap("write");
+    let mut instances: Vec<Value> = writes
+        .iter()
+        .zip(&results)
+        .map(|(w, r)| {
+            let address = format!("{:#x}", w.address - offset);
+            match r {
+                Ok(()) => json!({"address": address, "status": "restored"}),
+                Err(why) => json!({"address": address, "status": "left", "why": why}),
+            }
+        })
+        .collect();
+    instances.sort_by_key(|i| i["status"] != "restored");
+    let restored = results.iter().filter(|r| r.is_ok()).count();
+    let counts =
+        json!({"applied": writes.len(), "restored": restored, "left": writes.len() - restored});
+    fields.insert("vtable".into(), meta["vtable"].clone());
+    fields.insert("counts".into(), counts);
+    fields.insert("instances".into(), json!(instances));
+    let out = result(
+        &cx,
+        call,
+        &game,
+        tool,
+        args,
+        Value::Object(fields),
+        Some("instances"),
+    )?;
+    if restored == 0 {
+        let why = format!("{name}: no instance restored (counts, instances): nothing changed");
+        return Err(Done::RefusedWith(why, out));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1086,6 +1352,43 @@ pub(crate) mod tests {
     static HOP: Cell<[*const u8; 2]> =
         Cell(UnsafeCell::new([(&raw const BUF).cast(), std::ptr::null()]));
 
+    /// The dummy game's instances of a class of the tests' own, not any game's: the class's vtable (a static whose
+    /// address only matters), then an f32 at +0x58, 0.2 in all but the third.
+    #[repr(C, align(8))]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Obj {
+        vtable: *const u8,
+        pad: [u8; 0x50],
+        pub(crate) field: f32,
+        tail: u32,
+    }
+
+    static VTABLE: [u64; 2] = [0x5155_454e_5654_424c, 0];
+    const fn obj(field: f32) -> Obj {
+        Obj {
+            vtable: (&raw const VTABLE).cast(),
+            pad: [0; 0x50],
+            field,
+            tail: 0,
+        }
+    }
+    pub(crate) static OBJS: Cell<[Obj; 4]> =
+        Cell(UnsafeCell::new([obj(0.2), obj(0.2), obj(0.5), obj(0.2)]));
+
+    /// The dummy game's `instance_patches.tsv`: `steer` writes 0.35 over 0.2 in [`OBJS`]' field; `bad` names a field
+    /// over the vtable pointer.
+    pub(crate) fn instances_tsv() -> String {
+        let (_, mine) = this_exe();
+        let vt = VTABLE.as_ptr() as u64 - mine.base;
+        let field = offset_of!(Obj, field);
+        let stamp = &mine.stamp;
+        format!(
+            "name\tclass\tvtable\tbuild\toffset\ttype\told\tnew\tboundaries-checked\n\
+             steer\tCQuenTest\t{vt:#x}\t{stamp}\t{field:#x}\tf32\t0.2\t0.35\ttest\n\
+             bad\tCQuenTest\t{vt:#x}\t{stamp}\t0x4\tf32\t0.2\t0.35\ttest\n"
+        )
+    }
+
     /// The dummy game's `cvar_layout.tsv`, for `build`.
     pub(crate) fn layout_tsv(build: &str) -> String {
         let o = |offset: usize| format!("{offset:#x}");
@@ -1147,7 +1450,7 @@ pub(crate) mod tests {
     #[ignore = "the dummy game other tests start: it only sleeps"]
     fn dummy_game() {
         if std::env::var_os("QUEN_DUMMY_GAME").is_some() {
-            std::hint::black_box((&VAR, &BUF, &HOP));
+            std::hint::black_box((&VAR, &BUF, &HOP, &OBJS));
             for modifier in [PAGE_WRITECOMBINE, PAGE_NOCACHE] {
                 let commit = MEM_COMMIT | MEM_RESERVE;
                 // SAFETY: a fresh allocation, checked, then written at its base only.
@@ -1623,6 +1926,171 @@ pub(crate) mod tests {
             crate::doctor::KB_PATCHES.name,
             "{none}"
         );
+    }
+
+    /// One session's tool call, as a client's: its patch list stays across calls.
+    pub(crate) fn run(session: &mut Session, tool: &str, args: Value) -> Value {
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let done = super::call(session, &mut call, tool, &args);
+        session.envelope(tool, call, done)
+    }
+
+    /// The dummy game's [`OBJS`] fields, read through mem_read.
+    pub(crate) fn obj_fields(session: &mut Session) -> Vec<Value> {
+        let objs = rva(OBJS.address());
+        let field = offset_of!(Obj, field) as u64;
+        (0..4)
+            .map(|i| {
+                let at = objs + i * size_of::<Obj>() as u64 + field;
+                let read = json!({"token": "tok", "rva": at, "type": "f32"});
+                run(session, "mem_read", read)["value"].clone()
+            })
+            .collect()
+    }
+
+    /// mem_patch_instances writes the field of every instance of the dummy's class that holds the row's old value,
+    /// journaled as one step and on the patch list with every field; a second call finds nothing to write;
+    /// mem_unpatch_instances restores them; rows that break the rules, unknown rows and no table are refused.
+    #[test]
+    fn instance_patches_write_every_live_instance_and_are_undone() {
+        let fx = Fake::new("meminstances");
+        fs::write(fx.dir.join("kb/instance_patches.tsv"), instances_tsv()).unwrap();
+        let mut session = fx.session();
+        let on = |name: &str| json!({"token": "tok", "name": name, "user_ok": true});
+        let asked = run(
+            &mut session,
+            "mem_patch_instances",
+            json!({"token": "tok", "name": "steer"}),
+        );
+        assert!(
+            asked["reason"].as_str().unwrap().starts_with("user_ok"),
+            "{asked}"
+        );
+        let v = |f: f32| json!(f);
+        let start = [v(0.2), v(0.2), v(0.5), v(0.2)];
+        assert_eq!(obj_fields(&mut session), start);
+
+        let out = run(&mut session, "mem_patch_instances", on("steer"));
+        assert_eq!(out["ok"], true, "{out}");
+        let counts = json!({"found": 4, "matched": 3, "written": 3, "already": 0, "left": 1});
+        assert_eq!(out["counts"], counts, "{out}");
+        assert_eq!(
+            obj_fields(&mut session),
+            [v(0.35), v(0.35), v(0.5), v(0.35)]
+        );
+        assert_eq!(
+            OBJS.initial()[0].field,
+            0.2,
+            "the dummy's copy was written, not ours"
+        );
+        let base = hex(&out["image_base"]);
+        let obj = |i: u64| x(base + rva(OBJS.address()) + i * size_of::<Obj>() as u64);
+        let instances = out["instances"].as_array().unwrap().iter();
+        let status: Vec<Value> = instances
+            .map(|i| json!([i["address"], i["status"]]))
+            .collect();
+        let want = [(0, "written"), (1, "written"), (3, "written"), (2, "left")];
+        let want: Vec<Value> = want.iter().map(|(i, s)| json!([obj(*i), s])).collect();
+        assert_eq!(status, want, "{out}");
+        assert!(
+            out["instances"][3]["why"]
+                .as_str()
+                .unwrap()
+                .contains("holds 0.5"),
+            "{out}"
+        );
+        assert_eq!(out["row"]["name"], "steer");
+        assert_eq!(out["row"]["offset"], "0x58");
+        assert_eq!(
+            out["vtable_rva"],
+            x(VTABLE.as_ptr() as u64 - this_exe().1.base)
+        );
+        provenance(&out, &this_exe().1);
+        let timing = out["timing_s"].as_object().unwrap();
+        assert!(
+            timing.contains_key("search") && timing.contains_key("write"),
+            "{out}"
+        );
+        {
+            let patches = session.live.as_ref().unwrap().patches.borrow();
+            let (_, entry) = patches.last().unwrap();
+            assert_eq!(entry["writes"].as_array().unwrap().len(), 3, "{entry}");
+            assert_eq!(entry["instances"]["written"], 3, "{entry}");
+            assert_eq!(entry["instances"]["offset"], 0x58, "{entry}");
+            assert_eq!(entry["taints"], true, "{entry}");
+        }
+
+        // A second call: every instance holds new or another value. Refused, nothing written.
+        let again = run(&mut session, "mem_patch_instances", on("steer"));
+        assert_eq!(again["refused"], true, "{again}");
+        assert_eq!(again["counts"]["already"], 3, "{again}");
+        assert!(
+            again["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no instance written"),
+            "{again}"
+        );
+
+        let off = run(
+            &mut session,
+            "mem_unpatch_instances",
+            json!({"token": "tok", "name": "steer"}),
+        );
+        assert_eq!(off["ok"], true, "{off}");
+        assert_eq!(
+            off["counts"],
+            json!({"applied": 3, "restored": 3, "left": 0}),
+            "{off}"
+        );
+        assert_eq!(obj_fields(&mut session), start);
+        let twice = run(
+            &mut session,
+            "mem_unpatch_instances",
+            json!({"token": "tok", "name": "steer"}),
+        );
+        assert!(
+            twice["reason"]
+                .as_str()
+                .unwrap()
+                .contains("nothing to undo"),
+            "{twice}"
+        );
+
+        let journal = fs::read_to_string(fx.dir.join("data/state/journal.jsonl")).unwrap();
+        let steps: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("game_memory"))
+            .collect();
+        assert_eq!(steps.len(), 2, "one step per call that wrote: {journal}");
+        assert!(
+            steps[0].contains("mem_patch_instances steer: 3 instances of CQuenTest")
+                && steps[1].contains("mem_unpatch_instances steer: 3 instances"),
+            "{journal}"
+        );
+        for (args, why) in [
+            (on("bad"), "+0x4"),
+            (on("nope"), "no patch named"),
+            (
+                json!({"token": "tok", "name": "steer", "user_ok": true, "deadline_s": 0}),
+                "deadline_s",
+            ),
+        ] {
+            let out = run(&mut session, "mem_patch_instances", args.clone());
+            assert_eq!(out["refused"], true, "{args}: {out}");
+            assert!(
+                out["reason"].as_str().unwrap().contains(why),
+                "{args}: {out}"
+            );
+        }
+        fs::remove_file(fx.dir.join("kb/instance_patches.tsv")).unwrap(); // this test's own file
+        let gone = run(&mut session, "mem_patch_instances", on("steer"));
+        assert_eq!(
+            gone["needs"][0]["dependency"],
+            crate::doctor::KB_INSTANCES.name,
+            "{gone}"
+        );
+        assert_eq!(obj_fields(&mut session), start);
     }
 
     /// mem_regions lists the dummy game's image sections and private regions with their protection; mem_find and mem_scan
