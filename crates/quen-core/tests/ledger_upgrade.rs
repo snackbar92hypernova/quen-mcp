@@ -68,6 +68,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0013_captures_deleted.sql",
         "36d7ae7a8640f66a876eef23ce2d153a2028757f1377d13fc1d0453932123dce",
     ),
+    (
+        "0014_boot_samplers.sql",
+        "964c577bdee9bdf1b7f20c36fedb4ee812d4aa7bb5a59f0e24f9994a9f34a2eb",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -516,6 +520,17 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
         .unwrap();
         assert!(
             now.execute("UPDATE captures SET removed_to = 'gone' WHERE id = 1", [])
+                .is_err(),
+            "v{k}"
+        );
+        // 0014: the samplers a boot's windows ran with, a JSON array.
+        now.execute(
+            r#"UPDATE boots SET samplers = '["actor_trace 10 Hz r8 max20 ref player"]' WHERE id = 2"#,
+            [],
+        )
+        .unwrap();
+        assert!(
+            now.execute("UPDATE boots SET samplers = 'trace' WHERE id = 2", [])
                 .is_err(),
             "v{k}"
         );

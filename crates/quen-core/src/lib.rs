@@ -22,4 +22,5 @@ pub mod seeds; // names.tsv -> REA seed file
 pub mod settings; // dx12user.settings overrides (W3_SETTINGS / W3_SECTION_SETTINGS semantics)
 pub mod stats; // PresentMon command line, CSV stats and the A/B verdict
 pub mod sweep; // camera sweeps: data model, the reference interpolation the cam.path verb ports, frame schedules
+pub mod trace; // actor traces: samples, tracks, behaviour metrics and their A/B verdicts
 pub mod wcc; // REDkit's wcc_lite compilescripts: its log's script messages, import stubs, the settings it rewrites

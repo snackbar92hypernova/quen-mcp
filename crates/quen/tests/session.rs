@@ -1410,7 +1410,7 @@ fn a_launch_needs_the_native_bridge_and_quen_s_package_whole() {
     off_in(&fx, r"Mods\modQuenRpc");
     fs::write(fx.path("game").join(PARTS[4]), "another release").unwrap();
     broken(
-        "quen.ws is not the version quen expects (quen-w3 0.1.11, quen-w3 0.1.10, quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
+        "quen.ws is not the version quen expects (quen-w3 0.1.12, quen-w3 0.1.11, quen-w3 0.1.10, quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
     );
     off_in(&fx, PARTS[4]); // quen.ws
     broken(r"W3Quen.asi without Mods\modQuen, half the package");
@@ -2451,6 +2451,7 @@ fn game_and_measure_tools_need_a_live_session() {
         "hands_give",
         "world_get",
         "measure_presentmon",
+        "measure_trace",
         "measure_ab",
     ] {
         assert!(names.contains(&tool), "{names:?}");

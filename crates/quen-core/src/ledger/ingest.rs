@@ -244,6 +244,7 @@ pub const METHOD_FAMILIES: &[&str] = &[
     "static_re",
     "mem",
     "files",
+    "game_state",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -607,6 +608,21 @@ impl Ledger {
         self.changed(n, "boot", boot_id, "has already finished")
     }
 
+    /// Adds `sampler` to the boot's samplers (schema 0014): a sampler that ran during its measurement windows, each named
+    /// once. Refuses an unknown boot or one already finished.
+    pub fn record_sampler(&mut self, boot_id: i64, sampler: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE boots SET samplers = (
+               SELECT json_group_array(value) FROM (
+                 SELECT value FROM json_each(coalesce(boots.samplers, '[]'))
+                 UNION SELECT ?2
+                 ORDER BY value))
+             WHERE id = ?1 AND t_end IS NULL",
+            params![boot_id, sampler],
+        )?;
+        self.changed(n, "boot", boot_id, "has already finished")
+    }
+
     /// Records how a boot ended. Refuses an unknown boot or one already finished.
     pub fn finish_boot(&mut self, boot_id: i64, end: &BootEnd) -> Result<()> {
         let n = self.conn.execute(
@@ -707,7 +723,8 @@ impl Ledger {
     pub fn add_measurement(&mut self, m: &Measurement) -> Result<i64> {
         if !METHOD_FAMILIES.contains(&m.method_family.as_str()) {
             return Err(Error::Refused(format!(
-                "method_family {:?} is not one of {}: a shader decompile is static_re, game files are files \
+                "method_family {:?} is not one of {}: a shader decompile is static_re, game files are files, \
+                 what the game's scripts read in the running game (world_get, world_actors, traces) is game_state \
                  (quen_guide playbook §2)",
                 m.method_family,
                 METHOD_FAMILIES.join(", ")

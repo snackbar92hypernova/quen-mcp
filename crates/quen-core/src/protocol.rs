@@ -151,9 +151,17 @@ pub enum Verb {
     },
     /// Read the alive actors within `radius` of the player, nearest first, at most `max`: each one's position, heading,
     /// velocity, names and flags (the reply's data); changes nothing. `radius` above 0 to [`MAX_ACTORS_RADIUS`], `max`
-    /// 1 to [`MAX_ACTORS`].
+    /// 1 to [`MAX_ACTORS`]. From quen-w3 0.1.12: only those with `tag`, and with `class` the gameplay entities of that
+    /// class instead, actors or not; each with its id. Both names as [`crate::trace::plain_name`] checks them.
     #[serde(rename = "world.actors")]
-    WorldActors { radius: f32, max: u32 },
+    WorldActors {
+        radius: f32,
+        max: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+    },
 }
 
 /// What `photo.reset` puts back.
@@ -289,13 +297,20 @@ impl Verb {
                      to {MAX_ITEM_COUNT}"
                 )))
             }
-            Verb::WorldActors { radius, max }
-                if !(*radius > 0.0
-                    && *radius <= MAX_ACTORS_RADIUS
-                    && (1..=MAX_ACTORS).contains(max)) =>
+            Verb::WorldActors {
+                radius,
+                max,
+                tag,
+                class,
+            } if !(*radius > 0.0
+                && *radius <= MAX_ACTORS_RADIUS
+                && (1..=MAX_ACTORS).contains(max)
+                && [tag, class]
+                    .iter()
+                    .all(|n| n.as_deref().is_none_or(crate::trace::plain_name))) =>
             {
                 Err(Error::Invalid(format!(
-                    "world.actors: a radius above 0 to {MAX_ACTORS_RADIUS} and a max of 1 to {MAX_ACTORS}"
+                    "world.actors: a radius above 0 to {MAX_ACTORS_RADIUS}, a max of 1 to {MAX_ACTORS}, and a tag or                      class of 1 to 64 letters, digits and _"
                 )))
             }
             Verb::PhotoTime { minute } if !(0.0..1440.0).contains(minute) => Err(Error::Invalid(
@@ -504,6 +519,14 @@ mod tests {
             Verb::WorldActors {
                 radius: 30.0,
                 max: 20,
+                tag: None,
+                class: None,
+            },
+            Verb::WorldActors {
+                radius: 8.0,
+                max: 50,
+                tag: Some("q104_ciri".into()),
+                class: Some("CNewNPC".into()),
             },
         ]
     }
@@ -610,7 +633,23 @@ mod tests {
             (30.0, 0),
             (30.0, MAX_ACTORS + 1),
         ] {
-            invalid(Verb::WorldActors { radius, max });
+            invalid(Verb::WorldActors {
+                radius,
+                max,
+                tag: None,
+                class: None,
+            });
+        }
+        for name in ["", "a b", "x'y", &"n".repeat(65)] {
+            let name = Some(name.to_string());
+            for (tag, class) in [(name.clone(), None), (None, name)] {
+                invalid(Verb::WorldActors {
+                    radius: 8.0,
+                    max: 1,
+                    tag,
+                    class,
+                });
+            }
         }
         for line in [
             r#"{"id":1,"ttl_ms":1,"verb":"photo.mode"}"#,

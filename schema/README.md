@@ -144,6 +144,9 @@ One launch of the game. `id`; `game_id` → games; `t_start`, `t_end` (NULL whil
 - `busy_with` (JSON array): what the quiet-machine checks found running that skews the numbers, such as compilers or
   RE analysis; `[]` when every check found the machine quiet, NULL when none was recorded (every boot before schema 5,
   and every boot quen measured before its measure tools recorded their checks).
+- `samplers` (JSON array, sorted, each once): every sampler that ran during one of the boot's measurement windows, as
+  the windows' rows name it, e.g. `actor_trace 10 Hz r8 max20 ref player` (measure_trace, measure_ab with `trace`);
+  NULL when none ran (every boot before schema 14). The views don't show it.
 - `patches` (JSON array): every memory patch and data write of the boot, as its journal recorded them. An instance patch's entry holds `writes` (each field written: `address`, `old`, `new`) and `instances` (the row's `name` and `class`, `vtable`, `offset`, and its counts).
 
 The end: `outcome` (`ok`, `failed`, or `recovered`: closed by a journal replay), `failure` (why, for failed),
