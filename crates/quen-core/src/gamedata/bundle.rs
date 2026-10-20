@@ -139,7 +139,8 @@ pub fn read(
             unzip.map_err(|e| format!("zlib: {e}"))?;
         }
         4 | 5 => {
-            let mut src = Vec::with_capacity(e.zsize as usize);
+            // Grown as read too: a damaged zsize (up to 4 GB) must not reserve that much up front.
+            let mut src = Vec::new();
             raw.read_to_end(&mut src).map_err(io)?;
             out = lz4_block(&src, want)?;
         }

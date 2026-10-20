@@ -293,8 +293,9 @@ pub fn read(d: &[u8], opts: &Opts) -> Result<Value, String> {
         tree.push(Value::Object(node));
     }
     crc.insert("exports_bad".into(), json!(bad_crc));
+    // Up to the first entry outside the file: a damaged count (up to 4 billion) would otherwise loop that long.
     let buffers: Vec<Value> = (0..t[5].count)
-        .filter_map(|k| {
+        .map_while(|k| {
             let at = t[5].offset + 24 * k;
             let f: Vec<u32> = (0..6).map(|j| u32_at(d, at + 4 * j)).collect::<Option<_>>()?;
             Some(json!({"flags": f[0], "index": f[1], "offset": f[2], "bytes": f[3], "memory_bytes": f[4], "crc32": f[5]}))
@@ -873,6 +874,22 @@ pub(crate) mod tests {
         );
         assert!(v["tree_unread"].as_str().unwrap().contains("141"));
         assert!(names(&d[..d.len() - 3]).is_err());
+    }
+
+    /// Any mod's file is read, and a release quen aborts on a panic, a live session's game with it: every prefix of the
+    /// sample, and the sample with any one byte flipped, reads or fails, never panics, and fast (a flipped buffer count
+    /// once looped 276 s).
+    #[test]
+    fn damaged_files_never_panic() {
+        let (s, o) = (sample(), opts());
+        for len in 0..s.len() {
+            let _ = (read(&s[..len], &o), names(&s[..len]));
+        }
+        for i in 0..s.len() {
+            let mut d = s.clone();
+            d[i] ^= 0xFF;
+            let _ = (read(&d, &o), names(&d));
+        }
     }
 
     /// A names-level read needs only the header and the first three tables, and finds the names and imports.
