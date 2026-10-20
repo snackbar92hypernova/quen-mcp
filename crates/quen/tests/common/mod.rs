@@ -353,6 +353,7 @@ impl Quen {
             .env("QUEN_TEST_IN_JOB", "1")
             .env("QUEN_TEST_PINS", test_pins())
             .env("QUEN_TEST_RECYCLE_TO", fx.path("recycled"))
+            .env("QUEN_TEST_WCC_IMAGE", "quen-test-no-such-wcc.exe")
             .env("QUEN_TEST_INPUT", fx.path("harness/fake_input.py"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

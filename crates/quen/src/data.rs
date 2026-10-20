@@ -997,12 +997,15 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
     if journal.exists() {
         return Err(format!("{} is left: session_recover first", journal.display()).into());
     }
+    // Any wcc_lite on the PC, not only REDkit's: every run writes the same documents folder. `QUEN_TEST_WCC_IMAGE`
+    // (tests only) names another image, so the user's own REDkit runs don't fail the tests (finding 78).
+    let wcc = std::env::var("QUEN_TEST_WCC_IMAGE").unwrap_or_else(|_| "wcc_lite.exe".into());
     for (image, why) in [
         (
             config.game_exe.as_str(),
             "the game runs: it writes the documents folder too",
         ),
-        ("wcc_lite.exe", "a wcc_lite runs already: one at a time"),
+        (wcc.as_str(), "a wcc_lite runs already: one at a time"),
     ] {
         if !session::outside(image, None)?.is_empty() {
             return Err(format!("{image}: {why}").into());
