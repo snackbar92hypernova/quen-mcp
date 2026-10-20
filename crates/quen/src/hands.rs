@@ -79,7 +79,7 @@ pub(crate) fn tools() -> Vec<Value> {
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
                 moves the focus (game_keys, game_console, game_load, game_pause, game_settime, game_weather, \
                 game_teleport, game_items, game_save, game_camera with a pose, game_cvar set or restore, mem_patch, \
-                mem_unpatch, \
+                mem_unpatch, mem_patch_instances, mem_unpatch_instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
                 are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
                 Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
@@ -204,7 +204,9 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         let mine = patches.get(h.since.get()..).unwrap_or_default();
         // A test session's writes stay applied across its hand-overs: all of them count.
         let writes = if cx.live.play { mine } else { &patches[..] };
-        let applied: Vec<Value> = applied(writes).iter().map(|a| a[3].clone()).collect();
+        let mut applied: Vec<Value> = applied(writes).iter().map(|a| a[3].clone()).collect();
+        // An instance patch's fields are one entry: named once.
+        applied.dedup();
         (applied, kept(mine))
     };
     let mut fields = Map::new();
@@ -212,7 +214,8 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         fields.insert("applied".into(), json!(applied));
         if cx.live.play && !keep {
             let why = "a memory patch or cvar write of this hand-over is still applied (applied): undo each \
-                       (mem_unpatch, game_cvar restore), or pass keep_writes: true with the user's OK. Nothing done";
+                       (mem_unpatch, mem_unpatch_instances, game_cvar restore), or pass keep_writes: true with the \
+                       user's OK. Nothing done";
             return Err(Done::RefusedWith(why.into(), fields));
         }
     }
@@ -290,33 +293,38 @@ fn in_front(cx: &Ctx, call: &Call) -> &'static str {
 
 /// The connection that launched a play session closed. While the agent has the controls, this hand-over's memory
 /// patches and cvar writes still applied are undone, newest first: each journaled like any write, and only while the
-/// bytes there are still the ones it wrote, as mem_unpatch checks (another writer's are left). A write kept by agreement
-/// (hands_give's keep_writes) is an earlier hand-over's and stays. Then the user has the controls. What it undid, what it
-/// left and why, and the hand-over's teleports, settime and weather (kept), for the log.
+/// bytes there are still the ones it wrote, as mem_unpatch checks (another writer's are left); an instance patch's
+/// fields as mem_unpatch_instances undoes them, one step per patch. A write kept by agreement (hands_give's keep_writes)
+/// is an earlier hand-over's and stays. Then the user has the controls. What it undid, what it left and why, and the
+/// hand-over's teleports, settime and weather (kept), for the log.
 pub(crate) fn dropped(session: &Session) -> Value {
     let Some(live) = &session.live else {
         return Value::Null;
     };
     let (mut undone, mut left, mut keep) = (Vec::new(), Vec::new(), Vec::new());
     if session.shared.hands() == Some(Hands::Agent) {
-        let todo: Vec<(u64, Vec<u8>, Vec<u8>, String)> = {
+        let todo: Vec<(Write, String, Value)> = {
             let patches = live.patches.borrow();
             let mine = patches
                 .get(live.handovers.since.get()..)
                 .unwrap_or_default();
             keep = kept(mine);
-            let applied = applied(mine)
-                .into_iter()
-                .filter_map(|[address, old, new, what]| {
-                    let what = what.as_str().unwrap_or_default();
-                    let what = what.rsplit_once(" at ").map_or(what, |(w, _)| w);
-                    Some((
-                        address.as_u64()?,
-                        hex_bytes(old)?,
-                        hex_bytes(new)?,
-                        what.into(),
-                    ))
-                });
+            let applied =
+                applied(mine)
+                    .into_iter()
+                    .filter_map(|[address, old, new, what, meta]| {
+                        let what = what.as_str().unwrap_or_default();
+                        let what = match meta.is_null() {
+                            true => what.rsplit_once(" at ").map_or(what, |(w, _)| w),
+                            false => what,
+                        };
+                        let undo = Write {
+                            address: address.as_u64()?,
+                            old: hex_bytes(new)?,
+                            new: hex_bytes(old)?,
+                        };
+                        Some((undo, what.into(), meta.clone()))
+                    });
             applied.collect()
         };
         let game = session.config().and_then(|config| {
@@ -327,24 +335,40 @@ pub(crate) fn dropped(session: &Session) -> Value {
             };
             cx.game().map(|game| (cx, game))
         });
-        for (address, old, new, what) in todo {
-            let undo = Write {
-                address,
-                old: new,
-                new: old,
-            };
-            let made = match &game {
-                Ok((cx, game)) => {
-                    cx.write(game, &format!("undo of {what}"), &undo, &mut Map::new())
+        // An instance patch's fields come one after another: undone together.
+        for run in todo.chunk_by(|a, b| !a.2.is_null() && (&a.1, &a.2) == (&b.1, &b.2)) {
+            let (what, meta) = (&run[0].1, &run[0].2);
+            let step = format!("undo of {what}");
+            let made = match (&game, meta.is_null()) {
+                (Ok((cx, game)), true) => cx.write(game, &step, &run[0].0, &mut Map::new()),
+                (Ok((cx, game)), false) => {
+                    let writes: Vec<Write> = run.iter().map(|(w, ..)| w.clone()).collect();
+                    let results = cx.undo_instances(game, &step, meta, &writes, &mut Map::new());
+                    results.and_then(|results| {
+                        let n = results.iter().filter(|r| r.is_ok()).count();
+                        let Some(why) = results.iter().find_map(|r| r.clone().err()) else {
+                            return Ok(());
+                        };
+                        let note = format!(
+                            "{} of {} fields left ({why})",
+                            results.len() - n,
+                            results.len()
+                        );
+                        if n == 0 {
+                            return Err(Done::Refused(note));
+                        }
+                        left.push(format!("{what}: {note}"));
+                        Ok(())
+                    })
                 }
-                Err(why) => Err(Done::Refused(why.clone())),
+                (Err(why), _) => Err(Done::Refused(why.clone())),
             };
             match made {
-                Ok(()) => undone.push(what),
+                Ok(()) => undone.push(what.clone()),
                 Err(Done::Failed(why, _) | Done::Refused(why)) => {
                     left.push(format!("{what}: {why}"))
                 }
-                Err(_) => left.push(what),
+                Err(_) => left.push(what.clone()),
             }
         }
     }
@@ -352,25 +376,31 @@ pub(crate) fn dropped(session: &Session) -> Value {
     json!({"undone": undone, "left": left, "kept": keep})
 }
 
-/// The memory writes among `patches` (mem_patch and mem_unpatch, game_cvar's, measure_ab's cvars) still applied, newest
-/// first: per address, the last write's new bytes differ from what the first found there. Each as the address, the
-/// first write's old bytes, the last one's new bytes and its `what`.
-fn applied(patches: &[(SystemTime, Value)]) -> Vec<[&Value; 4]> {
+/// The memory writes among `patches` (mem_patch and mem_unpatch, game_cvar's, measure_ab's cvars, and each field of an
+/// instance patch's `writes`) still applied, newest first: per address, the last write's new bytes differ from what the
+/// first found there. Each as the address, the first write's old bytes, the last one's new bytes, its `what` and its
+/// entry's `instances` (null but for an instance patch's).
+/// ponytail: quadratic in the writes; a few thousand instance fields take milliseconds.
+pub(crate) fn applied(patches: &[(SystemTime, Value)]) -> Vec<[&Value; 5]> {
     let writes = || {
-        let all = patches.iter().map(|(_, p)| (&p["write"], &p["what"]));
-        all.filter(|(w, _)| !w.is_null())
+        patches.iter().flat_map(|(_, p)| {
+            let one = std::iter::once(&p["write"]).filter(|w| !w.is_null());
+            let many = p["writes"].as_array().into_iter().flatten();
+            one.chain(many)
+                .map(move |w| (w, &p["what"], &p["instances"]))
+        })
     };
     let mut seen = Vec::new();
     let mut out = Vec::new();
-    for (w, what) in writes().rev() {
+    for (w, what, meta) in writes().rev() {
         if seen.contains(&&w["address"]) {
             continue;
         }
         seen.push(&w["address"]);
-        let first = writes().find(|(f, _)| f["address"] == w["address"]);
-        let old = &first.unwrap_or((w, what)).0["old"];
+        let first = writes().find(|(f, ..)| f["address"] == w["address"]);
+        let old = &first.unwrap_or((w, what, meta)).0["old"];
         if *old != w["new"] {
-            out.push([&w["address"], old, &w["new"], what]);
+            out.push([&w["address"], old, &w["new"], what, meta]);
         }
     }
     out
@@ -380,7 +410,7 @@ fn applied(patches: &[(SystemTime, Value)]) -> Vec<[&Value; 4]> {
 fn kept(patches: &[(SystemTime, Value)]) -> Vec<Value> {
     patches
         .iter()
-        .filter(|(_, p)| p["write"].is_null() && p["taints"] == true)
+        .filter(|(_, p)| p["write"].is_null() && p["writes"].is_null() && p["taints"] == true)
         .map(|(_, p)| p["what"].clone())
         .collect()
 }
@@ -408,6 +438,8 @@ mod tests {
             "measure_ab",
             "mem_patch",
             "mem_unpatch",
+            "mem_patch_instances",
+            "mem_unpatch_instances",
             "focus",
         ] {
             assert!(!user_may(tool, &none), "{tool}");
@@ -679,6 +711,36 @@ mod tests {
         // With the user's hands, a drop changes nothing.
         let again = dropped(&session);
         assert_eq!(again, json!({"undone": [], "left": [], "kept": []}));
+    }
+
+    /// The connection that launched a play session closes while the agent has the controls: this hand-over's instance
+    /// patch, listed once by hands_give while applied, is undone as one journaled step, every field it wrote back.
+    #[test]
+    fn a_dropped_play_session_undoes_the_hand_overs_instance_patches() {
+        use crate::mem::tests::{instances_tsv, obj_fields, run as mem};
+        let fx = Fake::new("play-drop-instances");
+        std::fs::write(fx.dir.join("kb/instance_patches.tsv"), instances_tsv()).unwrap();
+        let mut session = handed_over(&fx, true);
+        let on = json!({"token": "tok", "name": "steer", "user_ok": true});
+        let out = mem(&mut session, "mem_patch_instances", on);
+        assert_eq!(out["counts"]["written"], 3, "{out}");
+        let what = json!(["mem_patch_instances steer: 3 instances of CQuenTest"]);
+        let give = run(&session, "hands_give", json!({"token": "tok"}));
+        assert_eq!(
+            (&give["refused"], &give["applied"]),
+            (&json!(true), &what),
+            "{give}"
+        );
+        let out = dropped(&session);
+        assert_eq!(out, json!({"undone": what, "left": [], "kept": []}));
+        let v = |f: f32| json!(f);
+        assert_eq!(obj_fields(&mut session), [v(0.2), v(0.2), v(0.5), v(0.2)]);
+        let journal = std::fs::read_to_string(fx.dir.join("data/state/journal.jsonl")).unwrap();
+        assert!(
+            journal.contains("undo of mem_patch_instances steer: 3 instances of CQuenTest"),
+            "{journal}"
+        );
+        assert_eq!(fx.shared.hands(), Some(Hands::User));
     }
 
     /// hands_take: refused without user_ok and while the agent has the controls; then it sorts the user's saves since

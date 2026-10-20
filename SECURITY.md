@@ -36,11 +36,12 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod testing. This pa
 
 **The game's memory**
 - quen reads the running game's memory (the `mem_*` tools, `game_cvar`).
-- It writes there in two ways only:
+- It writes there in three ways only:
   - a patch defined in the RE knowledge base (`patches.tsv`), applied only if the game build and the bytes in memory are the ones the patch expects;
+  - a field in every live instance of a class, defined in the knowledge base (`instance_patches.tsv`): each instance written only if the game build is the row's, the instance still starts with the class's vtable pointer and the field holds the value the row expects, at most 1000 instances, and your client asks you on every call;
   - a console variable (cvar).
 
-  Both are journaled, recorded on the boot's ledger row, and gone when the game closes. Saves the game writes afterwards are marked "tainted".
+  All three are journaled, recorded on the boot's ledger row, and gone when the game closes. Saves the game writes afterwards are marked "tainted".
 - quen runs code in the game: `measure_ab` can call a loaded ASI mod's exported `*_SetMode` function, on a new thread inside the game.
 - It touches only the game process it started, never another copy.
 
@@ -73,7 +74,7 @@ Only your account can write these. A program running as you could change them, b
 |---|---|
 | The config file (`%USERPROFILE%\.quen\config.toml`, or the file `QUEN_CONFIG` names) | the game and data folders, and the programs quen starts (PresentMon, Nsight, REDkit's wcc_lite) |
 | The journal (`<data root>\state\journal.jsonl`) | what to move back, restore and send to the Recycle Bin after a crash. The replay checks hashes and file ids before it undoes a step. |
-| The RE knowledge base (`kb` in the config): `patches.tsv`, `cvar_layout.tsv` | which memory patches are allowed, and where a cvar's value lives in memory |
+| The RE knowledge base (`kb` in the config): `patches.tsv`, `instance_patches.tsv`, `cvar_layout.tsv` | which memory patches are allowed, and where a cvar's value lives in memory |
 | A PresentMon quen finds itself | without `presentmon` in the config, quen runs the newest `PresentMon-<version>-x64.exe` in its installer's folder under Program Files, else the first `PresentMon.exe` on your PATH. Set the config's absolute path instead. The measure tools return the path they ran, as `presentmon`. |
 
 ## What your agent shouldn't trust

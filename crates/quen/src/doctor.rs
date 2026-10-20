@@ -755,6 +755,14 @@ pub(crate) const KB_PATCHES: Dep = Dep {
     check: |cx| kb_table(cx, "patches.tsv"),
 };
 
+pub(crate) const KB_INSTANCES: Dep = Dep {
+    name: "the RE knowledge base's instance patch table (instance_patches.tsv in kb)",
+    required: false,
+    enables: "mem_patch_instances: a field written in every live instance of a class, per game build",
+    how_to_get: "the re folder of witcher3-mods (not published yet), which quen's config names as kb",
+    check: |cx| kb_table(cx, "instance_patches.tsv"),
+};
+
 pub(crate) const KB_BUILD: Dep = Dep {
     name: "the RE knowledge base's build (the build line of names.tsv and hooks.tsv in kb)",
     required: false,
@@ -986,7 +994,7 @@ fn kb_table(cx: &Cx, file: &str) -> State {
 }
 
 /// Every dependency, required ones first, as quen_doctor lists them.
-const DEPS: [&Dep; 21] = [
+const DEPS: [&Dep; 22] = [
     &GAME,
     &NATIVE_BRIDGE,
     &PACKAGE,
@@ -1006,6 +1014,7 @@ const DEPS: [&Dep; 21] = [
     &REDKIT,
     &KB_CVARS,
     &KB_PATCHES,
+    &KB_INSTANCES,
     &KB_BUILD,
     &KB_INDEX,
 ];

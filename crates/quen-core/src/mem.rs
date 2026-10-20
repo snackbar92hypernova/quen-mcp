@@ -8,7 +8,9 @@
 //! Nothing here writes. A patch [`plan`] checks the KB definition (`patches.tsv`) and the live bytes, and returns the one
 //! [`Write`] allowed, or a [`Refusal`]. The platform layer journals it as an
 //! [`Action::GameMemory`](crate::journal::Action::GameMemory) record (its time taints later saves), then makes it with a
-//! handle open only for the write.
+//! handle open only for the write. An instance patch (`instance_patches.tsv`) is planned by [`plan_instances`], one
+//! write per live instance of a class, and made through the platform's write by [`write_instances`], which checks each
+//! instance again right before its write.
 
 use std::fmt;
 use std::io;
@@ -1141,31 +1143,44 @@ pub fn from_patches_tsv(text: &str) -> Result<Vec<Patch>, TsvError> {
     let mut patches: Vec<Patch> = Vec::new();
     for (line, [name, rva_cell, old, new, build, checked]) in rows {
         let err = |msg| err(line, msg);
-        if name.is_empty() || name.contains(char::is_whitespace) {
-            return Err(err(format!("name {name:?} is blank or has whitespace")));
-        }
-        if build.is_empty() {
-            return Err(err("the build is blank".into()));
-        }
-        if patches.iter().any(|p| p.name == name && p.build == build) {
-            return Err(err(format!("{name} is defined twice for build {build}")));
-        }
+        let seen = patches.iter().any(|p| p.name == name && p.build == build);
+        let boundaries_checked = patch_cells(name, build, seen, checked).map_err(err)?;
         let bytes =
             |cell: &str, which: &str| parse_hex(cell).map_err(|msg| err(format!("{which}: {msg}")));
-        let unchecked = matches!(
-            checked.to_ascii_lowercase().as_str(),
-            "" | "-" | "0" | "no" | "false"
-        );
         patches.push(Patch {
             name: name.into(),
             rva: rva(rva_cell).map_err(err)?,
             old: bytes(old, "old")?,
             new: bytes(new, "new")?,
             build: build.into(),
-            boundaries_checked: (!unchecked).then(|| checked.into()),
+            boundaries_checked,
         });
     }
     Ok(patches)
+}
+
+/// Checks a KB patch row's name (not blank, no whitespace) and build (not blank), and that no row before it has both
+/// (`seen`); reads its boundaries-checked cell: `None` when blank, `-`, `0`, `no` or `false`.
+fn patch_cells(
+    name: &str,
+    build: &str,
+    seen: bool,
+    checked: &str,
+) -> Result<Option<String>, String> {
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return Err(format!("name {name:?} is blank or has whitespace"));
+    }
+    if build.is_empty() {
+        return Err("the build is blank".into());
+    }
+    if seen {
+        return Err(format!("{name} is defined twice for build {build}"));
+    }
+    let unchecked = matches!(
+        checked.to_ascii_lowercase().as_str(),
+        "" | "-" | "0" | "no" | "false"
+    );
+    Ok((!unchecked).then(|| checked.into()))
 }
 
 /// `mem.patch` or `mem.unpatch`.
@@ -1189,8 +1204,11 @@ pub struct Write {
 /// Why a plan was refused. Nothing was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// No definition by this name.
-    Unknown(String),
+    /// No definition by this name in this table.
+    Unknown {
+        name: String,
+        table: &'static str,
+    },
     /// Defined, but not for the running build.
     Build {
         running: String,
@@ -1222,19 +1240,33 @@ pub enum Refusal {
         live: Vec<u8>,
         expected: Vec<u8>,
     },
+    /// An instance field that overlaps the vtable pointer, crosses an 8-byte boundary or lies past [`MAX_STRIDE`].
+    Field {
+        offset: u64,
+        len: usize,
+    },
+    /// The search found over [`MAX_INSTANCES`] instances.
+    TooMany(usize),
+    /// The search stopped (`deadline`, `cancelled`) after this many bytes.
+    Stopped {
+        why: &'static str,
+        bytes: u64,
+    },
+    /// The regions couldn't be listed.
+    Regions(String),
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unknown(name) => write!(f, "no patch named {name:?} in patches.tsv"),
+            Self::Unknown { name, table } => write!(f, "no patch named {name:?} in {table}"),
             Self::Build { running, defined } => write!(
                 f,
                 "defined for build {}, not the running {running}",
                 defined.join(", ")
             ),
             Self::Unchecked => f.write_str(
-                "boundaries-checked is not set: check old and new with a disassembler first",
+                "boundaries-checked is not set: check the row with a disassembler first",
             ),
             Self::Length { old, new } if old != new => {
                 write!(
@@ -1261,6 +1293,21 @@ impl fmt::Display for Refusal {
                 to_hex(live),
                 to_hex(expected)
             ),
+            Self::Field { offset, len } => write!(
+                f,
+                "{len} bytes at +{offset:#x}: an instance field starts at +0x8 or later, below \
+                 +{MAX_STRIDE:#x}, and stays inside one aligned qword"
+            ),
+            Self::TooMany(n) => write!(
+                f,
+                "{n} instances found, over the {MAX_INSTANCES} an instance patch writes: nothing written"
+            ),
+            Self::Stopped { why, bytes } => write!(
+                f,
+                "the search stopped ({why}) after {} MiB: nothing written",
+                bytes >> 20
+            ),
+            Self::Regions(why) => write!(f, "the regions: {why}"),
         }
     }
 }
@@ -1281,7 +1328,10 @@ pub fn plan(
     let named: Vec<&Patch> = patches.iter().filter(|p| p.name == name).collect();
     let Some(p) = named.iter().find(|p| p.build == build) else {
         return Err(match named[..] {
-            [] => Refusal::Unknown(name.into()),
+            [] => Refusal::Unknown {
+                name: name.into(),
+                table: "patches.tsv",
+            },
             _ => Refusal::Build {
                 running: build.into(),
                 defined: named.iter().map(|p| p.build.clone()).collect(),
@@ -1331,6 +1381,277 @@ pub fn plan(
             expected,
         })
     }
+}
+
+/// The most live instances one instance patch writes: a search that finds more refuses, nothing written.
+pub const MAX_INSTANCES: usize = 1000;
+
+/// Windows' `PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY`: an instance is
+/// written only in a region whose protection has one of them.
+pub const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80;
+
+const INSTANCES_HEADER: [&str; 9] = [
+    "name",
+    "class",
+    "vtable",
+    "build",
+    "offset",
+    "type",
+    "old",
+    "new",
+    "boundaries-checked",
+];
+
+/// One `instance_patches.tsv` row: a field to write in every live instance of a class, from the KB. The instance rules
+/// are checked by [`plan_instances`], so a bad row refuses only its own patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstancePatch {
+    pub name: String,
+    /// The class, as the KB names it.
+    pub class: String,
+    /// Its vtable's RVA in the build the row is for: an instance's first qword is the image base plus it.
+    pub vtable: u32,
+    pub build: String,
+    /// The field: its offset from the instance's start, and its type, whose bytes `old` and `new` are.
+    pub offset: u64,
+    pub ty: Type,
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+    /// Who or when checked, with a disassembler, that the class has this field at this offset with this type. `None`
+    /// as patches.tsv's.
+    pub boundaries_checked: Option<String>,
+}
+
+impl InstancePatch {
+    /// The row as results give it: its RVA and offset as 0x hex, old and new as values of its type.
+    pub fn json(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "class": self.class,
+            "vtable_rva": format!("{:#x}", self.vtable),
+            "build": self.build,
+            "offset": format!("{:#x}", self.offset),
+            "type": format!("{:?}", self.ty).to_lowercase(),
+            "old": self.ty.decode(&self.old),
+            "new": self.ty.decode(&self.new),
+            "boundaries_checked": self.boundaries_checked,
+        })
+    }
+}
+
+/// The definitions of a KB `instance_patches.tsv`: a header row of `name class vtable build offset type old new
+/// boundaries-checked`, then one row per patch and build. `vtable` is an RVA (0x hex), `offset` a number or 0x hex,
+/// `type` one of u8 u16 u32 u64 i32 i64 f32 f64 or bytes, and `old` and `new` values of it: a number, a float, or (bytes)
+/// hex bytes, whose count is the width.
+pub fn from_instances_tsv(text: &str) -> Result<Vec<InstancePatch>, TsvError> {
+    let err = |line, msg| TsvError {
+        file: "instance_patches.tsv",
+        line,
+        msg,
+    };
+    let rows = tsv_rows(text, &INSTANCES_HEADER).map_err(|(line, msg)| err(line, msg))?;
+    let mut defs: Vec<InstancePatch> = Vec::new();
+    for (line, [name, class, vtable, build, offset, ty, old, new, checked]) in rows {
+        let err = |msg| err(line, msg);
+        let seen = defs.iter().any(|d| d.name == name && d.build == build);
+        let boundaries_checked = patch_cells(name, build, seen, checked).map_err(err)?;
+        if class.is_empty() || class.contains(char::is_whitespace) {
+            return Err(err(format!("class {class:?} is blank or has whitespace")));
+        }
+        let offset = number(offset)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| err(format!("offset {offset:?} is not a number or 0x hex")))?;
+        let len = (ty == "bytes").then(|| parse_hex(old).map_or(0, |b| b.len()));
+        let ty = match ty {
+            "ptr" => Err("type ptr: write a pointer field as u64".to_string()),
+            _ => Type::named(ty, len),
+        }
+        .map_err(err)?;
+        let value =
+            |cell: &str, which: &str| ty.encode(cell).map_err(|e| err(format!("{which}: {e}")));
+        defs.push(InstancePatch {
+            name: name.into(),
+            class: class.into(),
+            vtable: rva(vtable).map_err(err)?,
+            build: build.into(),
+            offset,
+            ty,
+            old: value(old, "old")?,
+            new: value(new, "new")?,
+            boundaries_checked,
+        });
+    }
+    Ok(defs)
+}
+
+/// The live instances of a class a search found, and the writes planned in them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Instances {
+    /// The vtable pointer searched for: the image base plus the row's RVA.
+    pub vtable: u64,
+    /// One per instance whose field held the row's old bytes, in address order: the field's address, old, new.
+    pub writes: Vec<Write>,
+    /// The instances whose field held the row's new bytes.
+    pub already: Vec<u64>,
+    /// The other qwords that held the vtable pointer, and why each isn't written.
+    pub left: Vec<(u64, String)>,
+    /// What the search covered: bytes, the pages it couldn't read, the regions it left out ([`scan`]'s).
+    pub bytes: u64,
+    pub skipped: Vec<Skipped>,
+    pub left_out: LeftOut,
+}
+
+/// Plans the instance patch `name` in a process running `build`, its image at `image_base`: checks the row's rules,
+/// then finds every 8-byte-aligned qword holding the class's vtable pointer in the image and private regions
+/// ([`find`]'s scope, [`UNCACHED`] regions left out), page after page with `tick` as [`scan`] takes it, and reads the
+/// field of each. Refused, nothing written: a rule broken, the search stopped, or over [`MAX_INSTANCES`] found.
+pub fn plan_instances(
+    defs: &[InstancePatch],
+    name: &str,
+    build: &str,
+    image_base: u64,
+    mem: &dyn Memory,
+    tick: &mut dyn FnMut(u64, u64) -> ControlFlow<&'static str>,
+) -> Result<(InstancePatch, Instances), Refusal> {
+    let named: Vec<&InstancePatch> = defs.iter().filter(|d| d.name == name).collect();
+    let Some(&d) = named.iter().find(|d| d.build == build) else {
+        return Err(match named[..] {
+            [] => Refusal::Unknown {
+                name: name.into(),
+                table: "instance_patches.tsv",
+            },
+            _ => Refusal::Build {
+                running: build.into(),
+                defined: named.iter().map(|d| d.build.clone()).collect(),
+            },
+        });
+    };
+    if d.boundaries_checked.is_none() {
+        return Err(Refusal::Unchecked);
+    }
+    let len = d.old.len();
+    if d.new.len() != len || !(1..=MAX_PATCH).contains(&len) {
+        let new = d.new.len();
+        return Err(Refusal::Length { old: len, new });
+    }
+    if d.old == d.new {
+        return Err(Refusal::NoChange);
+    }
+    // Instances are 8-byte aligned (their first qword is the vtable pointer), so the offset says where the field lies.
+    let offset = d.offset;
+    if !(8..MAX_STRIDE).contains(&offset) || offset % 8 + len as u64 > 8 {
+        return Err(Refusal::Field { offset, len });
+    }
+    let Some(vtable) = image_base.checked_add(d.vtable.into()) else {
+        let why = "the image base plus the RVA overflows".into();
+        return Err(Refusal::Unreadable {
+            address: image_base,
+            why,
+        });
+    };
+    let pattern = Pattern::qwords(&[vtable]);
+    let scope = Scope::from(Which::Kinds(vec![Kind::Image, Kind::Private]));
+    let listed = |e: io::Error| Refusal::Regions(e.to_string());
+    let mut out = Instances {
+        vtable,
+        ..Instances::default()
+    };
+    let (mut hits, mut from) = (Vec::new(), 0);
+    loop {
+        let page = scan(mem, &pattern, &scope, from, MAX_HITS, tick).map_err(listed)?;
+        out.bytes += page.bytes;
+        if let Some(why) = page.stopped {
+            let bytes = out.bytes;
+            return Err(Refusal::Stopped { why, bytes });
+        }
+        out.skipped.extend(page.skipped);
+        out.left_out = page.left_out;
+        hits.extend(page.hits);
+        if hits.len() > MAX_INSTANCES {
+            return Err(Refusal::TooMany(hits.len()));
+        }
+        match page.next {
+            Some(next) => from = next,
+            None => break,
+        }
+    }
+    let regions = mem.regions().map_err(listed)?;
+    for at in hits {
+        let field = at.saturating_add(offset);
+        let region = regions
+            .iter()
+            .find(|r| r.base <= at && at < r.base + r.size);
+        let why = match region {
+            None => Some("not in a region listed after the search".to_string()),
+            Some(r) if r.protect & WRITABLE == 0 => Some(format!(
+                "in a region of protect {:#x}: not writable",
+                r.protect
+            )),
+            Some(r) if field.saturating_add(len as u64) > r.base + r.size => {
+                Some("the field lies past the end of its region".into())
+            }
+            _ => None,
+        };
+        if let Some(why) = why {
+            out.left.push((at, why));
+            continue;
+        }
+        let mut live = vec![0; len];
+        match mem.read(field, &mut live) {
+            Err(e) => out.left.push((at, format!("can't read the field: {e}"))),
+            Ok(()) if live == d.old => out.writes.push(Write {
+                address: field,
+                old: d.old.clone(),
+                new: d.new.clone(),
+            }),
+            Ok(()) if live == d.new => out.already.push(at),
+            Ok(()) => {
+                let held = json!(d.ty.decode(&live));
+                out.left
+                    .push((at, format!("the field holds {held}: neither old nor new")));
+            }
+        }
+    }
+    Ok((d.clone(), out))
+}
+
+/// Makes each of `writes` with `write`: a field `offset` bytes into an instance whose first qword was `vtable`, written
+/// only while that qword is still `vtable` and the field still holds the write's old bytes, both read again right
+/// before it. An instance freed and reused for another class has another first qword, so it is left. Per write, in
+/// order: made, or why it was left.
+/// ponytail: microseconds pass between the reads and the write, in which the game may free the instance; suspend the
+/// game's threads around each write if that is ever seen.
+pub fn write_instances(
+    mem: &dyn Memory,
+    vtable: u64,
+    offset: u64,
+    writes: &[Write],
+    write: &mut dyn FnMut(&Write) -> Result<(), String>,
+) -> Vec<Result<(), String>> {
+    let mut checked = |w: &Write| -> Result<(), String> {
+        let at = w.address.saturating_sub(offset);
+        let mut first = [0; 8];
+        mem.read(at, &mut first)
+            .map_err(|e| format!("can't read the instance now: {e}"))?;
+        let now = u64::from_le_bytes(first);
+        if now != vtable {
+            return Err(format!(
+                "its first qword is {now:#x} now, not the vtable: freed, or another object"
+            ));
+        }
+        let mut live = vec![0; w.old.len()];
+        mem.read(w.address, &mut live)
+            .map_err(|e| format!("can't read the field now: {e}"))?;
+        if live != w.old {
+            return Err(format!(
+                "the field holds {} now, not {}: the game wrote it",
+                to_hex(&live),
+                to_hex(&w.old)
+            ));
+        }
+        write(w)
+    };
+    writes.iter().map(&mut checked).collect()
 }
 
 /// Hex bytes, spaced or not (`41 0f b6`, `410fb6`): each whitespace-separated token is whole bytes.
@@ -1407,6 +1728,17 @@ mod tests {
             };
             self.regions.push((region, bytes));
             self
+        }
+
+        /// Writes `bytes` at `address`, inside one region: what a test's game does, or a write a test made.
+        fn poke(&mut self, address: u64, bytes: &[u8]) {
+            let (r, b) = self
+                .regions
+                .iter_mut()
+                .find(|(r, _)| r.base <= address && address < r.base + r.size)
+                .unwrap();
+            let at = (address - r.base) as usize;
+            b[at..at + bytes.len()].copy_from_slice(bytes);
         }
     }
 
@@ -2633,7 +2965,10 @@ mod tests {
         );
         assert_eq!(
             plan(&defs, "mask_z", Op::Patch, "build-1", IMAGE, &original),
-            Err(Refusal::Unknown("mask_z".into()))
+            Err(Refusal::Unknown {
+                name: "mask_z".into(),
+                table: "patches.tsv"
+            })
         );
     }
 
@@ -2693,5 +3028,310 @@ mod tests {
             &mem,
         );
         assert!(matches!(near_top, Err(Refusal::Unreadable { .. })));
+    }
+
+    const INSTANCES: &str =
+        "name\tclass\tvtable\tbuild\toffset\ttype\told\tnew\tboundaries-checked\n";
+    /// The synthetic class's vtable RVA, and where the test's instances live: private regions of their own.
+    const VT: u32 = 0x1000;
+    const HEAP: u64 = 0x2000_0000;
+    const FREED: u64 = 0x3000_0000;
+    /// An instance's size, and its field's offset: an f32 that starts 0.2 (`old`) and is patched to 0.35 (`new`).
+    const SIZE: u64 = 0x60;
+    const FIELD: u64 = 0x58;
+
+    fn steer() -> InstancePatch {
+        let text =
+            format!("{INSTANCES}steer\tCFake\t{VT:#x}\tbuild-1\t{FIELD:#x}\tf32\t0.2\t0.35\tyes\n");
+        from_instances_tsv(&text).unwrap().remove(0)
+    }
+
+    /// `n` instances back to back from `base`, each holding the vtable pointer and its field `value`.
+    fn heap(n: u64, value: f32) -> Vec<u8> {
+        let mut b = vec![0; (n * SIZE) as usize];
+        for i in 0..n as usize {
+            let at = i * SIZE as usize;
+            b[at..at + 8].copy_from_slice(&(IMAGE + u64::from(VT)).to_le_bytes());
+            let field = at + FIELD as usize;
+            b[field..field + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        b
+    }
+
+    fn plan_steer(
+        defs: &[InstancePatch],
+        mem: &Fake,
+    ) -> Result<(InstancePatch, Instances), Refusal> {
+        plan_instances(defs, "steer", "build-1", IMAGE, mem, &mut go)
+    }
+
+    /// The writes `write_instances` made through it, kept to be made in the fake afterwards.
+    fn made(
+        mem: &Fake,
+        vt: u64,
+        writes: &[Write],
+        log: &mut Vec<Write>,
+    ) -> Vec<Result<(), String>> {
+        write_instances(mem, vt, FIELD, writes, &mut |w| {
+            log.push(w.clone());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn instance_patches_tsv_rows_become_definitions() {
+        let text = format!(
+            "# synthetic definitions, not from any real binary\n{INSTANCES}\
+             steer\tCFake\t0x1000\tbuild-1\t0x58\tf32\t0.2\t0.35\t2026-01-01 by hand\r\n\
+             flag\tCFake\t0x1000\tbuild-1\t12\tbytes\t01 00\t0000\tyes\n\
+             count\tCFake\t0X2000\tbuild-2\t0x5c\ti32\t-1\t0x10\tno\n"
+        );
+        let defs = from_instances_tsv(&text).unwrap();
+        let steer = InstancePatch {
+            name: "steer".into(),
+            class: "CFake".into(),
+            vtable: 0x1000,
+            build: "build-1".into(),
+            offset: 0x58,
+            ty: Type::F32,
+            old: 0.2f32.to_le_bytes().into(),
+            new: 0.35f32.to_le_bytes().into(),
+            boundaries_checked: Some("2026-01-01 by hand".into()),
+        };
+        assert_eq!(defs[0], steer);
+        assert_eq!(
+            (
+                defs[1].ty,
+                defs[1].offset,
+                &defs[1].old[..],
+                &defs[1].new[..]
+            ),
+            (Type::Bytes(2), 12, &[1, 0][..], &[0, 0][..])
+        );
+        assert_eq!(
+            (
+                &defs[2].old[..],
+                &defs[2].new[..],
+                &defs[2].boundaries_checked
+            ),
+            (&(-1i32).to_le_bytes()[..], &16i32.to_le_bytes()[..], &None)
+        );
+        assert_eq!(
+            defs[0].json(),
+            json!({"name": "steer", "class": "CFake", "vtable_rva": "0x1000", "build": "build-1", "offset": "0x58",
+                   "type": "f32", "old": 0.2f32, "new": 0.35f32, "boundaries_checked": "2026-01-01 by hand"})
+        );
+        for (row, why) in [
+            (
+                "m\tC\t0x10\tb\t0x58\tf32\tzz\t1\tyes",
+                r#"old: "zz" is not a f32"#,
+            ),
+            (
+                "m\tC\t0x10\tb\t0x58\tu8\t1\t256\tyes",
+                r#"new: "256" is not a u8"#,
+            ),
+            ("m\tC\t0x10\tb\t0x58\tbytes\t01\t02 03\tyes", "new: "),
+            ("m\tC\t10\tb\t0x58\tf32\t1\t2\tyes", "not 0x-prefixed hex"),
+            ("m\tC\t0x10\tb\t-8\tf32\t1\t2\tyes", r#"offset "-8""#),
+            ("m\tC\t0x10\tb\t0x58\tptr\t1\t2\tyes", "type ptr"),
+            ("m\tC\t0x10\tb\t0x58\tf16\t1\t2\tyes", r#"type "f16""#),
+            ("m\t\t0x10\tb\t0x58\tf32\t1\t2\tyes", r#"class """#),
+            ("m\tC D\t0x10\tb\t0x58\tf32\t1\t2\tyes", "has whitespace"),
+            ("m\tC\t0x10\t\t0x58\tf32\t1\t2\tyes", "the build is blank"),
+            (
+                "p\tC\t0x10\tb-1\t0x58\tf32\t1\t2\tyes",
+                "p is defined twice for build b-1",
+            ),
+            ("m\tC\t0x10\tb\t0x58\tf32\t1\t2", "8 columns"),
+        ] {
+            let text = format!("{INSTANCES}p\tC\t0x10\tb-1\t0x58\tf32\t1\t2\tyes\n{row}\n");
+            match from_instances_tsv(&text) {
+                Err(e @ TsvError { line: 3, .. }) => {
+                    assert!(e.msg.contains(why), "{row:?}: {e}");
+                    assert!(e.to_string().starts_with("instance_patches.tsv line 3: "));
+                }
+                other => panic!("{row:?}: {other:?}"),
+            }
+        }
+        assert!(from_instances_tsv(HEADER).is_err(), "patches.tsv's header");
+    }
+
+    /// Instances found, then changed by the game before their write: one reused for another object, one freed, one
+    /// rewritten; one held another value, one the new one, one lay in read-only memory. Only the instances still
+    /// holding the vtable and the old value are written; a second apply writes only an instance new since; an undo
+    /// restores only the fields still holding the new value in an instance of the class.
+    #[test]
+    fn instance_patches_write_only_live_instances_holding_the_old_value() {
+        let vt = IMAGE + u64::from(VT);
+        let at = |i: u64| HEAP + i * SIZE;
+        let mut mem = Fake::default()
+            .with(IMAGE, heap(1, 0.2), Some(".rdata"))
+            .with(HEAP, heap(8, 0.2), None)
+            .with(FREED, heap(1, 0.2), None);
+        mem.regions[0].0.protect = 0x02;
+        mem.poke(at(4) + FIELD, &0.5f32.to_le_bytes());
+        mem.poke(at(5) + FIELD, &0.35f32.to_le_bytes());
+        // Instance 7 isn't one yet: it becomes one after the patch.
+        mem.poke(at(7), &[0; 8]);
+        let defs = [steer()];
+        let (row, found) = plan_steer(&defs, &mem).unwrap();
+        assert_eq!(row, defs[0]);
+        assert_eq!(found.vtable, vt);
+        let fields: Vec<u64> = found.writes.iter().map(|w| w.address - FIELD).collect();
+        assert_eq!(fields, [at(0), at(1), at(2), at(3), at(6), FREED]);
+        assert!(
+            found
+                .writes
+                .iter()
+                .all(|w| w.old == row.old && w.new == row.new)
+        );
+        assert_eq!(found.already, [at(5)]);
+        let left: Vec<u64> = found.left.iter().map(|(a, _)| *a).collect();
+        assert_eq!(left, [at(4), IMAGE], "{:?}", found.left);
+        assert_eq!(found.left[0].1, "the field holds 0.5: neither old nor new");
+        assert!(
+            found.left[1].1.contains("protect 0x2: not writable"),
+            "{:?}",
+            found.left
+        );
+        assert_eq!(found.bytes, SIZE * 10);
+
+        // Between the search and the writes: 1 freed and its memory reused, the FREED region freed, 3 rewritten by the
+        // game.
+        mem.poke(at(1), &0xdead_0000u64.to_le_bytes());
+        mem.bad.push(FREED..FREED + SIZE);
+        mem.poke(at(3) + FIELD, &0.3f32.to_le_bytes());
+        let mut log = Vec::new();
+        let results = made(&mem, vt, &found.writes, &mut log);
+        let ok: Vec<bool> = results.iter().map(Result::is_ok).collect();
+        assert_eq!(ok, [true, false, true, false, true, false], "{results:?}");
+        let why = |i: usize| results[i].clone().unwrap_err();
+        assert!(
+            why(1).contains("0xdead0000 now, not the vtable"),
+            "{results:?}"
+        );
+        assert!(
+            why(3).contains("the field holds 9a 99 99 3e now"),
+            "{results:?}"
+        );
+        assert!(
+            why(5).contains("can't read the instance now"),
+            "{results:?}"
+        );
+        let written: Vec<u64> = log.iter().map(|w| w.address - FIELD).collect();
+        assert_eq!(written, [at(0), at(2), at(6)]);
+        for w in &log {
+            mem.poke(w.address, &w.new);
+        }
+
+        // A second apply: the written ones and 5 hold the new value already; 1 is no instance now, 3 holds another
+        // value; 7, an instance since, is written.
+        mem.poke(at(7), &vt.to_le_bytes());
+        let (_, again) = plan_steer(&defs, &mem).unwrap();
+        let fields: Vec<u64> = again.writes.iter().map(|w| w.address - FIELD).collect();
+        assert_eq!(fields, [at(7)], "{again:?}");
+        assert_eq!(again.already, [at(0), at(2), at(5), at(6)]);
+        let left: Vec<u64> = again.left.iter().map(|(a, _)| *a).collect();
+        assert_eq!(left, [at(3), at(4), IMAGE], "{again:?}");
+        assert_eq!(again.skipped.len(), 1, "the freed region: {again:?}");
+        let mut log = Vec::new();
+        made(&mem, vt, &again.writes, &mut log);
+        for w in &log {
+            mem.poke(w.address, &w.new);
+        }
+
+        // The undo of every write made (0, 2, 6, 7): 0 freed, 6 rewritten by the game; 2 and 7 restored.
+        mem.poke(at(0), &0u64.to_le_bytes());
+        mem.poke(at(6) + FIELD, &0.4f32.to_le_bytes());
+        let undo: Vec<Write> = [at(0), at(2), at(6), at(7)]
+            .map(|a| Write {
+                address: a + FIELD,
+                old: row.new.clone(),
+                new: row.old.clone(),
+            })
+            .into();
+        let mut log = Vec::new();
+        let results = made(&mem, vt, &undo, &mut log);
+        let ok: Vec<bool> = results.iter().map(Result::is_ok).collect();
+        assert_eq!(ok, [false, true, false, true], "{results:?}");
+        let restored: Vec<(u64, &[u8])> = log
+            .iter()
+            .map(|w| (w.address - FIELD, &w.new[..]))
+            .collect();
+        assert_eq!(restored, [(at(2), &row.old[..]), (at(7), &row.old[..])]);
+        // A failed write is why it was left.
+        let failed = write_instances(&mem, vt, FIELD, &undo[3..], &mut |_| Err("no".into()));
+        assert_eq!(failed, [Err("no".to_string())]);
+    }
+
+    #[test]
+    fn instance_patches_refuse_rows_that_break_the_rules_and_over_the_cap() {
+        let mem = Fake::default().with(HEAP, heap(4, 0.2), None);
+        let refusal = |d: InstancePatch| plan_steer(&[d], &mem).unwrap_err();
+        let unchecked = InstancePatch {
+            boundaries_checked: None,
+            ..steer()
+        };
+        assert_eq!(refusal(unchecked), Refusal::Unchecked);
+        let same = InstancePatch {
+            new: steer().old,
+            ..steer()
+        };
+        assert_eq!(refusal(same), Refusal::NoChange);
+        let wide = InstancePatch {
+            ty: Type::Bytes(9),
+            old: vec![0; 9],
+            new: vec![1; 9],
+            ..steer()
+        };
+        assert_eq!(refusal(wide), Refusal::Length { old: 9, new: 9 });
+        for (offset, len) in [(0, 4), (4, 4), (0x5e, 4), (0x10000, 4)] {
+            let at = InstancePatch { offset, ..steer() };
+            assert_eq!(refusal(at), Refusal::Field { offset, len }, "{offset:#x}");
+        }
+        assert_eq!(
+            Refusal::Field { offset: 4, len: 4 }.to_string(),
+            "4 bytes at +0x4: an instance field starts at +0x8 or later, below +0x10000, and stays inside one aligned qword"
+        );
+        let other = InstancePatch {
+            build: "build-2".into(),
+            ..steer()
+        };
+        assert_eq!(
+            refusal(other).to_string(),
+            "defined for build build-2, not the running build-1"
+        );
+        let unknown = plan_instances(&[steer()], "nope", "build-1", IMAGE, &mem, &mut go);
+        assert_eq!(
+            unknown.unwrap_err().to_string(),
+            r#"no patch named "nope" in instance_patches.tsv"#
+        );
+        // A search stopped before its end writes nothing.
+        let two = Fake::default()
+            .with(HEAP, heap(4, 0.2), None)
+            .with(FREED, heap(4, 0.2), None);
+        let mut stop = |_: u64, _: u64| ControlFlow::Break("deadline");
+        let stopped = plan_instances(&[steer()], "steer", "build-1", IMAGE, &two, &mut stop);
+        assert_eq!(
+            stopped.unwrap_err(),
+            Refusal::Stopped {
+                why: "deadline",
+                bytes: 4 * SIZE
+            }
+        );
+        // The cap: every instance found, over two pages of hits, or refused.
+        let n = MAX_INSTANCES as u64;
+        let full = Fake::default().with(HEAP, heap(n, 0.2), None);
+        assert_eq!(
+            plan_steer(&[steer()], &full).unwrap().1.writes.len(),
+            MAX_INSTANCES
+        );
+        let over = Fake::default().with(HEAP, heap(n + 1, 0.2), None);
+        let refused = plan_steer(&[steer()], &over).unwrap_err();
+        assert_eq!(refused, Refusal::TooMany(MAX_INSTANCES + 1));
+        assert_eq!(
+            refused.to_string(),
+            "1001 instances found, over the 1000 an instance patch writes: nothing written"
+        );
     }
 }

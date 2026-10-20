@@ -260,10 +260,13 @@ approval_mode = "prompt"
 
 [mcp_servers.quen.tools.capture_clean]
 approval_mode = "prompt"
+
+[mcp_servers.quen.tools.mem_patch_instances]
+approval_mode = "prompt"
 ```
 
 - `tool_timeout_sec`: quen answers within about 20 s (then `job_status`), so 120 leaves room. Codex's default is 60 or 300 s depending on the version.
-- **Approvals.** Without `default_tools_approval_mode`, Codex asks before every quen tool that changes something (quen 0.1.8 marks only its read-only tools, which run without asking), so during a launch you would switch from the game to Codex for each call. With the entry above, Codex asks only for the four calls Claude Code also asks for every time: `session_launch`, `game_save`, `hands_take` and `capture_clean`, each with an approval card (the launch's was tried on 2026-10-19; the other three use the same setting). Use a Codex permission mode that asks, not Full access: there Codex refuses every tool that needs approval, including the launch.
+- **Approvals.** Without `default_tools_approval_mode`, Codex asks before every quen tool that changes something (quen 0.1.8 marks only its read-only tools, which run without asking), so during a launch you would switch from the game to Codex for each call. With the entry above, Codex asks only for the five calls Claude Code also asks for every time: `session_launch`, `game_save`, `hands_take`, `capture_clean` and `mem_patch_instances`, each with an approval card (the launch's was tried on 2026-10-19; the other four use the same setting). Use a Codex permission mode that asks, not Full access: there Codex refuses every tool that needs approval, including the launch.
 - Codex passes only a short list of environment variables to servers. If you set `QUEN_CONFIG`, add `env_vars = ["QUEN_CONFIG"]`, or `env = { QUEN_CONFIG = '<path>' }`, and set the same `QUEN_CONFIG` in the terminal that runs `quen serve --stay`: with another config, Codex's `quen mcp` looks for another `quen serve`.
 
 **VS Code (Copilot agent mode).** In your user `mcp.json` (Command Palette: *MCP: Open User Configuration*) or a workspace's `.vscode\mcp.json`:
@@ -296,9 +299,9 @@ Cursor's timeout can't be changed: about 60 minutes in the editor, 60 s in its C
 
 **Claude Code's auto mode** may refuse a quen tool in the middle of a session (seen 2026-10-19: `mem_patch` as "Modify Shared Resources", `mem_read` as "Security Weaken"). An allow rule in `%USERPROFILE%\.claude\settings.json`, under `permissions.allow`, names a tool that may run: the rule for quen's tool `<tool>` is `mcp__quen__<tool>`, for example `{"permissions": {"allow": ["mcp__quen__mem_read"]}}`. Which tools you allow is your decision; quen doesn't read Claude Code's settings. The tools on the game's memory:
 - **Only read it:** `mem_read`, `mem_scan`, `mem_follow`, `mem_walk`, `mem_find`, `mem_regions`.
-- **Write it:** `mem_patch`, `mem_unpatch` (journaled; every save the game writes afterwards is marked tainted).
+- **Write it:** `mem_patch`, `mem_unpatch`, `mem_patch_instances`, `mem_unpatch_instances` (journaled; every save the game writes afterwards is marked tainted).
 - **Both:** `game_cvar` reads a cvar, and with `set` or `restore` writes it. One rule, `mcp__quen__game_cvar`, covers both.
-- `session_launch`, `game_save`, `capture_clean` and `hands_take` prompt on every call, whatever the rules say.
+- `session_launch`, `game_save`, `capture_clean`, `hands_take` and `mem_patch_instances` prompt on every call, whatever the rules say.
 
 **What runs.** `quen mcp` only relays messages. The first one starts `quen serve` in the background, which holds the game lock, the session and its journal. Several client sessions share that one `quen serve`. It exits a few seconds after the last of them closes. If a game session is still running then, it first ends it (waits for saves to finish, closes the game, puts the folder back), so it can outlive the client by a little while.
 

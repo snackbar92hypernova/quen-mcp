@@ -38,7 +38,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// sets another for its client; 0 waits for every call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 14] = [
+const LONG: [&str; 15] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -50,6 +50,7 @@ const LONG: [&str; 14] = [
     "measure_ab",
     "mem_scan",
     "mem_find",
+    "mem_patch_instances",
     "sweep_play",
     "data_scan",
     "script_compile",
@@ -1101,8 +1102,8 @@ mod tests {
         }
     }
 
-    /// The client prompts for every launch, every capture cleanup, every save and every hand-over of a play session to
-    /// the agent, and for nothing else, so the plan, which takes the launch's arguments but user_ok, stays free for
+    /// The client prompts for every launch, every capture cleanup, every save, every hand-over of a play session to the
+    /// agent and every instance patch, and for nothing else, so the plan, which takes the launch's arguments but user_ok, stays free for
     /// subagents.
     #[test]
     fn only_the_launch_asks_the_user_and_the_plan_takes_its_arguments() {
@@ -1116,7 +1117,13 @@ mod tests {
             .collect();
         assert_eq!(
             marked,
-            ["session_launch", "game_save", "hands_take", "capture_clean"]
+            [
+                "session_launch",
+                "game_save",
+                "hands_take",
+                "mem_patch_instances",
+                "capture_clean"
+            ]
         );
         for name in marked {
             let meta = &tool(name.as_str().unwrap())["_meta"]["anthropic/requiresUserInteraction"];
