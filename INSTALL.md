@@ -38,6 +38,25 @@ Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 - **`-Uninstall`** sends `.quen\bin` and the package to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
 - **`-WhatIf`** prints every step and changes nothing. It still downloads and checks the release, in a temp folder that then goes to the Recycle Bin.
 
+## Updating
+
+Each release's notes on GitHub say what changed and what to do.
+
+**Installed with `install.ps1`:**
+1. End any quen session and close the game.
+2. Download the new `install.ps1` as above, then run it with `-Update`:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File install.ps1 -Update
+   ```
+
+   It replaces `quen.exe`, stopping a running one first after you agree. The in-game package is replaced whenever the release's version differs from the one in the game, with or without `-Update`; the old one goes to the Recycle Bin.
+3. Restart Claude Desktop, or in the Claude Code CLI reconnect quen with `/mcp`: a client keeps the tool list it got when it connected. Your agent's `session_status` then gives the new version (`quen`).
+
+**Built from source:** close the MCP clients that use quen and wait until no `quen.exe` runs (Task Manager): Windows can't replace a running one. Then `git pull` and the same `cargo install` line as in section 2. For the in-game package, unzip the release's `quen-w3-<version>.zip` into the game folder, after moving the old `Mods\modQuen` to the Recycle Bin; `quen doctor` names the version it expects.
+
+Your config, ledger, logs and captures stay. When a new quen changes the ledger's layout, it upgrades the ledger the first time it starts, after copying it to `state\backups` in the data root.
+
 ## 1. What you need
 
 **Windows 10 or 11, 64-bit.** quen runs only on Windows.
@@ -89,14 +108,14 @@ Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 In a terminal:
 
 ```bat
-git clone <the repo URL from your invitation> quen-mcp
+git clone https://github.com/snackbar92hypernova/quen-mcp
 cd quen-mcp
 cargo install --path crates/quen
 ```
 
 This builds quen and puts it at `%USERPROFILE%\.cargo\bin\quen.exe`. rustup has already put that folder on your PATH. Check it by running `quen`: it prints its usage.
 
-**To update:** `git pull`, then the same `cargo install` line. Close the MCP clients that use quen first, and wait until no `quen.exe` runs (Task Manager): Windows can't replace a running one.
+**To update:** see [Updating](#updating).
 
 ## 3. Configure: ask your agent
 

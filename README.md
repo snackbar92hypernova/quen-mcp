@@ -85,6 +85,8 @@ quen never downloads or installs third-party tools: you install them yourself, u
 1. **Install quen and its in-game package.** Two ways:
    - `install.ps1` from a release, which also installs the package and offers to register quen in Claude Code ([INSTALL.md](INSTALL.md), Quick install);
    - or build from source (INSTALL.md §2).
+
+   To update later: [INSTALL.md, Updating](INSTALL.md#updating).
 2. **Ask your agent to run `quen_setup`, then `quen_doctor`.**
    - Setup shows the paths and tools quen found and writes only what you confirm.
    - The doctor lists what's ready and what's missing, with where to get it.
