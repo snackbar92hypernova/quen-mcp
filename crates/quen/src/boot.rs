@@ -80,6 +80,8 @@ pub(crate) struct Spec {
     pub(crate) fg: bool,
     pub(crate) vsync: bool,
     pub(crate) photo: bool,
+    /// Start the game with `-debugscripts` (finding 50), a condition on the boot row.
+    debugscripts: bool,
     /// `renderdoc:NAME`, `nsys:NAME` or `ngfx:NAME`, as asked, and its launch profile.
     pub(crate) profiler: Option<String>,
     pub(crate) profile: Option<Profile>,
@@ -118,6 +120,7 @@ impl Spec {
             "extra_env",
             "stage",
             "stage_mods",
+            "debugscripts",
             "user_ok",
             "allow_unknown_build",
         ];
@@ -234,11 +237,15 @@ impl Spec {
                 .is_some_and(|(d, g)| d.starts_with(g))
         };
         let mods_dir = game_dir.join("Mods");
-        for (key, list, dir) in [
-            ("stage", &stage, &bin),
-            ("stage_mods", &stage_mods, &mods_dir),
+        // A staged .xml goes into the menu folder (finding 49), anything else into bin.
+        let menu_dir = boot::menu_dir(&game_dir);
+        let menus = stage.iter().any(|p| boot::is_menu(p));
+        for (key, used, dir) in [
+            ("stage", stage.iter().any(|p| !boot::is_menu(p)), &bin),
+            ("stage", menus, &menu_dir),
+            ("stage_mods", !stage_mods.is_empty(), &mods_dir),
         ] {
-            if !list.is_empty() && !inside(dir) {
+            if used && !inside(dir) {
                 return Err(format!(
                     "{key}: {} is missing or leads out of the game folder (a link or junction)",
                     dir.display()
@@ -375,6 +382,14 @@ impl Spec {
         let mut conditions = Vec::new();
         if devkit {
             conditions.push("devkit");
+        }
+        let debugscripts = flag("debugscripts", false)?;
+        if debugscripts {
+            // ngfx starts the game from its own arguments (`--exe`), where quen passes none.
+            if profile.as_ref().is_some_and(|p| p.tool == Tool::Ngfx) {
+                return Err("debugscripts isn't taken under profiler ngfx".into());
+            }
+            conditions.push("debugscripts");
         }
         if let (Some(profile), Some(profiler)) = (&profile, profiler) {
             if devkit && parks_reshade {
@@ -520,12 +535,17 @@ impl Spec {
             .copied()
             .chain([config.game_exe.as_str()])
             .collect();
+        let menu = match menus {
+            true => listing(&menu_dir)?,
+            false => Vec::new(),
+        };
         let staged = boot::stage(
             &JournalFs,
             &game_dir,
             &stage,
             &never,
             &bin_entries,
+            &menu,
             &changes,
         )?;
         changes.extend(staged);
@@ -556,6 +576,7 @@ impl Spec {
             fg,
             vsync,
             photo: flag("photo", !play)?,
+            debugscripts,
             profiler: profiler.map(str::to_owned),
             profile,
             changes,
@@ -577,17 +598,22 @@ impl Spec {
     }
 
     /// What starts the game, and in which folder: the exe itself in bin, or its profile's tool around it, writing into
-    /// `out` (profile.rs).
+    /// `out` (profile.rs); with `debugscripts` the game's argument after the exe, which ends the command line but under
+    /// ngfx (refused with it).
     pub(crate) fn command(&self, config: &Config, out: &Path) -> (Vec<String>, PathBuf) {
         let bin = config.bin_dir().unwrap_or_default();
         let exe = bin.join(&config.game_exe).display().to_string();
-        match &self.profile {
+        let (mut argv, cwd) = match &self.profile {
             Some(profile) => {
                 let frames = self.extra.get("W3_NGFX_FRAMES").and_then(Value::as_str);
                 profile.command(config, exe, &bin, out, frames)
             }
             None => (vec![exe], bin),
+        };
+        if self.debugscripts {
+            argv.push("-debugscripts".into());
         }
+        (argv, cwd)
     }
 }
 

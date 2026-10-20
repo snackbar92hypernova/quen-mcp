@@ -45,6 +45,9 @@ constexpr float kMaxTick = 10;
 // protocol.rs's MAX_ITEM_BYTES and MAX_ITEM_COUNT: items.add's name and count, from quen-w3 0.1.10.
 constexpr size_t kMaxItem = 200;
 constexpr uint64_t kMaxItemCount = 1000;
+// protocol.rs's MAX_ACTORS_RADIUS and MAX_ACTORS: world.actors' radius and max, from quen-w3 0.1.10.
+constexpr float kMaxActorsRadius = 100;
+constexpr uint64_t kMaxActors = 50;
 // photo.grade's sliders, in modQuen's QUEN_Grade order, as protocol.rs names them.
 constexpr const char* kGrade[] = {"exposure", "contrast", "highlights", "saturation", "temperature", "vignette", "grain",
                                   "chromatic_aberration"};
@@ -775,6 +778,13 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     ok = whole("count", kMaxItemCount, n) && n > 0 && take("equip", Value::kBool, equip) && name("name") &&
          cmd.args.size() <= kMaxItem + 1;
     cmd.args = ' ' + std::to_string(n) + (equip.flag ? " 1" : " 0") + cmd.args;
+  } else if (v == "world.actors") {
+    // "<max> <radius>".
+    Value r;
+    float radius = 0;
+    ok = whole("max", kMaxActors, n) && n > 0 && take("radius", Value::kNumber, r) && ParseFloat(r.text, radius) &&
+         radius > 0 && radius <= kMaxActorsRadius;
+    cmd.args = ' ' + std::to_string(n) + ' ' + Fixed(radius);
   } else if (v == "photo.reset") {
     const char* parts[] = {"weather", "env", "grading"};
     int part = -1;
@@ -819,7 +829,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
             "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
             "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes, an "
-            "items.add name over 200 bytes or count outside 1 to 1000)";
+            "items.add name over 200 bytes or count outside 1 to 1000, a world.actors radius outside 0 (excluded) to 100 or "
+            "max outside 1 to 50)";
     return false;
   }
   if (!fields.empty()) {
@@ -902,6 +913,10 @@ static void Next(void*, void* frame, void* result) {
 // {"player":{"pos":[..],"heading":..},"time":{"day":..,"hour":..},"rain":..,"snow":..,"sky_clear":..,"weather":..};
 // items.add "before after equipped" (the item's count before and after, equipped 0 or 1) ->
 // {"before":..,"after":..,"equipped":..};
+// world.actors "<found>" then per actor "|x y z heading vx vy vz distance flags|<name>|<entity>" (modQuen's
+// QUENRPC_Actors: flags 1 combat, 2 hostile, 4 guard, 8 at work, 16 action point, 32 scene, 64 velocity known) ->
+// {"found":..,"actors":[{"name":..,"entity":..,"pos":[..],"heading":..,"velocity":[..] or null,"distance":..,
+// "combat":..,"hostile":..,"guard":..,"at_work":..,"action_point":..,"scene":..}]};
 // the other photo.* verbs modQuen's QUENRPC_PhotoState (20 numbers, then '|' and three names) ->
 // {"weather":..,"minute":..,"env":..,"grading":{..},"grading_at_open":{..},"rain":..,"snow":..,"sky_clear":..,
 // "world_weather":..}.
@@ -912,6 +927,30 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
       for (const std::string_view item : Split(data, '|')) json += Quote(item) + ',';
     if (json.back() == ',') json.pop_back();
     json += ']';
+    return true;
+  }
+  if (verb == "world.actors") {
+    const std::vector<std::string_view> part = Split(data, '|');
+    uint64_t found = 0;
+    if ((part.size() - 1) % 3 || !Whole(part[0], INT32_MAX, found) || (part.size() - 1) / 3 > found) return false;
+    std::string out = "{\"found\":" + std::to_string(found) + ",\"actors\":[";  // json only once all of it parsed
+    for (size_t a = 1; a < part.size(); a += 3) {
+      const std::vector<std::string_view> t = Split(part[a], ' ');
+      float f[8];
+      uint64_t flags = 0;
+      if (t.size() != 9 || !Whole(t[8], 127, flags)) return false;
+      for (int k = 0; k < 8; ++k)
+        if (!ParseFloat(t[k], f[k])) return false;
+      const auto flag = [&](uint64_t bit) { return std::string(flags & bit ? "true" : "false"); };
+      const std::string velocity =
+          flags & 64 ? "[" + Number(f[4]) + ',' + Number(f[5]) + ',' + Number(f[6]) + ']' : std::string("null");
+      out += std::string(a > 1 ? "," : "") + "{\"name\":" + Quote(part[a + 1]) + ",\"entity\":" + Quote(part[a + 2]) +
+              ",\"pos\":[" + Number(f[0]) + ',' + Number(f[1]) + ',' + Number(f[2]) + "],\"heading\":" + Number(f[3]) +
+              ",\"velocity\":" + velocity + ",\"distance\":" + Number(f[7]) + ",\"combat\":" + flag(1) +
+              ",\"hostile\":" + flag(2) + ",\"guard\":" + flag(4) + ",\"at_work\":" + flag(8) +
+              ",\"action_point\":" + flag(16) + ",\"scene\":" + flag(32) + '}';
+    }
+    json = out + "]}";
     return true;
   }
   const std::vector<std::string_view> t = Split(data, ' ');

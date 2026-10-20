@@ -101,9 +101,9 @@ pub enum Change {
     /// recycles the copy.
     CopyDir { from: PathBuf, dest: PathBuf },
     /// Back `path` up to `backup` and record its write time: the game rewrites it during the session (its compiled
-    /// scripts, once a mod is parked; input.settings and dx12user.settings.bak, at every launch), and the replay puts
-    /// both back. `keep`: a live file whose lines changed beyond their order is kept beside first (input.settings: the
-    /// user may rebind a key in the game's menu meanwhile).
+    /// scripts, once a mod is parked; input.settings, user.settings and dx12user.settings.bak, at every launch), and the
+    /// replay puts both back. `keep`: a live file whose lines changed beyond their order is kept beside first
+    /// (input.settings: the user may rebind a key in the game's menu meanwhile; user.settings: a mod menu's values).
     Rebuilt {
         path: PathBuf,
         sha: String,
@@ -149,10 +149,23 @@ pub fn bin_dir(game_dir: &Path) -> PathBuf {
     game_dir.join("bin").join("x64_dx12")
 }
 
+/// The game's menu folder, `bin\config\r4game\user_config_matrix\pc`: 5.01 holds the vanilla menus' XMLs and installed
+/// mods' menu XMLs side by side there, with no filelist (one install, 2026-10-20).
+pub fn menu_dir(game_dir: &Path) -> PathBuf {
+    let config = game_dir.join("bin").join("config");
+    config.join("r4game").join("user_config_matrix").join("pc")
+}
+
+/// Whether [`stage`] copies `file` into [`menu_dir`] (a `.xml`: a mod's menu, finding 49) rather than bin.
+pub fn is_menu(file: &Path) -> bool {
+    file.extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("xml"))
+}
+
 /// Every change the boot makes, read from the files as they are now: dx12user.settings (frame generation off, camera
 /// auto-rotate off, the overrides, VSync off if asked), the parking (and with a Mods folder parked, the compiled
-/// scripts kept), input.settings and dx12user.settings.bak kept, ReShade.ini and ReShadePreset.ini with RenoDX, general.ini's console, and `steam_appid.txt` if it
-/// is missing. A file the boot leaves as it is gets no change. A play session ([`Inputs::play`]) forces no setting.
+/// scripts kept), input.settings, user.settings and dx12user.settings.bak kept, ReShade.ini and ReShadePreset.ini with
+/// RenoDX, general.ini's console, and `steam_appid.txt` if it is missing. A file the boot leaves as it is gets no change. A play session ([`Inputs::play`]) forces no setting.
 /// Refuses, with nothing changed, on any doubt: a missing file, settings that aren't 5.01's, a bad override or park
 /// name, a key the patch needs.
 pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
@@ -207,9 +220,15 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
     let new = dx12_settings(&data, inputs)?;
     // The game rewrites input.settings at every launch, its lines reordered within sections (live boot 1), and
     // dx12user.settings.bak from the settings it starts with, quen's patched ones (feature tests 1): both kept like the
-    // compiled scripts, so their bytes come back. A key the user rebound meanwhile is kept beside. A play
-    // session that changes no setting leaves both to the game, as a launch without quen does.
-    for (name, keep) in [("input.settings", true), ("dx12user.settings.bak", false)] {
+    // compiled scripts, so their bytes come back. A key the user rebound meanwhile is kept beside. user.settings holds
+    // mod menus' values, which a menu or a script's SaveUserSettings writes during a test (finding 49): kept the same
+    // way, a changed value kept beside. A play session that changes no setting leaves all three to the game, as a
+    // launch without quen does.
+    for (name, keep) in [
+        ("input.settings", true),
+        ("user.settings", true),
+        ("dx12user.settings.bak", false),
+    ] {
         let path = inputs.documents.join(name);
         if fs.exists(&path) && (!inputs.play || new != data) {
             changes.push(Change::Rebuilt {
@@ -291,20 +310,21 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
     Ok(changes)
 }
 
-/// The changes that copy `files` (on this PC) into bin under their own names for one session, after `earlier` (the
-/// boot's other changes): a file of that name in bin (`bin` lists it) is parked first, unless `earlier` parks it, then
-/// the copy placed. A staged file's `<stem>.log` that isn't in bin is journaled, so the replay recycles it, after the
-/// end copied the boot's logs into game_logs. Refuses, with nothing changed: a name staged twice or on `never`, a
-/// folder or link of that name in bin, one `earlier` changes otherwise, a file that can't be read.
+/// The changes that copy `files` (on this PC) into bin under their own names for one session, a `.xml` into the menu
+/// folder ([`is_menu`]), after `earlier` (the boot's other changes): a file of that name there (`bin` and `menu` list
+/// them) is parked first, unless `earlier` parks it, then the copy placed. A file staged into bin whose `<stem>.log`
+/// isn't in bin has that log journaled, so the replay recycles it, after the end copied the boot's logs into game_logs.
+/// Refuses, with nothing changed: a name staged twice or on `never`, a folder or link of that name where it goes, one
+/// `earlier` changes otherwise, a file that can't be read.
 pub fn stage(
     fs: &dyn Fs,
     game_dir: &Path,
     files: &[PathBuf],
     never: &[&str],
     bin: &[Entry],
+    menu: &[Entry],
     earlier: &[Change],
 ) -> Result<Vec<Change>, String> {
-    let dir = bin_dir(game_dir);
     let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
     let in_bin = |name: &str| bin.iter().find(|e| e.name.eq_ignore_ascii_case(name));
     let (mut changes, mut dests) = (Vec::new(), Vec::<PathBuf>::new());
@@ -314,11 +334,15 @@ pub fn stage(
         if never.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
             return refused("quen never parks that name, so nothing is staged over it");
         }
-        let found = in_bin(&name);
+        let (dir, listed, folder, parking) = match is_menu(file) {
+            true => (menu_dir(game_dir), menu, "the menu folder", "menu"),
+            false => (bin_dir(game_dir), bin, "bin", "bin"),
+        };
+        let found = listed.iter().find(|e| e.name.eq_ignore_ascii_case(&name));
         if found.is_some_and(|e| e.is_dir || e.is_link) {
-            return refused("a folder or link of that name is in bin");
+            return refused(&format!("a folder or link of that name is in {folder}"));
         }
-        // The name as bin spells it, so the original comes back as it was.
+        // The name as the folder spells it, so the original comes back as it was.
         let dest = dir.join(found.map_or(&*name, |e| e.name.as_str()));
         if dests.iter().any(|d| same(d, &dest)) {
             return refused("a second file of that name");
@@ -337,7 +361,7 @@ pub fn stage(
         if let Some(e) = found.filter(|_| !earlier.iter().any(parked)) {
             changes.push(Change::Move {
                 from: dest.clone(),
-                to: game_dir.join(PARKED).join("bin").join(&e.name),
+                to: game_dir.join(PARKED).join(parking).join(&e.name),
             });
         }
         let mut stage = dest.clone().into_os_string();
@@ -350,7 +374,7 @@ pub fn stage(
         });
         dests.push(dest);
     }
-    for dest in &dests {
+    for dest in dests.iter().filter(|d| !is_menu(d)) {
         let log = dest.with_extension("log");
         let name = log.file_name().unwrap_or_default().to_string_lossy();
         let listed = |c: &Change| matches!(c, Change::NewLog { path } if same(path, &log));
@@ -1153,24 +1177,27 @@ mod tests {
     }
 
     /// Live boot 1: the game rewrites input.settings at every launch with lines reordered; feature tests 1: and
-    /// dx12user.settings.bak from quen's patched settings. Whatever it wrote, the replay puts the user's bytes and write
-    /// times back; without the files there is nothing to keep.
+    /// dx12user.settings.bak from quen's patched settings; finding 49: a mod menu writes its values into user.settings.
+    /// Whatever it wrote, the replay puts the user's bytes and write times back; without the files there is nothing to
+    /// keep.
     #[test]
     fn input_settings_and_the_settings_bak_come_back_after_the_game_rewrites_them() {
         let fs = game();
         let input = Path::new("DOCS/input.settings");
+        let user = Path::new("DOCS/user.settings");
         let bak = Path::new("DOCS/dx12user.settings.bak");
         fs.put(
             input,
             "[Exploration]\r\nIK_W=(Action=A)\r\nIK_S=(Action=B)\r\n",
         );
+        fs.put(user, "[ModMenu]\r\nRadius=5\r\nOn=true\r\n");
         fs.put(bak, SETTINGS);
         let now = |p| (fs.read(p).unwrap(), fs.mtime(p).unwrap());
-        let before = (now(input), now(bak));
+        let before = (now(input), now(user), now(bak));
         let changes = plan(&fs, &inputs(&[], &[])).unwrap();
         assert!(
-            matches!(&changes[..2], [Change::Rebuilt { path: a, .. }, Change::Rebuilt { path: b, .. }]
-                if a == input && b == bak),
+            matches!(&changes[..3], [Change::Rebuilt { path: a, .. }, Change::Rebuilt { path: u, .. },
+                Change::Rebuilt { path: b, .. }] if a == input && u == user && b == bak),
             "{changes:?}"
         );
         let path = Path::new("QUEN/journal.jsonl");
@@ -1180,23 +1207,29 @@ mod tests {
             input,
             "[Exploration]\r\nIK_S=(Action=B)\r\nIK_W=(Action=A)\r\n",
         );
+        fs.put(user, "[ModMenu]\r\nOn=true\r\nRadius=5\r\n");
         fs.put(bak, SETTINGS.replace("VSync=true", "VSync=false"));
         let report = replay(&fs.read(path).unwrap(), &fs);
         assert!(report.clean() && report.kept.is_empty(), "{report:#?}");
-        assert_eq!((now(input), now(bak)), before);
-        // A key the user rebound in the game's menu is kept beside before the restore; the .bak isn't.
+        assert_eq!((now(input), now(user), now(bak)), before);
+        // A key the user rebound in the game's menu, and a value a mod menu wrote, are kept beside before the restore;
+        // the .bak isn't.
         fs.recycle(path).unwrap();
         let mut journal = Journal::create(&fs, path).unwrap();
         apply(&fs, &mut journal, &changes, &|| false).unwrap();
         let rebound = "[Exploration]\r\nIK_S=(Action=B)\r\nIK_W=(Action=Jump)\r\n";
+        let menu = "[ModMenu]\r\nRadius=9\r\nOn=true\r\n";
         fs.put(input, rebound);
+        fs.put(user, menu);
         fs.put(bak, "rewritten by the game");
         let report = replay(&fs.read(path).unwrap(), &fs);
         let kept = PathBuf::from("DOCS/input.settings.quen-current");
+        let kept_user = PathBuf::from("DOCS/user.settings.quen-current");
         assert!(report.clean(), "{report:#?}");
-        assert_eq!(report.kept, std::slice::from_ref(&kept));
+        assert_eq!(report.kept, [kept_user.clone(), kept.clone()]);
         assert_eq!(fs.read(&kept).unwrap(), rebound.as_bytes());
-        assert_eq!((now(input), now(bak)), before);
+        assert_eq!(fs.read(&kept_user).unwrap(), menu.as_bytes());
+        assert_eq!((now(input), now(user), now(bak)), before);
         let fs = game();
         let none = plan(&fs, &inputs(&[], &[])).unwrap();
         assert!(
@@ -1205,9 +1238,9 @@ mod tests {
         );
     }
 
-    /// A play session's default plan touches only general.ini's console and steam_appid.txt; input.settings
-    /// and the .bak stay the game's. A setting the user asked for (here VSync off) patches only that line, and then
-    /// both are kept as in a test boot.
+    /// A play session's default plan touches only general.ini's console and steam_appid.txt; input.settings,
+    /// user.settings and the .bak stay the game's. A setting the user asked for (here VSync off) patches only that line,
+    /// and then all three are kept as in a test boot.
     #[test]
     fn a_play_plan_changes_only_what_was_asked() {
         let fs = game();
@@ -1215,6 +1248,7 @@ mod tests {
             "DOCS/input.settings",
             "[Exploration]\r\nIK_W=(Action=A)\r\n",
         );
+        fs.put("DOCS/user.settings", "[ModMenu]\r\nOn=true\r\n");
         fs.put("DOCS/dx12user.settings.bak", SETTINGS);
         let mut inp = inputs(&[], &[]);
         (inp.play, inp.fg) = (true, true);
@@ -1251,7 +1285,7 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, Change::Rebuilt { .. }))
             .count();
-        assert_eq!(kept, 2, "{changes:?}");
+        assert_eq!(kept, 3, "{changes:?}");
     }
 
     fn file(name: &str, is_link: bool) -> Entry {
@@ -1264,36 +1298,50 @@ mod tests {
 
     /// Finding 23: test files copied into bin by hand before each boot and recycled after it. Staged, each is a placed
     /// copy; the user's file of that name (here in another case) is parked first and comes back; a log a staged mod
-    /// writes where none was is recycled; a file a park moves already isn't moved twice.
+    /// writes where none was is recycled; a file a park moves already isn't moved twice. Finding 49: a mod's menu XML
+    /// goes into the menu folder, the same way, with no log journaled.
     #[test]
     fn staged_files_land_park_what_is_there_and_replay_away() {
         let fs = game();
+        let game_dir = Path::new("GAME");
+        let menu_dir = menu_dir(game_dir);
         fs.put("GAME/bin/x64_dx12/w3fake.INI", "the user's ini");
         fs.put("GAME/bin/x64_dx12/Tweaks.asi", "the user's tweaks");
+        fs.put(menu_dir.join("modMenu.xml"), "the user's menu");
         for (name, bytes) in [
             ("W3Test.asi", "test asi"),
             ("W3Test.ini", "test ini"),
             ("W3Fake.ini", "test fake ini"),
             ("Tweaks.asi", "test tweaks"),
+            ("modMenu.XML", "test menu"),
         ] {
             fs.put(Path::new("PC").join(name), bytes);
         }
         let before = fs.files();
         let bin = [file("w3fake.INI", false), file("Tweaks.asi", false)];
+        let menu = [file("modMenu.xml", false), file("audio.xml", false)];
         let mut inp = inputs(&[], &bin);
         inp.park = "Tweaks.asi";
         let mut changes = plan(&fs, &inp).unwrap();
-        let files: Vec<PathBuf> = ["W3Test.asi", "W3Test.ini", "W3Fake.ini", "Tweaks.asi"]
-            .iter()
-            .map(|n| Path::new("PC").join(n))
-            .collect();
-        let game_dir = Path::new("GAME");
-        let staged = stage(&fs, game_dir, &files, park::W3_NEVER_PARK, &bin, &changes).unwrap();
+        let files: Vec<PathBuf> = [
+            "W3Test.asi",
+            "W3Test.ini",
+            "W3Fake.ini",
+            "Tweaks.asi",
+            "modMenu.XML",
+        ]
+        .iter()
+        .map(|n| Path::new("PC").join(n))
+        .collect();
+        let never = park::W3_NEVER_PARK;
+        let staged = stage(&fs, game_dir, &files, never, &bin, &menu, &changes).unwrap();
         let bin_dir = bin_dir(game_dir);
         let show = |p: &str| bin_dir.join(p).display().to_string();
         let pc = |p: &str| Path::new("PC").join(p).display().to_string();
         let lines: Vec<String> = staged.iter().map(Change::summary).collect();
         let parked = game_dir.join(PARKED).join("bin").join("w3fake.INI");
+        let parked_menu = game_dir.join(PARKED).join("menu").join("modMenu.xml");
+        let user_menu = menu_dir.join("modMenu.xml");
         assert_eq!(
             lines,
             [
@@ -1303,6 +1351,8 @@ mod tests {
                 format!("stage {} -> {}", pc("W3Fake.ini"), show("w3fake.INI")),
                 // The park moves Tweaks.asi already: only the copy.
                 format!("stage {} -> {}", pc("Tweaks.asi"), show("Tweaks.asi")),
+                format!("park {} -> {}", user_menu.display(), parked_menu.display()),
+                format!("stage {} -> {}", pc("modMenu.XML"), user_menu.display()),
                 format!(
                     "recycle {} at the end if the game writes it (game_logs keeps a copy)",
                     show("W3Test.log")
@@ -1326,6 +1376,8 @@ mod tests {
         assert_eq!(read("w3fake.INI"), "test fake ini");
         assert_eq!(read("Tweaks.asi"), "test tweaks");
         assert_eq!(fs.read(&parked).unwrap(), b"the user's ini");
+        assert_eq!(fs.read(&user_menu).unwrap(), b"test menu");
+        assert_eq!(fs.read(&parked_menu).unwrap(), b"the user's menu");
         // The staged mod logs; the replay recycles its log and the copies, and puts the user's files back.
         fs.put(bin_dir.join("W3Test.log"), "a staged mod's log");
         let report = replay(&fs.read(path).unwrap(), &fs);
@@ -1339,10 +1391,12 @@ mod tests {
                 "{name}: {report:#?}"
             );
         }
+        assert!(report.recycled.contains(&user_menu), "{report:#?}");
     }
 
-    /// Each refusal comes before any change, naming the file: a name quen never parks, a folder or link in bin, a
-    /// second file of one name (in any case), a file another change of the launch makes, a file it can't read.
+    /// Each refusal comes before any change, naming the file: a name quen never parks, a folder or link in bin or the
+    /// menu folder, a second file of one name (in any case), a file another change of the launch makes, a file it can't
+    /// read.
     #[test]
     fn staging_refuses_before_any_change() {
         let fs = game();
@@ -1352,6 +1406,7 @@ mod tests {
         fs.put("PC/a/W3Test.asi", "x");
         fs.put("PC/b/w3test.ASI", "x");
         fs.put("PC/steam_appid.txt", "x");
+        fs.put("PC/hud.xml", "x");
         let before = fs.files();
         let bin = [
             Entry {
@@ -1361,11 +1416,19 @@ mod tests {
             },
             file("Linked.asi", true),
         ];
+        let menu = [file("hud.xml", true)];
         let earlier = plan(&fs, &inputs(&[], &bin)).unwrap();
         for (files, why) in [
             (&["PC/W3Quen.asi"][..], "never parks"),
             (&["PC/plugins.asi"], "a folder or link"),
-            (&["PC/Linked.asi"], "a folder or link"),
+            (
+                &["PC/Linked.asi"],
+                "a folder or link of that name is in bin",
+            ),
+            (
+                &["PC/hud.xml"],
+                "a folder or link of that name is in the menu folder",
+            ),
             (&["PC/a/W3Test.asi", "PC/b/w3test.ASI"], "a second file"),
             (
                 &["PC/steam_appid.txt"],
@@ -1380,6 +1443,7 @@ mod tests {
                 &files,
                 park::W3_NEVER_PARK,
                 &bin,
+                &menu,
                 &earlier,
             );
             let err = got.unwrap_err();

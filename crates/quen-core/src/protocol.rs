@@ -149,6 +149,11 @@ pub enum Verb {
         count: u32,
         equip: bool,
     },
+    /// Read the alive actors within `radius` of the player, nearest first, at most `max`: each one's position, heading,
+    /// velocity, names and flags (the reply's data); changes nothing. `radius` above 0 to [`MAX_ACTORS_RADIUS`], `max`
+    /// 1 to [`MAX_ACTORS`].
+    #[serde(rename = "world.actors")]
+    WorldActors { radius: f32, max: u32 },
 }
 
 /// What `photo.reset` puts back.
@@ -178,6 +183,11 @@ pub const MAX_TICK_S: f32 = 10.0;
 pub const MAX_ITEM_BYTES: usize = 200;
 /// The most of one item `items.add` adds.
 pub const MAX_ITEM_COUNT: u32 = 1000;
+/// The widest `world.actors` radius, in the scripts' units (metres).
+pub const MAX_ACTORS_RADIUS: f32 = 100.0;
+/// The most actors one `world.actors` reply holds: 50 of them, names cut at 80 characters, stay under
+/// [`MAX_REPLY_BYTES`].
+pub const MAX_ACTORS: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +285,15 @@ impl Verb {
                 Err(Error::Invalid(format!(
                     "items.add: a name of 1 to {MAX_ITEM_BYTES} bytes, no control character, and a count of 1 \
                      to {MAX_ITEM_COUNT}"
+                )))
+            }
+            Verb::WorldActors { radius, max }
+                if !(*radius > 0.0
+                    && *radius <= MAX_ACTORS_RADIUS
+                    && (1..=MAX_ACTORS).contains(max)) =>
+            {
+                Err(Error::Invalid(format!(
+                    "world.actors: a radius above 0 to {MAX_ACTORS_RADIUS} and a max of 1 to {MAX_ACTORS}"
                 )))
             }
             Verb::PhotoTime { minute } if !(0.0..1440.0).contains(minute) => Err(Error::Invalid(
@@ -480,6 +499,10 @@ mod tests {
                 count: 1,
                 equip: true,
             },
+            Verb::WorldActors {
+                radius: 30.0,
+                max: 20,
+            },
         ]
     }
 
@@ -575,6 +598,17 @@ mod tests {
                 count,
                 equip: false,
             });
+        }
+        // Finding 51: world.actors' radius and max.
+        for (radius, max) in [
+            (0.0, 1),
+            (-1.0, 1),
+            (MAX_ACTORS_RADIUS + 0.5, 1),
+            (f32::NAN, 1),
+            (30.0, 0),
+            (30.0, MAX_ACTORS + 1),
+        ] {
+            invalid(Verb::WorldActors { radius, max });
         }
         for line in [
             r#"{"id":1,"ttl_ms":1,"verb":"photo.mode"}"#,
