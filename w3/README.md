@@ -274,9 +274,11 @@ The Tracy modes (from 0.1.3). `test.exe` has an empty 41 MiB region (`.bss`, no 
 
 ## Offline script compile
 
-REDkit's `wcc_lite compilescripts <dir> -out=<dir>` compiles a script tree without the game. Run it with `The Witcher 3 REDkit\bin\x64_RedKit` as the working folder, on a scratch copy of the game's `content\content0\scripts` plus the mods' scripts. Never point it at the game folder. quen's `script_compile` does all of this.
+REDkit's `wcc_lite compilescripts <dir> -out=<dir> -agreetoterms` compiles a script tree without the game. Run it with `The Witcher 3 REDkit\bin\x64_RedKit` as the working folder, on a scratch copy of the game's `content\content0\scripts` plus the mods' scripts. Never point it at the game folder. quen's `script_compile` does all of this.
 
-wcc_lite rewrites `editoruser.settings`, `profile.settings` and their `.bak` in `Documents\The Witcher 3` on every run (checked 2026-10-20: the same bytes, new write times; nothing else there, no registry value under `HKCU\Software\CD Projekt RED`). By hand, copy those four files before the run and put them back after; `script_compile` does it, journaled.
+`-agreetoterms` accepts REDkit's licence (`wcc_eula.rtf`) for the run and skips its dialog. Without it, wcc_lite shows the dialog on every run: the 2026-10-07 build reads its saved answer (`HKCU\Software\CD Projekt RED\Mod Tools\1.0\DoNotShowEula`) with a 0-byte buffer, the read fails, and it writes 0 over the answer.
+
+wcc_lite rewrites `editoruser.settings`, `profile.settings` and their `.bak` in `Documents\The Witcher 3` on every run (checked 2026-10-20 with `-agreetoterms`: the same bytes, new write times; nothing else there, no registry value under `HKCU\Software\CD Projekt RED`). By hand, copy those four files before the run and put them back after; `script_compile` does it, journaled.
 
 Checked 2026-10-17 for 0.1.0 and 0.1.1, 2026-10-18 for 0.1.2 and 2026-10-19 for 0.1.3, whose `quen.ws` is 0.1.2's, 0.1.4, 0.1.5, 0.1.6, 0.1.7, 0.1.8, 0.1.9 and 0.1.10, and 2026-10-20 for 0.1.10's rebuild with `world.actors`, for 0.1.11 and for 0.1.12 (the same results, 0.1.12 without the all-mods run; its control was planted in `world.actors`' class branch; as shipped, seven imports can't bind, `QUEN_CamAt` the new one in 0.1.2), with `quen.ws`, the Native Bridge's `Mods\modNativeBridge\content\scripts\imports.ws` and the W3 Game State Bridge's `w3gsb.ws`, about 40 s per run:
 - **As shipped:** exit 1, and the only errors are the six `import function`s that can't bind (`QUEN_Next`, `QUEN_Reply`, `QUEN_State`, `W3GSB_Push`, `WNB_GetApiVersion`, `WNB_StringToName`). wcc_lite has no Native Bridge, so import binding can only be checked in the game.
