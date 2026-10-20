@@ -322,8 +322,8 @@ entities share matches neither, and unknown hex never becomes an entity.
 | `function` | its KB name; unnamed: `fn_<stamp>_<rva>` | `Post_Tonemap`, `fn_6AC555A3_34D4D0` | KB scan (names.tsv) |
 | `label` | its KB name (a name inside code or data) | `CRenderSkinningData_vftable_slot10` | KB scan (names.tsv) |
 | `hook` | `<mod>:<hook kind>:<function key>` at a function's start, else `<mod>:<hook kind>:<stamp>_<rva>` | `W3ElementMap:hook:ElementMap_AllocIndex` | KB scan (hooks.tsv) |
-| `patch` | its name in patches.tsv | `cull_disable` | KB scan (patches.tsv) |
-| `field` | `<struct>+0x<offset>`, or `<struct>.<name>` once named | `cvar_object.value` (cvar_layout.tsv's columns) | KB scan (cvar_layout.tsv) |
+| `patch` | its name in patches.tsv or instance_patches.tsv (an instance patch's rva: its class's vtable) | `cull_disable` | KB scan (patches.tsv, instance_patches.tsv) |
+| `field` | `<struct>+0x<offset>`, or `<struct>.<name>` once named | `cvar_object.value` (cvar_layout.tsv's columns) | KB scan (cvar_layout.tsv; instance_patches.tsv: `<class>+0x<offset>`) |
 | `shader` | the RenoDX devkit's hash: `0x` + 8 uppercase hex | `0x382CDBDB` | KB claim import |
 | `surface` | a render target, texture or buffer as a frame uses it | `RTN_PostProcessTempHalf3` | not yet |
 | `stage` | a slug | `tonemap` | not yet |
@@ -334,7 +334,7 @@ entities share matches neither, and unknown hex never becomes an entity.
 Draw indices, per-run resource handles and row ids are never keys.
 
 **Link relations** (`rel`, from → to): `runs` (stage → shader), `draws` (function → shader), `reads` / `writes`
-(shader or stage → surface), `sets` (function → cbreg or field), `reads_cvar` (function → cvar), `calls` (function →
+(shader or stage → surface), `sets` (function or instance patch → cbreg or field), `reads_cvar` (function → cvar), `calls` (function →
 function: the REA import writes it from callers and callees records whose both ends are known functions of that
 build), `in` (label, hook site or patch → the function holding it), `hooks` (hook → function: the KB scan writes it for
 a hook at a function's start), `patches` (patch → function), `controls` (setting → cvar), `same_as` (any → the same

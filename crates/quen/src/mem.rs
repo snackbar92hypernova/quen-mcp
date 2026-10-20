@@ -16,7 +16,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::journal::sha256_hex;
-use quen_core::ledger::Capture;
+use quen_core::ledger::{Capture, Ledger};
 use quen_core::mem::{
     self, Elements, Field, Filter, Find, Image, Kind, Memory, Module, Op, Pattern, Region, Scope,
     Section, Type, Walk, Which, Write,
@@ -34,6 +34,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
+use crate::config::Config;
 use crate::game::{self, Ctx, Fields, ctx, flag, hex_bytes, text};
 use crate::ledger::{self, INLINE_BYTES};
 use crate::session::{self, Call, Done, Session};
@@ -162,7 +163,8 @@ pub fn tools() -> Vec<Value> {
                 1000, counted before filter); pass next as from for the page after. deadline_s (default 60, at most \
                 600) ends a page early: stopped says why, next where to go on. skipped lists the pages that couldn't be read. Numbers and \
                 provenance as mem_read's. A result over 16 KB comes back as its first hits and the path of a JSON \
-                file holding all of it, a captures row (ledger.captures).",
+                file holding all of it, a captures row (ledger.captures); with keep, any result also goes to that \
+                file and row.",
             "inputSchema": schema(json!({
                 "value": number("the qword to find"),
                 "values": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64, "description": "qwords to find in one pass: numbers or 0x hex"},
@@ -176,7 +178,26 @@ pub fn tools() -> Vec<Value> {
                 "from": number("search from"),
                 "limit": limit,
                 "deadline_s": deadline,
+                "keep": {"type": "boolean", "description": "true: the whole result also goes to a JSON file with a captures row, as one over 16 KB does (mem_diff compares two). Default false"},
             }), &[]),
+        }),
+        json!({
+            "name": "mem_diff",
+            "description": "Compare two mem_find results kept as captures (keep, or over 16 KB), by hit address: added \
+                (hits only b has), removed (only a), changed (address and each other key whose values differ, as {a, \
+                b}), in address order; counts of each and of the same; a and b, each one's capture_id, boot, \
+                read_at, args, hits (how many), next and stopped. Reads quen's files only, no session needed. \
+                Refused: a capture that isn't a mem_find result, its file gone or changed since. A result over 16 KB \
+                comes back as the first entries of each list and the path of a JSON file holding all of it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer", "description": "the earlier result's captures id"},
+                    "b": {"type": "integer", "description": "the later result's captures id"},
+                },
+                "required": ["a", "b"],
+                "additionalProperties": false,
+            },
         }),
         json!({
             "name": "mem_follow",
@@ -239,10 +260,10 @@ pub fn tools() -> Vec<Value> {
             "description": "Write a field in every live instance of a class, as a row of the KB's instance_patches.tsv \
                 defines it for the running build. The client asks the user on every call (user_ok is only your word): \
                 never route around a denial. Instances: the 8-byte-aligned qwords holding the class's vtable pointer \
-                in the image and private regions (mem_find's default scope), at most 1000. Each is written only in a \
-                writable region and while, read again right before its write, its first qword is the vtable pointer \
-                and its field holds the row's old value. Instances created later keep their value. counts: found, \
-                matched, written, already, left; instances: address, status, why. One journaled step; it taints saves. \
+                in the image and private regions, at most 1000; with addresses, only those listed. Each is written only in a writable region and while, read again right before its write, its \
+                first qword is the vtable pointer and its field holds the row's old value. Later instances keep \
+                their value. counts: found, unlisted, matched, written, already, left; instances: address, status, \
+                why. One journaled step; it taints saves. \
                 Refused, nothing written: no user_ok; no row of that name for the running build, boundaries-checked \
                 not set, a row that breaks the rules; the search stopped (deadline_s) or found over 1000; no instance \
                 written; with needs: no instance_patches.tsv. The rules: quen_guide. Numbers and provenance as \
@@ -251,7 +272,8 @@ pub fn tools() -> Vec<Value> {
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": schema(json!({
                 "name": instances,
-                "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation the row, the class, the field's old and new values and that every live instance found is written (the count comes back), and they agreed. Required."},
+                "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation the row, the class, the field's old and new values and that every live instance found (with addresses, every one listed) is written (the count comes back), and they agreed. Required."},
+                "addresses": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 1000, "description": "only these instances (mem_find hits' addresses): numbers or 0x hex. counts' unlisted: the ones found and not listed; a listed one the search didn't find is left"},
                 "deadline_s": deadline,
             }), &["name", "user_ok"]),
         }),
@@ -834,8 +856,10 @@ fn find(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         "from",
         "limit",
         "deadline_s",
+        "keep",
     ];
     let cx = checked(session, args, &known)?;
+    flag(args, "keep")?;
     let values = match (args.get("value"), args.get("values")) {
         (Some(v), None) => vec![
             unsigned(v)
@@ -1024,7 +1048,8 @@ fn regions(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, D
 /// `build`, `read_at`) and the world in its `state` (`measurements.world`'s words). With `list`, a result over
 /// [`INLINE_BYTES`] goes whole to `<tool>-<secs>-<random>.json` in the session's capture folder, under a `header` (the
 /// tool, the call's arguments less its token, the boot, the build, the image base, `read_at`), with a captures row
-/// (`ledger.captures`); inline only the first of its `list` that fit (`truncated`, `file`).
+/// (`ledger.captures`); inline only the first of its `list` that fit (`truncated`, `file`). With `keep` in `args`, any
+/// result goes there too, kept whole inline when it fits.
 fn result(
     cx: &Ctx,
     call: &mut Call,
@@ -1040,7 +1065,8 @@ fn result(
     out["build"] = json!(game.image.stamp);
     out["read_at"] = json!(session::utc_ms(now));
     out["state"] = json!({"world": crate::measure::world(cx)});
-    let Some(list) = list.filter(|_| out.to_string().len() > INLINE_BYTES) else {
+    let big = out.to_string().len() > INLINE_BYTES;
+    let Some(list) = list.filter(|_| big || args["keep"] == true) else {
         return Ok(fields(out));
     };
     let mut args = args.clone();
@@ -1060,16 +1086,18 @@ fn result(
     let file = ledger::spill(&dir, &format!("{tool}-"), &data, &mut listed)?;
     call.artifact(&file);
     let mut out = fields(out);
-    if let Some(Value::Array(items)) = out.get_mut(list) {
-        let mut size = 0;
-        let fit = items.iter().take_while(|item| {
-            size += item.to_string().len() + 1;
-            size <= INLINE_BYTES / 2
-        });
-        let fit = fit.count();
-        items.truncate(fit);
+    if big {
+        if let Some(Value::Array(items)) = out.get_mut(list) {
+            let mut size = 0;
+            let fit = items.iter().take_while(|item| {
+                size += item.to_string().len() + 1;
+                size <= INLINE_BYTES / 2
+            });
+            let fit = fit.count();
+            items.truncate(fit);
+        }
+        out.insert("truncated".into(), json!(true));
     }
-    out.insert("truncated".into(), json!(true));
     out.insert("file".into(), json!(file));
     let name = file.file_name().unwrap_or_default().to_string_lossy();
     let row = Capture {
@@ -1130,30 +1158,57 @@ fn patch(session: &Session, call: &mut Call, args: &Value, op: Op) -> Result<Fie
 
 fn patch_instances(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let tool = "mem_patch_instances";
-    let cx = checked(session, args, &["name", "user_ok", "deadline_s"])?;
+    let cx = checked(
+        session,
+        args,
+        &["name", "user_ok", "addresses", "deadline_s"],
+    )?;
     let name = text(args, "name")?;
     if !flag(args, "user_ok")? {
         let why = "user_ok: tell the user in this conversation the row, the class, the old and new values and that \
-                   every live instance found is written, and get their OK, first";
+                   every live instance found (with addresses, every one listed) is written, and get their OK, first";
         return Err(why.to_string().into());
     }
+    let only = match args.get("addresses") {
+        None => None,
+        Some(v) => Some(
+            v.as_array()
+                .filter(|a| (1..=mem::MAX_INSTANCES).contains(&a.len()))
+                .and_then(|a| a.iter().map(unsigned).collect::<Option<Vec<u64>>>())
+                .ok_or_else(|| {
+                    format!(
+                        "addresses must be 1 to {} numbers or 0x hex",
+                        mem::MAX_INSTANCES
+                    )
+                })?,
+        ),
+    };
     let budget = deadline(args)?;
     let rows = cx.kb(&doctor::KB_INSTANCES, tool, mem::from_instances_tsv)?;
     let game = cx.game()?;
     let image = &game.image;
     let mut tick = ticker(call, budget);
-    let planned = mem::plan_instances(&rows, name, &image.stamp, image.base, &game, &mut tick);
+    let only = only.as_deref();
+    let planned = mem::plan_instances(
+        &rows,
+        name,
+        &image.stamp,
+        image.base,
+        only,
+        &game,
+        &mut tick,
+    );
     drop(tick);
     let (row, found) = planned.map_err(|r| format!("{name}: {r}"))?;
     call.lap("search");
-    let total = found.writes.len() + found.already.len() + found.left.len();
+    let (total, unlisted) = (found.found, found.unlisted);
     let mut fields = Map::new();
     let results = match found.writes.len() {
         0 => Vec::new(),
         n => {
             let what = format!("{tool} {name}: {n} instances of {}", row.class);
-            let meta = json!({"name": row.name, "class": row.class, "found": total, "matched": n,
-                              "already": found.already.len()});
+            let meta = json!({"name": row.name, "class": row.class, "found": total, "unlisted": unlisted,
+                              "matched": n, "already": found.already.len()});
             let (vtable, writes) = (found.vtable, &found.writes);
             cx.write_instances(&game, &what, vtable, row.offset, meta, writes, &mut fields)?
         }
@@ -1177,7 +1232,7 @@ fn patch_instances(session: &Session, call: &mut Call, args: &Value) -> Result<F
     done.extend(already.map(|a| json!({"address": at(*a), "status": "already"})));
     fields.insert("row".into(), row.json());
     fields.insert("vtable".into(), at(found.vtable));
-    let counts = json!({"found": total, "matched": found.writes.len(), "written": written,
+    let counts = json!({"found": total, "unlisted": unlisted, "matched": found.writes.len(), "written": written,
                         "already": found.already.len(), "left": left_n});
     fields.insert("counts".into(), counts);
     fields.insert("instances".into(), json!(done));
@@ -1268,6 +1323,68 @@ fn unpatch_instances(session: &Session, call: &mut Call, args: &Value) -> Result
         return Err(Done::RefusedWith(why, out));
     }
     Ok(out)
+}
+
+/// `mem_diff`, read-only: the mem_find results kept as captures `a` and `b` (their ids), each file checked against its
+/// captures row's sha256, compared by [`mem::diff`]. A result over [`INLINE_BYTES`] goes whole to a file where
+/// ledger_query puts its own, inline only the first entries of each list that fit (`truncated`, `file`).
+pub(crate) fn diff(
+    config: &Config,
+    args: &Value,
+    artifacts: &mut Vec<Value>,
+) -> Result<Fields, String> {
+    ledger::object(args, &["a", "b"])?;
+    let db = config.state_dir().join("quen.db");
+    let l = Ledger::open_readonly(&db).map_err(|e| format!("the ledger: {e}"))?;
+    let kept = |key: &str| -> Result<(Value, Vec<mem::Row>), String> {
+        let id = args.get(key).and_then(Value::as_i64);
+        let id = id.ok_or(format!("{key} must be a captures id"))?;
+        let sql = "SELECT path, sha256, method FROM captures WHERE id = ?1";
+        let found = l.query(sql, &[json!(id)], Duration::from_secs(5));
+        let row = found.map_err(|e| format!("the ledger: {e}"))?.rows.pop();
+        let Some([Value::String(path), Value::String(sha), method]) = row.as_deref() else {
+            return Err(format!("{key}: no capture {id}"));
+        };
+        if *method != "mem_find" {
+            return Err(format!(
+                "{key}: capture {id} is no mem_find result (method {method})"
+            ));
+        }
+        let file = config.capture_root().join(path);
+        let at = |e: &dyn Display| format!("{key}: {}: {e}", file.display());
+        let bytes = fs::read(&file).map_err(|e| at(&e))?;
+        if sha256_hex(&bytes) != *sha {
+            return Err(at(&"changed since quen wrote it"));
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|e| at(&e))?;
+        let hits: Vec<mem::Row> =
+            serde_json::from_value(data["hits"].clone()).map_err(|e| at(&e))?;
+        let header = &data["header"];
+        let about = json!({"capture_id": id, "boot": header["boot"], "read_at": data["read_at"],
+                           "args": header["args"], "hits": hits.len(), "next": data["next"], "stopped": data["stopped"]});
+        Ok((about, hits))
+    };
+    let ((about_a, a), (about_b, b)) = (kept("a")?, kept("b")?);
+    let mut out = mem::diff(&a, &b);
+    out["a"] = about_a;
+    out["b"] = about_b;
+    if out.to_string().len() > INLINE_BYTES {
+        let file = ledger::spill(&ledger::queries(config), "mem_diff-", &out, artifacts)?;
+        for list in ["added", "removed", "changed"] {
+            if let Some(Value::Array(items)) = out.get_mut(list) {
+                let mut size = 0;
+                let fit = items.iter().take_while(|item| {
+                    size += item.to_string().len() + 1;
+                    size <= INLINE_BYTES / 6
+                });
+                let fit = fit.count();
+                items.truncate(fit);
+            }
+        }
+        out["truncated"] = json!(true);
+        out["file"] = json!(file);
+    }
+    Ok(fields(out))
 }
 
 #[cfg(test)]
@@ -1972,7 +2089,8 @@ pub(crate) mod tests {
 
         let out = run(&mut session, "mem_patch_instances", on("steer"));
         assert_eq!(out["ok"], true, "{out}");
-        let counts = json!({"found": 4, "matched": 3, "written": 3, "already": 0, "left": 1});
+        let counts =
+            json!({"found": 4, "unlisted": 0, "matched": 3, "written": 3, "already": 0, "left": 1});
         assert_eq!(out["counts"], counts, "{out}");
         assert_eq!(
             obj_fields(&mut session),
@@ -2091,6 +2209,90 @@ pub(crate) mod tests {
             "{gone}"
         );
         assert_eq!(obj_fields(&mut session), start);
+    }
+
+    /// mem_patch_instances with addresses writes only the listed instances, and mem_unpatch_instances undoes those;
+    /// mem_find with keep keeps a small result whole, and mem_diff of the finds before and after names the field
+    /// written. mem_diff refuses a capture of another tool, one not there and a file changed since.
+    #[test]
+    fn scoped_instance_patches_and_kept_find_diffs() {
+        let fx = Fake::new("memscope");
+        fs::write(fx.dir.join("kb/instance_patches.tsv"), instances_tsv()).unwrap();
+        let mut session = fx.session();
+        let cx = ctx(&session, &json!({"token": "tok"}), &[]).unwrap();
+        let base = cx.game().unwrap().image.base;
+        let obj = |i: u64| x(base + rva(OBJS.address()) + i * size_of::<Obj>() as u64);
+        let vtable = x(base + rva(VTABLE.as_ptr() as u64));
+        let find = |session: &mut Session| {
+            let w = json!([{"name": "w", "offset": "0x58", "type": "f32"}]);
+            let args =
+                json!({"token": "tok", "value": vtable, "context": 0, "fields": w, "keep": true});
+            let out = run(session, "mem_find", args);
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(out["hits"].as_array().unwrap().len(), 4, "{out}");
+            assert!(out.get("truncated").is_none(), "{out}");
+            (out["ledger"]["captures"][0].clone(), out["file"].clone())
+        };
+        let (before, _) = find(&mut session);
+
+        // Instance 1, and an address that holds none: only 1 is written.
+        let scoped = json!({"token": "tok", "name": "steer", "user_ok": true, "addresses": [obj(1), x(base)]});
+        let out = run(&mut session, "mem_patch_instances", scoped);
+        let counts =
+            json!({"found": 4, "unlisted": 3, "matched": 1, "written": 1, "already": 0, "left": 1});
+        assert_eq!(out["counts"], counts, "{out}");
+        let why = "the search found no vtable pointer there";
+        assert_eq!(out["instances"][1]["why"], why, "{out}");
+        let v = |f: f32| json!(f);
+        let start = [v(0.2), v(0.2), v(0.5), v(0.2)];
+        assert_eq!(obj_fields(&mut session), [v(0.2), v(0.35), v(0.5), v(0.2)]);
+        let (after, file) = find(&mut session);
+
+        let diff = |a: &Value, b: &Value| {
+            crate::ledger::call(&fx.shared, "mem_diff", &json!({"a": a, "b": b}))
+        };
+        let d = diff(&before, &after);
+        let counts = json!({"added": 0, "removed": 0, "changed": 1, "same": 3});
+        assert_eq!(d["counts"], counts, "{d}");
+        let changed = json!([{"address": obj(1), "w": {"a": 0.2f32, "b": 0.35f32}}]);
+        assert_eq!(d["changed"], changed, "{d}");
+        assert_eq!(
+            (
+                &d["a"]["capture_id"],
+                &d["a"]["hits"],
+                &d["a"]["args"]["keep"]
+            ),
+            (&before, &json!(4), &json!(true)),
+            "{d}"
+        );
+        assert_eq!(d["b"]["boot"], 1, "{d}");
+
+        let off = json!({"token": "tok", "name": "steer"});
+        let off = run(&mut session, "mem_unpatch_instances", off);
+        let counts = json!({"applied": 1, "restored": 1, "left": 0});
+        assert_eq!(off["counts"], counts, "{off}");
+        assert_eq!(obj_fields(&mut session), start);
+
+        for bad in [json!([]), json!(["nope"])] {
+            let args = json!({"token": "tok", "name": "steer", "user_ok": true, "addresses": bad});
+            let out = run(&mut session, "mem_patch_instances", args);
+            let why = out["reason"].as_str().unwrap();
+            assert!(why.starts_with("addresses must be"), "{out}");
+        }
+        let q = json!([{"name": "q", "offset": 0, "type": "u64"}]);
+        let walk =
+            json!({"token": "tok", "address": x(base), "stride": 8, "count": 2000, "fields": q});
+        let walked = run(&mut session, "mem_walk", walk)["ledger"]["captures"][0].clone();
+        fs::write(file.as_str().unwrap(), "{}").unwrap(); // this test's own capture
+        for (b, why) in [
+            (walked, "is no mem_find result"),
+            (json!(999), "b: no capture 999"),
+            (after, "changed since quen wrote it"),
+        ] {
+            let d = diff(&before, &b);
+            assert_eq!(d["refused"], true, "{d}");
+            assert!(d["reason"].as_str().unwrap().contains(why), "{d}");
+        }
     }
 
     /// mem_regions lists the dummy game's image sections and private regions with their protection; mem_find and mem_scan

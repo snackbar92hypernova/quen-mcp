@@ -58,10 +58,10 @@ const LONG: [&str; 16] = [
 ];
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
-/// every unannotated call). Their own files there count as nothing changed: ledger_query's spill files, and the mem
-/// and data tools' results over 16 KB with their captures rows. world_get, world_actors and game_listsaves read through
-/// the game's channel; game_scriptlog reads the game's script log.
-const READ_ONLY: [&str; 21] = [
+/// every unannotated call). Their own files there count as nothing changed: ledger_query's and mem_diff's spill files,
+/// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors and
+/// game_listsaves read through the game's channel; game_scriptlog reads the game's script log.
+const READ_ONLY: [&str; 22] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -80,6 +80,7 @@ const READ_ONLY: [&str; 21] = [
     "mem_walk",
     "mem_find",
     "mem_regions",
+    "mem_diff",
     "data_find",
     "data_read",
     "data_scan",
@@ -577,7 +578,7 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                 "capture_usage" => tool_result(&disk::usage(shared, &args)),
                 // Tables of contents and folder listings only: beside a live session, from any connection.
                 "data_find" => tool_result(&data::find(shared, &args)),
-                name if name.starts_with("ledger_") => {
+                name if name.starts_with("ledger_") || name == "mem_diff" => {
                     tool_result(&ledger::call(shared, name, &args))
                 }
                 // Every other listed tool runs on the session thread, one at a time.

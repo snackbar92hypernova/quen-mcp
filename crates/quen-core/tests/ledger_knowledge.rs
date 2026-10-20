@@ -66,12 +66,13 @@ fn a_kb_scan_mirrors_the_tables_indexes_the_notes_and_repeats_as_a_no_op() {
             scan.names,
             scan.hooks,
             scan.patches,
+            scan.instance_patches,
             scan.cvar_layouts,
             scan.rows_unknown_build
         ),
-        (4, 2, 1, 1, 1)
+        (4, 2, 1, 1, 1, 1)
     );
-    assert_eq!((scan.notes, scan.links), (2, 1));
+    assert_eq!((scan.notes, scan.links), (2, 2));
 
     let entities = rows(
         &l,
@@ -88,6 +89,8 @@ fn a_kb_scan_mirrors_the_tables_indexes_the_notes_and_repeats_as_a_no_op() {
         e("hook", "ModB:mid-hook:0BADF00D_1234", Some("inside alpha")),
         e("label", "Gamma_Table", None),
         e("patch", "cull_off", None),
+        e("patch", "steer_wide", None),
+        e("field", "CFake+0x58", None),
     ];
     want.extend(
         ["default", "flags", "group", "live", "name", "value"]
@@ -100,30 +103,40 @@ fn a_kb_scan_mirrors_the_tables_indexes_the_notes_and_repeats_as_a_no_op() {
         rows(
             &l,
             "SELECT e.key, a.rva, a.offset, a.kb_source, a.confidence FROM entity_addresses a
-             JOIN entities e ON e.id = a.entity_id WHERE e.key IN ('Alpha_Draw', 'Beta_Setup', 'cvar_object.value')
+             JOIN entities e ON e.id = a.entity_id
+             WHERE e.key IN ('Alpha_Draw', 'Beta_Setup', 'cvar_object.value', 'steer_wide', 'CFake+0x58')
              ORDER BY e.key",
             &[]
         ),
         [
             vec![json!("Alpha_Draw"), json!(0x1000), Value::Null, source("names.tsv"), json!("O")],
             vec![json!("Beta_Setup"), json!(0x2000), Value::Null, source("names.tsv"), json!("I")],
+            vec![json!("CFake+0x58"), Value::Null, json!(0x58), source("instance_patches.tsv"), Value::Null],
             vec![json!("cvar_object.value"), Value::Null, json!(0x20), source("cvar_layout.tsv"), Value::Null],
+            vec![json!("steer_wide"), json!(0x5000), Value::Null, source("instance_patches.tsv"), Value::Null],
         ]
     );
-    // A hook at a function's start hooks it; one inside a function is keyed by its site, unlinked.
+    // A hook at a function's start hooks it; one inside a function is keyed by its site, unlinked. An instance patch
+    // sets its field.
+    let link = |src: &str, rel: &str, dst: &str, file: &str| {
+        vec![
+            json!(src),
+            json!(rel),
+            json!(dst),
+            json!("kb"),
+            source(file),
+        ]
+    };
     assert_eq!(
         rows(
             &l,
-            "SELECT src_key, rel, dst_key, basis, kb_source FROM links_evidence",
+            "SELECT src_key, rel, dst_key, basis, kb_source FROM links_evidence ORDER BY src_key",
             &[]
         ),
-        [[
-            json!("ModA:hook:Alpha_Draw"),
-            json!("hooks"),
-            json!("Alpha_Draw"),
-            json!("kb"),
-            source("hooks.tsv")
-        ]]
+        [
+            link("ModA:hook:Alpha_Draw", "hooks", "Alpha_Draw", "hooks.tsv"),
+            link("steer_wide", "sets", "CFake+0x58", "instance_patches.tsv"),
+        ]
     );
 
     // Sections: the preamble, H2s and H3s with their parents; a fenced "##" is no heading.
@@ -228,7 +241,8 @@ fn a_kb_scan_mirrors_the_tables_indexes_the_notes_and_repeats_as_a_no_op() {
     );
     assert_eq!(snapshot(&l), before);
 
-    // An edit at a new commit: a renamed heading is a new section, the old one gone; a removed hook loses its link.
+    // An edit at a new commit: a renamed heading is a new section, the old one gone; a removed hook loses its link, the
+    // instance patch keeps its own.
     fs::write(db.dir().join("repo/.git/refs/heads/main"), "d".repeat(40)).unwrap();
     let note = kb.join("notes/alpha.md");
     fs::write(
@@ -251,9 +265,9 @@ fn a_kb_scan_mirrors_the_tables_indexes_the_notes_and_repeats_as_a_no_op() {
     let edited = l.scan_kb(&kb).unwrap();
     assert_eq!(
         (edited.sections_new, edited.sections_gone, edited.links),
-        (2, 2, 0)
+        (2, 2, 1)
     );
-    assert_eq!(rows(&l, "SELECT count(*) FROM links", &[]), [[json!(0)]]);
+    assert_eq!(rows(&l, "SELECT count(*) FROM links", &[]), [[json!(1)]]);
     let gone = rows(
         &l,
         "SELECT anchor FROM kb_sections WHERE gone_at IS NOT NULL ORDER BY anchor",
@@ -291,6 +305,13 @@ fn a_kb_scan_refuses_before_writing_anything() {
     fs::write(&names, good.replace(&sha(1), &sha(3))).unwrap();
     refused(l.scan_kb(&kb), "one KB, one build");
     fs::write(&names, &good).unwrap();
+    let instances = kb.join("instance_patches.tsv");
+    let rows_before = fs::read_to_string(&instances).unwrap();
+    fs::write(&instances, rows_before.replace("steer_wide", "cull_off")).unwrap();
+    refused(
+        l.scan_kb(&kb),
+        "cull_off names a patch in patches.tsv and one in instance_patches.tsv",
+    );
     fs::remove_dir_all(db.dir().join("repo/.git")).unwrap();
     refused(l.scan_kb(&kb), "git work tree");
     assert_eq!(

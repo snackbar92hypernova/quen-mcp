@@ -169,7 +169,7 @@ pub fn tools() -> Vec<Value> {
     ]
 }
 
-/// A `ledger_*` tool call, answered with the envelope.
+/// A `ledger_*` tool call, or mem_diff (it reads kept captures), answered with the envelope.
 pub fn call(shared: &Shared, name: &str, args: &Value) -> Value {
     let started = Instant::now();
     let mut artifacts = Vec::new();
@@ -193,6 +193,7 @@ pub fn call(shared: &Shared, name: &str, args: &Value) -> Value {
             "ledger_about" => {
                 done(about_args(args).and_then(|q| about(config, &q, &mut artifacts)))
             }
+            "mem_diff" => done(crate::mem::diff(config, args, &mut artifacts)),
             _ => Done::Refused(format!("unknown tool {name:?}")),
         },
     };
@@ -389,7 +390,7 @@ pub(crate) fn spill(
 }
 
 /// Where ledger_query and ledger_about put a result too big to answer inline.
-fn queries(config: &Config) -> PathBuf {
+pub(crate) fn queries(config: &Config) -> PathBuf {
     config.data_root.join("logs").join("queries")
 }
 
@@ -662,9 +663,9 @@ const KB_HELP: &str = "\
 quen kb: the RE knowledge base's index in the ledger. KB is its root, default kb in the config.
 
 quen kb scan [KB]
-    Indexes the KB at its git commit (read from its .git files): names.tsv, hooks.tsv, patches.tsv and
-    cvar_layout.tsv as entities, addresses and links; every .md note split at its H2 / H3 headings; the known
-    entities each section mentions. A scan of an unchanged KB adds nothing.
+    Indexes the KB at its git commit (read from its .git files): names.tsv, hooks.tsv, patches.tsv,
+    instance_patches.tsv and cvar_layout.tsv as entities, addresses and links; every .md note split at its H2 / H3
+    headings; the known entities each section mentions. A scan of an unchanged KB adds nothing.
 
 quen kb claims NOTE SECTION... [--scope TEXT] [--kb KB]
     One claim per table row of the note's sections (anchors, or heading labels such as 2d), keyed
