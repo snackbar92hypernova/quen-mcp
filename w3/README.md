@@ -29,6 +29,7 @@ The sources moved here from the maintainer's `witcher3-mods` repo (its `asi\quen
 | `mod\modQuen\content\scripts\local\quen.ws` | the one script: state, channel, camera paths, photo mode, console commands |
 | `pack.py` | builds, tests and packs the release zip |
 | `probes\walkers\` | a throwaway probe mod, never packed: do spawned NPCs walk where scripts tell them (its README) |
+| `probes\indicator\` | a throwaway probe mod and its fallback, never packed: can the game's own notification and a revived HUD module carry quen's lasting status line (its README) |
 | `out\` | build output and zips (ignored by git, never committed) |
 
 ## Release
