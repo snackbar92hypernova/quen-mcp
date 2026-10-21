@@ -73,6 +73,8 @@ fn main() {
         ["setup", ..] => std::process::exit(setup::cli(&args[1..])),
         ["doctor"] => std::process::exit(doctor::cli()),
         ["recover"] => std::process::exit(session::cli_recover()),
+        // Exit 0 on every path, even a bad argument: a hook's caller takes exit code 2 as a block.
+        ["focus", ..] => std::process::exit(focus::cli(&args[1..])),
         ["--version" | "-V"] => println!(
             "quen {} ({})",
             env!("CARGO_PKG_VERSION"),
@@ -99,6 +101,9 @@ fn main() {
             );
             eprintln!(
                 "       quen recover  replays a journal a crash or power loss left (session_recover)"
+            );
+            eprintln!(
+                "       quen focus --to client   Claude Code's hook: the chat to the front before quen's prompts while the game is (INSTALL.md section 4)"
             );
             eprintln!("       quen --version   the version and the git commit it was built from");
             std::process::exit(2);
