@@ -2607,3 +2607,197 @@ fn game_and_measure_tools_need_a_live_session() {
     let unknown = quen.request("tools/call", json!({"name": "game_nope", "arguments": {}}));
     assert_eq!(unknown["error"]["code"], -32602);
 }
+
+/// The owner's condition for Vortex: without its manifests nothing changes (no `vortex` in the plan, the launch or the
+/// end; `mods` lists what quen sees by its own kinds). With a synthetic Vortex that deployed modAlpha and a loader's
+/// dsound.dll (hardlinks of their staging copies, made here): the plan and the launch name each parked item's owner and
+/// what the boot leaves loaded, `mods` and doctor list them, the end reports the links whole after the replay, the mod
+/// set gets Vortex's version; a launch is refused while Vortex runs (its stand-in) or input.settings is a hardlink, with
+/// nothing changed.
+#[test]
+fn vortex_s_mods_get_owners_refusals_and_a_link_report_and_nothing_changes_without_it() {
+    let fx = Fixture::new();
+    let mut quen = Quen::start(&fx);
+    let park = json!({"park": "modAlpha,W3Fake.asi"});
+    let plan = quen.tool("session_plan", park.clone());
+    assert!(plan["ok"] == true && plan.get("vortex").is_none(), "{plan}");
+    let mods = quen.tool("mods", json!({}));
+    assert_eq!(
+        (&mods["vortex"], &mods["mods"]),
+        (&Value::Null, &json!([])),
+        "{mods}"
+    );
+    assert_eq!(
+        mods["outside"]["mods"],
+        json!(["modAlpha", "modNativeBridge", "modQuen"])
+    );
+    assert_eq!(
+        mods["outside"]["bin"],
+        json!(["W3Fake.asi", "W3Quen.asi", "WitcherNativeBridge.asi"])
+    );
+    let refused = quen.tool("mods", json!({"pair": ["nexus:1", "nexus:2"]}));
+    assert_eq!(refused["refused"], true, "{refused}");
+    let launched = launch_with(&mut quen, park.clone());
+    assert!(launched.get("vortex").is_none(), "{launched}");
+    let ended = quen.tool("session_end", json!({"token": launched["token"]}));
+    assert!(
+        ended["ok"] == true && ended.get("vortex").is_none(),
+        "{ended}"
+    );
+    fx.assert_restored();
+    let doctor = quen.tool("quen_doctor", json!({}));
+    assert_eq!(
+        doctor["vortex"],
+        "no Vortex deployment manifest in the game folder"
+    );
+
+    // Vortex deploys modAlpha (default mod type, into Mods) and a loader's dsound.dll (into the game root).
+    let staging = fx.path("vortex/staging");
+    let (alpha, loader) = (
+        "Alpha 101 1.2 2026-10-19T17-54Z Ab1",
+        "Loader 202 2.0 2026-10-19T17-54Z Cd2",
+    );
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(
+        staging.join("__vortex_staging_folder"),
+        r#"{"instance":"i1","game":"witcher3"}"#,
+    )
+    .unwrap();
+    fs::write(fx.path(r"game\bin\x64_dx12\dsound.dll"), "dll").unwrap();
+    for (source, rel, deployed) in [
+        (
+            alpha,
+            r"modAlpha\blob0.bundle",
+            r"game\Mods\modAlpha\blob0.bundle",
+        ),
+        (
+            loader,
+            r"bin\x64_dx12\dsound.dll",
+            r"game\bin\x64_dx12\dsound.dll",
+        ),
+    ] {
+        let copy = staging.join(source).join(rel);
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::hard_link(fx.path(deployed), copy).unwrap();
+    }
+    let manifest = |rel: &str, source: &str| {
+        json!({"instance": "i1", "version": 1, "deploymentMethod": "hardlink_activator", "gameId": "witcher3",
+               "deploymentTime": 1_792_623_500_298u64, "stagingPath": staging, "targetPath": "T",
+               "files": [{"relPath": rel, "source": source, "target": "", "time": 1}]})
+        .to_string()
+    };
+    fs::write(
+        fx.path(r"game\Mods\vortex.deployment.json"),
+        manifest(r"modAlpha\blob0.bundle", alpha),
+    )
+    .unwrap();
+    let root = fx.path(r"game\vortex.deployment.witcher3menumodroot.json");
+    fs::write(root, manifest(r"bin\x64_dx12\dsound.dll", loader)).unwrap();
+
+    let vortex = json!({
+        "parked": [
+            {"item": r"Mods\modAlpha", "owner": "Vortex: Alpha 1.2 (nexus 101)"},
+            {"item": r"bin\x64_dx12\W3Fake.asi", "owner": "outside Vortex"},
+        ],
+        "left_loaded": {"Loader 2.0 (nexus 202)": [r"bin\x64_dx12\dsound.dll"]},
+    });
+    let plan = quen.tool("session_plan", park.clone());
+    assert_eq!(plan["vortex"], vortex, "{plan}");
+    let mods = quen.tool("mods", json!({}));
+    let names: Vec<&Value> = mods["mods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["vortex"])
+        .collect();
+    assert_eq!(names, [alpha, loader], "{mods}");
+    assert_eq!(
+        mods["mods"][0]["units"],
+        json!([{"kind": "mods", "path": r"Mods\modAlpha", "files": 1}])
+    );
+    assert_eq!(
+        (
+            &mods["vortex"]["links"]["checked"],
+            &mods["vortex"]["links"]["ok"]
+        ),
+        (&json!(2), &json!(2))
+    );
+    assert_eq!(mods["vortex"]["running"], false);
+    assert_eq!(
+        mods["outside"]["mods"],
+        json!(["modNativeBridge", "modQuen"])
+    );
+    let pair = quen.tool("mods", json!({"pair": ["nexus:101", "Loader"]}));
+    assert_eq!(
+        pair["pair"],
+        json!({"mods": [alpha, loader], "paths": [], "mods_folders": []}),
+        "{pair}"
+    );
+    let doctor = quen.tool("quen_doctor", json!({}));
+    let line = doctor["vortex"].as_str().unwrap();
+    assert!(
+        line.starts_with(
+            "Vortex: 2 mods deployed by hardlink_activator (2 manifests), 2 of 2 files"
+        ),
+        "{line}"
+    );
+
+    // Today's names park as before; the end, after the replay, finds every link whole.
+    let launched = launch_with(&mut quen, park.clone());
+    assert_eq!(launched["vortex"], vortex, "{launched}");
+    let ended = quen.tool("session_end", json!({"token": launched["token"]}));
+    assert_eq!(ended["ok"], true, "{ended}");
+    let links = json!({"checked": 2, "ok": 2, "deleted": [], "srcdeleted": [], "refchange": []});
+    assert_eq!(ended["vortex"], links, "{ended}");
+    fx.assert_restored();
+    let labels = fx.ledger(
+        "SELECT e.name, e.version_label, e.provenance FROM mod_set_entries e
+           WHERE e.mod_set_id = (SELECT mod_set_id FROM boots ORDER BY id DESC LIMIT 1) AND e.name = 'modAlpha'",
+    );
+    assert_eq!(
+        labels,
+        [[json!("modAlpha"), json!("1.2"), json!("nexus_file")]]
+    );
+    let source = fx.ledger("SELECT source FROM mod_versions WHERE name = 'modAlpha'");
+    assert_eq!(source, [[json!(alpha)]]);
+
+    // input.settings a hardlink (Vortex's menu mod would make it one): refused, nothing changed.
+    let input = fx.path("vortex/input.settings");
+    fs::hard_link(fx.path("docs/input.settings"), &input).unwrap();
+    let refused = quen.tool("session_plan", json!({}));
+    let why = refused["reason"].as_str().unwrap_or_default();
+    assert!(
+        refused["refused"] == true && why.contains("input.settings is a hardlink (2 names"),
+        "{refused}"
+    );
+    let refused = quen.tool("session_launch", json!({"user_ok": true}));
+    assert_eq!(refused["refused"], true, "{refused}");
+    fx.assert_restored();
+    fs::remove_file(&input).unwrap(); // this test's own link
+
+    // Vortex running (a stand-in under the image this daemon looks for): parking its files is refused, nothing changed;
+    // a launch that parks nothing of Vortex's goes on.
+    let image = format!("vortex-{}", fx.2);
+    let mut other = Quen::spawn_with(
+        &fx,
+        fx.second_config(),
+        0,
+        &[("QUEN_TEST_VORTEX_IMAGE", &image)],
+    );
+    other.init(&fx);
+    fs::copy(fake_game(), fx.path(&format!("vortex/{image}"))).unwrap();
+    let mut running = Command::new(fx.path(&format!("vortex/{image}")))
+        .spawn()
+        .unwrap();
+    let refused = other.tool("session_plan", park.clone());
+    let why = refused["reason"].as_str().unwrap_or_default();
+    assert!(
+        refused["refused"] == true && why.starts_with("close Vortex first"),
+        "{refused}"
+    );
+    let planned = other.tool("session_plan", json!({"park": "W3Fake.asi"}));
+    assert_eq!(planned["ok"], true, "{planned}");
+    fx.assert_restored();
+    running.kill().unwrap();
+    running.wait().unwrap();
+}

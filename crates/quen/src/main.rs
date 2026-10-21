@@ -57,6 +57,8 @@ mod setup;
 #[cfg(windows)]
 mod status;
 #[cfg(windows)]
+mod vortex;
+#[cfg(windows)]
 mod w3;
 #[cfg(windows)]
 mod win;

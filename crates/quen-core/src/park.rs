@@ -215,6 +215,11 @@ pub fn plan(
     })
 }
 
+/// Whether `name` is one of the bin kinds quen parks: an `.asi`, an `.addon64` or `dxgi.dll` (any case).
+pub fn bin_kind(name: &str) -> bool {
+    Home::of(name) == Home::Bin
+}
+
 /// The non-empty items of a comma list, trimmed (a name can't hold spaces).
 fn names(list: &str) -> impl Iterator<Item = &str> {
     list.split(',')

@@ -25,7 +25,7 @@ use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
     camera, capture, channel, config, data, disk, doctor, focus, game, hands, image, ledger,
-    measure, mem, photo, plan, save, scene, setup,
+    measure, mem, photo, plan, save, scene, setup, vortex,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -65,8 +65,9 @@ const LONG: [&str; 18] = [
 /// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors,
 /// world_frame, world_ground, world_ray, world_nav, world_map and game_listsaves read through the game's channel
 /// (world_map's map files and their captures rows are its own); game_scriptlog reads the game's script log;
-/// measure_image reads quen's screenshots and writes its measurement rows.
-const READ_ONLY: [&str; 28] = [
+/// measure_image reads quen's screenshots and writes its measurement rows; mods reads Vortex's records and the game's
+/// folders.
+const READ_ONLY: [&str; 29] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -95,6 +96,7 @@ const READ_ONLY: [&str; 28] = [
     "data_read",
     "data_scan",
     "measure_image",
+    "mods",
 ];
 
 /// A tool call for the session thread, a connection that closed, the config file changed (quen_setup wrote it, or a
@@ -597,8 +599,10 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                 "quen_doctor" => tool_result(&doctor::call(shared, &args)),
                 "quen_guide" => tool_result(&guide(shared, &args)),
                 "capture_usage" => tool_result(&disk::usage(shared, &args)),
-                // Tables of contents and folder listings only: beside a live session, from any connection.
+                // Tables of contents, folder listings and Vortex's records only: beside a live session, from any
+                // connection.
                 "data_find" => tool_result(&data::find(shared, &args)),
+                "mods" => tool_result(&vortex::call(shared, &args)),
                 name if name.starts_with("ledger_") || name == "mem_diff" => {
                     tool_result(&ledger::call(shared, name, &args))
                 }
@@ -913,7 +917,8 @@ pub(crate) fn tools() -> Value {
                 prompt and nothing changed: save, changes (every file change; a profiler's output folder), \
                 settings_diff (what was asked), settings_written (each dx12user.settings line the launch changes, \
                 Section:Key=Value, of the forced keys and the overrides: a key already at its value isn't listed), \
-                command, game_build (the exe's sha256 and whether quen knows it). Refused as the \
+                command, game_build (the exe's sha256 and whether quen knows it), vortex (with Vortex's manifests: \
+                each parked item's owner, the Vortex files that stay loaded). Refused as the \
                 launch would be (a bad spec, a journal left, harness leftovers; with needs: what is missing), and \
                 while a session is live or another quen holds the lock: plan before a launch or after its end. \
                 Subagents may call it; only the agent the user talks to launches.",
@@ -922,6 +927,7 @@ pub(crate) fn tools() -> Value {
     );
     list.push(setup::tool());
     list.push(doctor::tool());
+    list.push(vortex::tool());
     list.push(json!({
         "name": "quen_guide",
         "description": "Read-only: quen's own guides, compiled into this binary so they match it, as text. topic \

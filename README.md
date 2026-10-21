@@ -73,6 +73,7 @@ quen makes that the agent's job, with guard rails:
   - **Tracy.** Built into quen's own package, dormant unless a Tracy launch triggers it.
   - Or with the **RenoDX devkit** loaded.
 - **The game's data.** Find, read and scan the files in its bundles and in REDkit's editor depot (CR2W files decoded to JSON; which files import or name something), and run REDkit's offline script compile on a scratch copy.
+- **Vortex.** `mods` lists what the Vortex mod manager deployed, read-only from its records: each mod with its Nexus id, version, files and load order, the files that are no longer Vortex's links, what is outside Vortex, and what two mods both carry. A launch names the owner of each mod it parks, refuses to park Vortex's files while Vortex runs, and its end reports the files Vortex's next deploy would flag.
 - **Memory.**
   - Read, scan and follow pointers in the running game.
   - Apply and undo live patches defined in your reverse-engineering knowledge base: at a fixed address, or a field in every live instance of a class (or only the instances you list). Saves written after a patch are flagged as tainted.

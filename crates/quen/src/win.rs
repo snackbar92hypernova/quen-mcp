@@ -1072,6 +1072,11 @@ fn move_file(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
 /// The volume serial and file index of a file or folder (a link itself, not its target): what a rename on one volume
 /// keeps.
 pub fn file_id(path: &Path) -> io::Result<String> {
+    file_info(path).map(|(id, _)| id)
+}
+
+/// [`file_id`], and how many names the file has (more than one: a hardlink).
+pub fn file_info(path: &Path) -> io::Result<(String, u32)> {
     let name = wide(path.as_os_str())?;
     // SAFETY: a NUL-terminated path; the handle is owned and closed once; the info struct is the documented layout.
     unsafe {
@@ -1093,10 +1098,11 @@ pub fn file_id(path: &Path) -> io::Result<String> {
             handle.as_raw_handle(),
             &mut info,
         ))?;
-        Ok(format!(
+        let id = format!(
             "{:08x}-{:08x}{:08x}",
             info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
-        ))
+        );
+        Ok((id, info.nNumberOfLinks))
     }
 }
 

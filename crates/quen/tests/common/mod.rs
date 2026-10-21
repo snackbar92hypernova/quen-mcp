@@ -353,6 +353,8 @@ impl Quen {
             .env("QUEN_TEST_PINS", test_pins())
             .env("QUEN_TEST_RECYCLE_TO", fx.path("recycled"))
             .env("QUEN_TEST_WCC_IMAGE", "quen-test-no-such-wcc.exe")
+            // Vortex's image: no test sees the user's own Vortex (a test names its stand-in's).
+            .env("QUEN_TEST_VORTEX_IMAGE", "quen-test-no-such-vortex.exe")
             // REDkit's licence answer, accepted: no test reads the user's.
             .env("QUEN_TEST_EULA", "1")
             .env("QUEN_TEST_INPUT", fx.path("harness/fake_input.py"))

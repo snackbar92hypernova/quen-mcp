@@ -87,6 +87,8 @@ pub(crate) struct Spec {
     pub(crate) profile: Option<Profile>,
     /// Every file change, in order: quen-core's plan, then the profile's.
     pub(crate) changes: Vec<Change>,
+    /// Vortex's records as the plan read them, its refusals passed; None without a Vortex manifest.
+    pub(crate) vortex: Option<quen_core::vortex::Inventory>,
     /// The ReShade.log line that says the RenoDX add-on loaded, when the boot waits for it.
     mark: Option<&'static str>,
     extra: Map<String, Value>,
@@ -514,6 +516,8 @@ impl Spec {
             &changes,
         )?;
         changes.extend(staged);
+        // With Vortex: what would undo the launch's parks, or a restore that breaks a link, refused (vortex.rs).
+        let vortex = crate::vortex::check(config, &changes)?;
         let mark = config.renodx_addon.as_ref().filter(|_| !play).map(|_| {
             if on("W3_FOREIGN_ADDON") {
                 "Registered add-on \"RenoDX\""
@@ -535,6 +539,7 @@ impl Spec {
             profiler: profiler.map(str::to_owned),
             profile,
             changes,
+            vortex,
             mark,
             extra,
         })
@@ -724,7 +729,7 @@ fn link_in(dir: &Path) -> Option<String> {
 }
 
 /// A folder's entries for the park planner.
-fn listing(dir: &Path) -> Result<Vec<Entry>, String> {
+pub(crate) fn listing(dir: &Path) -> Result<Vec<Entry>, String> {
     let read = || -> std::io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -1156,6 +1161,9 @@ pub(crate) fn plan_fields(config: &Config, spec: &Spec) -> Map<String, Value> {
     fields.insert("photo".into(), json!(spec.photo));
     if let Some(conditions) = spec.settings_diff.get("conditions") {
         fields.insert("conditions".into(), conditions.clone());
+    }
+    if let Some(inv) = &spec.vortex {
+        fields.insert("vortex".into(), crate::vortex::fields(inv, &spec.changes));
     }
     fields
 }

@@ -27,4 +27,5 @@ pub mod settings; // dx12user.settings overrides (W3_SETTINGS / W3_SECTION_SETTI
 pub mod stats; // PresentMon command line, CSV stats and the A/B verdict
 pub mod sweep; // camera sweeps: data model, the reference interpolation the cam.path verb ports, frame schedules
 pub mod trace; // actor traces: samples, tracks, behaviour metrics and their A/B verdicts
+pub mod vortex; // Vortex's records: manifests, mods.settings, its mods by quen's units, link states, the launch's refusals
 pub mod wcc; // REDkit's wcc_lite compilescripts: its log's script messages, import stubs, the settings it rewrites
