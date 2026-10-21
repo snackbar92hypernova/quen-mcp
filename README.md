@@ -45,6 +45,7 @@ quen makes that the agent's job, with guard rails:
   - Play sessions (`mode: "play"`): you play the game quen launched with your mods and settings as they are, and hand the agent the controls when you want it to look at something; the session ends when you quit the game.
   - Staged test files and mods (`stage`, `stage_mods`), copied in for one boot and taken out after.
   - A relaunch with the same spec (`session_launch` with `again`): a rebuilt staged mod is copied in fresh, and the setup since the last launch (load, teleport, time, weather, console and exec lines) is replayed.
+  - Plans run as one call (`run_plan`): setup, steps and teardown over quen's own game, reading and measuring tools, checked and estimated before anything runs, with the teardown run even when a step fails.
   - One agent drives at a time. A crash is recovered at quen's next start, or with `quen recover`.
 - **In-game control.**
   - A mod's exec functions run directly (`game_exec`), without typing into the console.

@@ -1,11 +1,11 @@
 [package]
 name = "quen"
-version = "0.1.11"
+version = "0.1.12"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "quen: the MCP server (stdio proxy + daemon) and the Windows layer that drives a game session for mod testing"
+description = "quen: the MCP server (stdio proxy + daemon) and the Windows layer that drives a game session for mod development, testing and troubleshooting"
 
 # MCP is a small JSON-RPC loop over serde_json, not an SDK: five methods need no async runtime, and session steps stay
 # on one OS thread.
