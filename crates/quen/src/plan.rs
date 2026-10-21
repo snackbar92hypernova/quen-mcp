@@ -113,7 +113,7 @@ struct Plan {
 
 impl Plan {
     /// The steps' estimates, and what is left of the plan's measuring line's [`status::MEASURING_SHOWN`] at its first
-    /// capture or window.
+    /// capture or window, after the game's answer that it is up (one [`status::CONFIRM_EVERY`]).
     fn estimate(&self) -> f64 {
         let steps = || self.phases.iter().flat_map(|(_, s)| s);
         let hides = |s: &Step| {
@@ -121,7 +121,8 @@ impl Plan {
         };
         let shown = steps().position(hides).map_or(0.0, |first| {
             let before: f64 = steps().take(first).map(|s| s.est).sum();
-            (status::MEASURING_SHOWN.as_secs_f64() - before).max(0.0)
+            status::CONFIRM_EVERY.as_secs_f64()
+                + (status::MEASURING_SHOWN.as_secs_f64() - before).max(0.0)
         });
         steps().map(|s| s.est).sum::<f64>() + shown
     }
@@ -1086,8 +1087,8 @@ mod tests {
         let out = run(&mut session, check);
         assert_eq!(out["ok"], true, "{out}");
         // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, the wait 1; and the plan's measuring
-        // line up 3 s before its first window: 2.8 s more after the settime.
-        assert_eq!(out["estimate_s"], 28.0, "{out}");
+        // line, confirmed after 0.5 s, up 5 s before its first window: 0.5 + 4.8 s more after the settime.
+        assert_eq!(out["estimate_s"], 30.5, "{out}");
         assert_eq!(out["steps"][1]["est_s"], 24.0, "{out}");
         assert!(!fx.dir.join("data/captures/s1").exists(), "nothing written");
     }

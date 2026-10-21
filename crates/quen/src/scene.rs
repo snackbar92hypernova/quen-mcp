@@ -152,7 +152,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "world_map",
             "description": "Read the space around a point into a top-down map (quen_guide: world_map). grid: a \
-                scene.ground point per cell, then a ray 6 m up from each walkable one, 16 a call: class (walkable, \
+                scene.ground point per cell, then rays 6 m up, 16 a call: class (walkable, \
                 tight, covered, water, obstacle, tall, ledge), clearance_m, chokepoints, components, edges; traces: \
                 heat layers from measure_trace CSVs. \
                 profile: a street's width along axis, two nav.line reaches a step, 8 steps a call. blockers: per \
@@ -1146,8 +1146,9 @@ fn base(cx: &Ctx, id: i64) -> Result<(Grid, Value), String> {
     Ok((grid, about))
 }
 
-/// The grid's cells, 16 points a scene.ground call, then their roof rays ([`map::roofs`]), 16 a scene.ray call. A
-/// cancel, or a call that failed, stops it (`stopped` says which); the cells read so far are kept.
+/// The grid's cells, 16 points a scene.ground call, then their roof rays ([`map::roofs`]: walkable cells' and
+/// would-be water's), 16 a scene.ray call. A cancel, or a call that failed, stops it (`stopped` says which); the cells
+/// read so far are kept.
 fn ground_pages(
     reads: &mut Reads,
     call: &Call,
@@ -1217,7 +1218,7 @@ fn ground_pages(
             Ok(read) => {
                 for ((i, ..), v) in page.iter().zip(&read) {
                     if let Some(c) = cells[*i].as_mut() {
-                        c.roof_z = v["pos"][2].as_f64().filter(|_| v["hit"] == true);
+                        c.roof(v);
                     }
                 }
             }
@@ -2452,9 +2453,10 @@ mod tests {
     }
 
     /// A stand-in for world_map's reads: the player at (0, 0, 10) facing +y; a street along y where |x| < 2 (navmesh
-    /// at 10.5 and free, the ground at 10), beyond it no navmesh and a 2 m wall's top (a hit at 12); three actors: 3
-    /// walking up the street at 1 m/s, 4 on a floor 5 m up, 5 standing in 3's way; each nav.line reaching 3 m and not
-    /// clear, no ray hitting. With `cancel`, the connection goes away during that scene.ground call.
+    /// at 10.5 and free, the ground at 10), beyond it no navmesh and a 2 m wall's top (a hit at 12), but at x > 4 water
+    /// (its surface at 9.8 over a ground hit at 8), under the ground where y > 0; three actors: 3 walking up the street
+    /// at 1 m/s, 4 on a floor 5 m up, 5 standing in 3's way; each nav.line reaching 3 m and not clear. With `cancel`,
+    /// the connection goes away during that scene.ground call.
     fn map_game(
         fx: &Fake,
         conns: usize,
@@ -2478,12 +2480,16 @@ mod tests {
                         {
                             conn.closed.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
-                        let cell = |p: &[f32]| match p[0].abs() < 2.0 {
-                            true => {
+                        let cell = |p: &[f32]| match p[0] {
+                            x if x.abs() < 2.0 => {
                                 json!({"nav_z": 10.5, "ground": {"pos": [p[0], p[1], 10], "normal": [0, 0, 1]},
                                            "water_level": 0, "water_depth": 0, "free": true, "safe": null})
                             }
-                            false => {
+                            x if x > 4.0 => {
+                                json!({"nav_z": null, "ground": {"pos": [p[0], p[1], 8], "normal": [0, 0, 1]},
+                                            "water_level": 9.8, "water_depth": 1.8, "free": null, "safe": null})
+                            }
+                            _ => {
                                 json!({"nav_z": null, "ground": {"pos": [p[0], p[1], 12], "normal": [0, 0, 1]},
                                             "water_level": 0, "water_depth": 0, "free": null, "safe": null})
                             }
@@ -2499,14 +2505,19 @@ mod tests {
                         };
                         json!(segments.chunks(6).map(reach).collect::<Vec<_>>())
                     }
-                    // A roof ray up at x < 0 hits a roof at z 14; every other ray misses.
+                    // A ray up at x < 0 hits a roof at z 14, one at x > 4 and y > 0 the ground's underside at 11; every
+                    // other ray misses.
                     Verb::SceneRay { segments, .. } => {
-                        let ray = |s: &[f32]| match s[0] == s[3] && s[1] == s[4] && s[0] < 0.0 {
-                            true => {
+                        let ray = |s: &[f32]| match s[0] == s[3] && s[1] == s[4] {
+                            true if s[0] < 0.0 => {
                                 json!({"hit": true, "pos": [s[0], s[1], 14], "normal": [0, 0, -1],
                                            "distance": 14.0 - s[2]})
                             }
-                            false => {
+                            true if s[0] > 4.0 && s[1] > 0.0 => {
+                                json!({"hit": true, "pos": [s[0], s[1], 11], "normal": [0, 0, 0.97],
+                                           "distance": 11.0 - s[2]})
+                            }
+                            _ => {
                                 json!({"hit": false, "pos": null, "normal": null, "distance": null})
                             }
                         };
@@ -2524,15 +2535,15 @@ mod tests {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap_or(Value::Null)
     }
 
-    /// The grid: ⌈cells / 16⌉ scene.ground verbs with every cell's centre, then a roof ray up from each walkable cell,
-    /// its files and captures rows; again from its JSON as base with only the occupants read; and the refusals that
-    /// send nothing.
+    /// The grid: ⌈cells / 16⌉ scene.ground verbs with every cell's centre, then a roof ray up from each walkable cell
+    /// and each would-be water cell's surface (water under the ground: its ground hit), its files and captures rows;
+    /// again from its JSON as base with only the occupants read; and the refusals that send nothing.
     #[test]
     fn map_reads_a_grid_in_pages_and_again_from_its_base() {
         let fx = served("scene-map");
-        // world.get, 3 scene.ground (40 cells), 1 scene.ray (16 roof rays), world.actors; then the base's world.get and
-        // world.actors.
-        let server = map_game(&fx, 6 + 2, None);
+        // world.get, 3 scene.ground (40 cells), 2 scene.ray (16 walkable cells' roof rays, 4 water cells'),
+        // world.actors; then the base's world.get and world.actors.
+        let server = map_game(&fx, 7 + 2, None);
         let mut session = fx.session();
         let args = json!({"token": "tok", "size": [10, 4], "tag": "street"});
         let out = run(&mut session, "world_map", args);
@@ -2546,14 +2557,18 @@ mod tests {
             (&json!(8), &json!(8)),
             "a roof 3.5 m over the navmesh at x < 0, past the band: {out}"
         );
-        assert_eq!(out["classes"]["obstacle"], 24, "a 2 m wall's top: {out}");
+        assert_eq!(
+            (&out["classes"]["obstacle"], &out["classes"]["water"]),
+            (&json!(22), &json!(2)),
+            "a 2 m wall's top, the water under the ground by its ground hit: {out}"
+        );
         assert_eq!(
             (out["z_ref"].as_f64(), out["ground_ref"].as_f64()),
             (Some(10.5), Some(10.0))
         );
         assert_eq!(out["chokepoints"], json!([]), "a street off both edges");
-        assert_eq!(out["budget"]["calls"], 6, "{out}");
-        assert_eq!(out["budget"]["rays"], 56);
+        assert_eq!(out["budget"]["calls"], 7, "{out}");
+        assert_eq!(out["budget"]["rays"], 60);
         assert_eq!(out["budget"]["in_window"], false);
         let occupants = out["occupants"]["list"].as_array().unwrap();
         let off: Vec<bool> = occupants.iter().map(|o| o["off_level"] == true).collect();
@@ -2607,7 +2622,7 @@ mod tests {
             assert_eq!(out["refused"], true, "{args}: {out}");
         }
         let sent = verbs(server.join().unwrap());
-        assert_eq!(sent.len(), 8, "{sent:?}");
+        assert_eq!(sent.len(), 9, "{sent:?}");
         let points = Frame::new([0.0, 0.0, 10.0], [10.0, 4.0], 1.0)
             .unwrap()
             .points();
@@ -2626,8 +2641,17 @@ mod tests {
         assert_eq!(*radius, 0.0);
         assert_eq!(segments.len(), 16 * 6);
         assert_eq!(segments[..6], [-1.5, 1.5, 10.5, -1.5, 1.5, 16.5]);
-        assert!(matches!(sent[5], Verb::WorldActors { max: 50, .. }));
-        assert_eq!(&sent[6..], [Verb::WorldGet {}, sent[5].clone()]);
+        let Verb::SceneRay { segments, .. } = &sent[5] else {
+            panic!("the rest: {:?}", sent[5]);
+        };
+        assert_eq!(segments.len(), 4 * 6);
+        assert_eq!(
+            segments[18..],
+            [4.5, -1.5, 9.8, 4.5, -1.5, 15.8],
+            "from the water"
+        );
+        assert!(matches!(sent[6], Verb::WorldActors { max: 50, .. }));
+        assert_eq!(&sent[7..], [Verb::WorldGet {}, sent[6].clone()]);
     }
 
     /// A cancel between scene.ground calls: the cells read so far, in the result and its files.
@@ -2751,7 +2775,7 @@ mod tests {
     #[test]
     fn map_layers_from_traces_sum_to_their_metrics() {
         let fx = served("scene-map-traces");
-        let server = map_game(&fx, 6, None);
+        let server = map_game(&fx, 7, None);
         let body = |id: i64, x: f64, y: f64, heading: f64, v: f64| trace::Body {
             id: Some(id),
             pos: [x, y, 10.0],
@@ -2832,7 +2856,7 @@ mod tests {
                 .contains("is no actor trace"),
             "{not}"
         );
-        assert_eq!(verbs(server.join().unwrap()).len(), 6);
+        assert_eq!(verbs(server.join().unwrap()).len(), 7);
     }
 
     /// measure_ab's console action with `exec` (quen-w3 0.1.13) goes as the exec verb, and its note says so; only a
