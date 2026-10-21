@@ -1159,6 +1159,33 @@ mod tests {
         );
     }
 
+    /// Claude Code's hook before its prompts (`quen focus --to client`) matches every tool it prompts for, as INSTALL.md
+    /// §4 and docs/clients.md give it and install.ps1 adds it.
+    #[test]
+    fn the_focus_hook_matches_every_tool_the_client_prompts_for() {
+        let tools = tools();
+        let prompted: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["_meta"]["anthropic/requiresUserInteraction"] == true)
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let matcher = format!("^mcp__quen__({})$", prompted.join("|"));
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..");
+        for file in [
+            "INSTALL.md",
+            r"docs\clients.md",
+            r"tools\release\install.ps1",
+        ] {
+            let text = std::fs::read_to_string(repo.join(file)).unwrap();
+            assert!(
+                text.contains(&matcher),
+                "{file}: the hook's matcher is {matcher}"
+            );
+        }
+    }
+
     /// quen_guide serves the compiled-in texts, which name no repo file an installed agent can't open.
     #[test]
     fn the_guide_serves_the_playbook_and_the_ledger_schema() {

@@ -109,6 +109,10 @@ Put "$game\Mods\modQuen\content\scripts\local\old_extra.ws" 'synthetic old file'
 Put "$game\Mods\modQuenRpc\content\scripts\local\rpc.ws" 'synthetic old modQuenRpc'
 Put "$home_\.quen\config.toml" "game_dir = '$game'`n"
 Put "$shim\claude.cmd" "@echo %*>>`"$root\claude.log`"`r`n@echo synthetic claude: %*`r`n"
+# Claude Code's settings with a setting and a hook of the user's own: quen's hook goes in beside them.
+$settings = Join-Path $home_ '.claude\settings.json'
+$userSettings = '{"model": "synthetic", "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo synthetic"}]}]}}'
+Put $settings $userSettings
 $at = @('-From', $rel, '-GameDir', $game)
 
 Write-Host "install-test: $root (release: $(Split-Path -Leaf $quenZip))"
@@ -120,6 +124,7 @@ Check ($r.code -eq 0) "exit 0 ($($r.code))"
 Check ($r.out -match 'What if: place .*W3Quen\.asi' -and $r.out -match 'What if: move .*modQuenRpc to the Recycle Bin') 'the package steps are printed'
 Check ($r.out -match "What if: place quen $([regex]::Escape($version)) at") 'the quen.exe step is printed'
 Check ($r.out -match 'What if: register quen in Claude Code') 'the Claude Code step is printed'
+Check ($r.out -match "What if: add quen's hook to .*settings\.json") 'the hook step is printed'
 Check ($r.out -match 'What if: place .*tools\\streamline\\sl\.interposer\.dll') 'the interposer step is printed'
 Check ($r.out -match 'next: ask your agent to run quen_setup, then quen_doctor') 'the next step is printed'
 Check ((Tree) -eq $before) 'no file changed (home, game, release, Recycle Bin)'
@@ -163,9 +168,9 @@ Check ($r.code -ne 0 -and $r.out -match 'refused, nothing was changed: a quen se
 Check ((Tree) -eq $before) 'nothing changed'
 Move-Item -LiteralPath $journal -Destination (Join-Path $root 'test-journal.jsonl')
 
-Write-Host 'install: package yes, PATH no, Claude Code yes'
+Write-Host 'install: package yes, PATH no, Claude Code yes, hook yes'
 $oldMod = Get-ChildItem -LiteralPath "$game\Mods" -Recurse -File | ForEach-Object Name
-$r = Install @('y', 'n', 'y') ($at + '-WithRenderDoc')
+$r = Install @('y', 'n', 'y', 'y') ($at + '-WithRenderDoc')
 Check ($r.code -eq 0) "exit 0 ($($r.code))"
 Check ((Test-Path -LiteralPath $exe) -and (Sha $exe) -eq $quenSha) 'quen.exe placed, the release''s bytes'
 foreach ($f in $pkg) { Check ((Sha (Join-Path $game $f.rel)) -eq $f.sha) "placed $($f.rel)" }
@@ -173,17 +178,32 @@ Check (-not (Test-Path -LiteralPath "$game\Mods\modQuenRpc") -and -not (Test-Pat
 $recycled = Get-ChildItem -LiteralPath $recycle -Recurse -File | ForEach-Object Name
 Check (-not ($oldMod | Where-Object { $_ -notin $recycled })) "the old files are in the Recycle Bin stand-in ($($oldMod -join ', '))"
 Check ((ClaudeLog) -match ('mcp add --scope user quen -- "?' + [regex]::Escape($exe) + '"? mcp')) 'claude mcp add --scope user quen -- <exe> mcp'
+$backups = @(Get-ChildItem -LiteralPath (Split-Path $settings) -Filter 'settings.json.quen-backup-*')
+Check ($backups.Count -eq 1 -and [IO.File]::ReadAllText($backups[0].FullName) -eq $userSettings) 'settings.json backed up first, as it was'
+$s = [IO.File]::ReadAllText($settings) | ConvertFrom-Json
+$pre = @($s.hooks.PreToolUse)
+Check ($s.model -eq 'synthetic' -and $pre.Count -eq 2 -and $pre[0].matcher -eq 'Bash' -and $pre[0].hooks[0].command -eq 'echo synthetic') 'the user''s setting and hook stay'
+Check ($pre[1].matcher -like '^mcp__quen__(*' -and $pre[1].hooks[0].command -eq $exe -and "$($pre[1].hooks[0].args)" -eq 'focus --to client' -and $pre[1].hooks[0].timeout -eq 5) 'quen''s hook comes last, with this quen.exe'
 Check (Test-Path -LiteralPath "$home_\.quen\tools\streamline\sl.interposer.dll") 'the interposer is in .quen\tools\streamline'
 Check ($r.out -match 'quen_setup will offer it') 'the interposer message'
 Check ($r.out -match 'quen doctor, needed for every session' -and $r.out -notmatch 'quen in-game package: ') 'quen doctor ran, and finds the package'
 $temps = Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory | Where-Object { $_.Name -match '^quen-install-[0-9a-f]{32}$' -and $_.CreationTime -gt $started }
 Check (-not $temps) 'its temp folders are gone from %TEMP%'
 
-Write-Host 'again, no -Update: nothing to change'
+Write-Host 'again, no -Update, hook yes: nothing to change'
 $before = Tree
-$r = Install @('n') $at
-Check ($r.code -eq 0 -and $r.out -match 'is already quen' -and $r.out -match 'is already in') "exit 0, already in place ($($r.code))"
+$r = Install @('n', 'n', 'y') $at
+Check ($r.code -eq 0 -and $r.out -match 'is already quen' -and $r.out -match 'is already in' -and $r.out -match 'quen''s hook is already in') "exit 0, already in place ($($r.code))"
 Check ((Tree) -eq $before) 'nothing changed'
+
+Write-Host 'refused: hook yes, settings.json not JSON'
+$good = [IO.File]::ReadAllText($settings)
+Put $settings '{"hooks": '
+$before = Tree
+$r = Install @('n', 'n', 'y') $at
+Check ($r.code -ne 0 -and $r.out -match 'refused, nothing was changed: .*settings\.json isn''t valid JSON') "refused ($($r.code))"
+Check ((Tree) -eq $before) 'nothing changed'
+Put $settings $good
 
 Write-Host 'refused: another quen.exe installed, no -Update'
 $rel2 = Join-Path $root 'release-2'
@@ -249,6 +269,30 @@ try {
     Set-UserPath (@($path -split ';' | Where-Object { -not (IsBin $_) }) -join ';')
     Check ((UserPath) -eq '%SystemRoot%\system32;C:\synthetic') 'taken out again, the rest as it was'
 } finally { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($envKey, $false) }
+
+Write-Host 'quen''s hook in Claude Code''s settings, on synthetic files'
+$ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Refuse', 'With-Hook' }, $true) |
+    ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+$f = Join-Path $root 'hook\settings.json'
+$quenAt = 'C:\synthetic\quen.exe'
+function Quens($text) { @(($text | ConvertFrom-Json).hooks.PreToolUse | ForEach-Object { $_.hooks } | Where-Object { "$($_.args)" -eq 'focus --to client' }) }
+Check (-not (Test-Path -LiteralPath $f) -and @(Quens (With-Hook $f $quenAt)).Count -eq 1) 'no file: the hook alone'
+Put $f "  `r`n"
+Check (@(Quens (With-Hook $f $quenAt)).Count -eq 1) 'an empty file: the hook alone'
+Put $f ('{"env": {"A": "1"}, "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo synthetic"}, ' +
+    '{"type": "command", "command": "C:\\old\\quen.exe", "args": ["focus", "--to", "client"]}]}], "Stop": [{"hooks": [{"type": "command", "command": "echo stop"}]}]}}')
+$t = With-Hook $f $quenAt
+$s = $t | ConvertFrom-Json
+Check ($s.env.A -eq '1' -and $s.hooks.Stop[0].hooks[0].command -eq 'echo stop' -and $s.hooks.PreToolUse[0].matcher -eq 'Bash' -and
+    @($s.hooks.PreToolUse[0].hooks).Count -eq 1 -and ($s.hooks.PSObject.Properties.Name -join ',') -eq 'PreToolUse,Stop') 'existing hooks: the others stay in their order, the old quen hook leaves its group'
+Check (@(Quens $t).Count -eq 1 -and @(Quens $t)[0].command -eq $quenAt) 'a changed quen path: one hook, with the new path'
+Put $f $t
+Check ($null -eq (With-Hook $f $quenAt)) 'already there: nothing to write'
+foreach ($bad in '{"hooks": ', '[1, 2]', '{"hooks": []}') {
+    Put $f $bad
+    $refused = try { [void](With-Hook $f $quenAt); '' } catch { $_.Exception.Message }
+    Check ($refused -like 'install: refused, nothing was changed: *' -and [IO.File]::ReadAllText($f) -eq $bad) "refused, the file as it was: $bad"
+}
 
 if ($failed) { Write-Host "install-test: $failed failed. Kept for a look: $root (install.log has every run)" -ForegroundColor Red; exit 1 }
 [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($root, 'OnlyErrorDialogs', 'SendToRecycleBin')

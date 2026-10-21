@@ -3,12 +3,17 @@
 //! the game back. Each connection's client is found once, at connect: the first process up the parent chain of its
 //! `quen mcp` that shows a window, so any client with a window works (Claude Desktop, VS Code, a terminal). Only
 //! windows move, and on the way back up to 3 escapes close the menu the game opened when it lost the front: no file
-//! changes, nothing is journaled.
+//! changes, nothing is journaled. `quen focus --to client` ([`cli`]) is the same switch for Claude Code's prompts, which
+//! show before a call reaches quen: a hook, with no session.
 
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongW, IsIconic, SW_RESTORE, ShowWindow, WS_EX_TOOLWINDOW,
+    GA_ROOTOWNER, GWL_EXSTYLE, GetAncestor, GetWindowLongW, IsIconic, SW_RESTORE, ShowWindow,
+    WS_EX_TOOLWINDOW,
+};
+use windows_sys::Win32::System::Console::{
+    ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole, GetConsoleWindow,
 };
 
 use crate::game::{self, Ctx, Fields, Focus};
@@ -90,17 +95,81 @@ pub(crate) fn to_client(pid: u32, name: &str) -> Result<bool, Done> {
         "{name}, this connection's client, shows no window now (closed, hidden, or on another virtual desktop): \
          nothing moved"
     ))?;
-    // SAFETY: plain window calls; a window that closed meanwhile just fails them. Activating a minimized window would
-    // leave it minimized.
-    if unsafe { IsIconic(window) }.as_bool() {
-        let _ = unsafe { ShowWindow(window, SW_RESTORE) };
-    }
-    input::focus(window).map_err(|_| {
+    raise(window).map_err(|_| {
         let fields = Map::from_iter([("focused".into(), json!(input::in_front(window)))]);
         Done::Failed(
             format!("{name}'s window would not come to the front"),
             fields,
         )
+    })
+}
+
+/// Brings `window` to the front ([`input::focus`]), a minimized one restored first.
+fn raise(window: HWND) -> Result<bool, String> {
+    // SAFETY: plain window calls; a window that closed meanwhile just fails them. Activating a minimized window would
+    // leave it minimized.
+    if unsafe { IsIconic(window) }.as_bool() {
+        let _ = unsafe { ShowWindow(window, SW_RESTORE) };
+    }
+    input::focus(window)
+}
+
+/// `quen focus --to client`, Claude Code's PreToolUse hook before the calls it prompts for (INSTALL.md §4): Claude Code
+/// shows its prompt before the call reaches quen, in its own window, which is behind the game while the game is in
+/// front. Then the hook brings the client that runs it to the front; otherwise it does nothing. It never answers the
+/// prompt. The hook's caller may read stdout as a permission decision and exit code 2 as a block: nothing on stdout,
+/// exit 0 on every path, at most one line on stderr.
+pub fn cli(args: &[String]) -> i32 {
+    let done = match args {
+        [to, client] if to == "--to" && client == "client" => {
+            crate::config::load().and_then(|config| hook(&config.game_exe))
+        }
+        _ => Err("usage: quen focus --to client".into()),
+    };
+    if let Err(why) = done {
+        eprintln!("quen focus: {why}");
+    }
+    0
+}
+
+/// [`cli`]'s work, with no session: the game is any process of image name `game` (the config's: quen launches none
+/// while one runs), and the client is [`terminal`]'s window, else the first up the parent chain with one ([`client`]).
+fn hook(game: &str) -> Result<(), String> {
+    let procs = game::processes().map_err(|e| format!("process list: {e}"))?;
+    let games: Vec<u32> = procs
+        .iter()
+        .filter(|(_, name)| name.eq_ignore_ascii_case(game))
+        .map(|&(pid, _)| pid)
+        .collect();
+    if !capture::in_front(&games) {
+        return Ok(());
+    }
+    let window = match terminal() {
+        Some(window) => window,
+        None => {
+            let (pid, name) = client(std::process::id())?;
+            window_of(pid)?.ok_or(format!("{name} shows no window now"))?
+        }
+    };
+    raise(window)
+        .map(drop)
+        .map_err(|_| "the client's window would not come to the front".into())
+}
+
+/// The terminal window of the console this process shares with the CLI that ran it: a classic console's own window, or
+/// the window that owns a pseudo console's hidden one (Windows Terminal, which needn't be an ancestor: a shell Windows
+/// handed to it as the default terminal). A hook started without a window of its own (CREATE_NO_WINDOW) takes its
+/// parent's console. None when neither shows one (the desktop app's CLI).
+fn terminal() -> Option<HWND> {
+    let shown = || {
+        // SAFETY: plain queries; without a console window they get a null handle, which `switchable` refuses.
+        let root = unsafe { GetAncestor(HWND(GetConsoleWindow()), GA_ROOTOWNER) };
+        switchable(root).map(|_| root)
+    };
+    // SAFETY: this process's own console; stdout and stderr stay the handles the hook's caller gave.
+    shown().or_else(|| unsafe {
+        FreeConsole();
+        (AttachConsole(ATTACH_PARENT_PROCESS) != 0).then(shown)?
     })
 }
 
@@ -304,8 +373,8 @@ mod tests {
     }
 
     /// The switch on this desktop: a window of this test stands in for the client (the walk from this process finds
-    /// it), a tool window for the game (the walk passes tool windows by). It takes the foreground for a moment and
-    /// gives it back, so it runs only when asked, never while the game runs:
+    /// it), a tool window for the game (the walk passes tool windows by); then the hook. It takes the foreground for a
+    /// moment and gives it back, so it runs only when asked, never while the game runs:
     /// `cargo test -p quen -- --ignored --test-threads 1 focus::`.
     #[test]
     #[ignore = "takes the foreground: run only when the PC is free"]
@@ -398,6 +467,17 @@ mod tests {
         assert!(matches!(to_client(pid, &name), Ok(false)));
         // SAFETY: a plain query.
         assert!(input::in_front(client) && !unsafe { IsIconic(client) }.as_bool());
+        // quen focus --to client, with this test's image as the game's: from the game a client comes (the terminal
+        // this runs in, else the test's window); with the game not in front, nothing moves.
+        let me = game::processes().unwrap();
+        let me = &me.iter().find(|p| p.0 == std::process::id()).unwrap().1;
+        input::focus(game).unwrap();
+        hook(me).unwrap();
+        assert!(!input::in_front(game));
+        // SAFETY: plain queries.
+        let front = unsafe { GetForegroundWindow() };
+        hook(me).unwrap();
+        assert_eq!(unsafe { GetForegroundWindow() }, front);
         quit.store(true, Ordering::SeqCst);
         pump.join().unwrap();
         if !before.is_invalid() {

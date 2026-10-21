@@ -272,7 +272,7 @@ pub fn tools() -> Vec<Value> {
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": schema(json!({
                 "name": instances,
-                "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation the row, the class, the field's old and new values and that every live instance found (with addresses, every one listed) is written (the count comes back), and they agreed. Required."},
+                "user_ok": {"type": "boolean", "description": "true only after telling the user in this conversation the row, the class, the field's old and new values and that every live instance found (with addresses, every one listed) is written (the count comes back), and they agreed. Required. Call focus to client first: the client's prompt for this call shows in the client's window."},
                 "addresses": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 1000, "description": "only these instances (mem_find hits' addresses): numbers or 0x hex. counts' unlisted: the ones found and not listed; a listed one the search didn't find is left"},
                 "deadline_s": deadline,
             }), &["name", "user_ok"]),

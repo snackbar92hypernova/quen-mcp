@@ -1775,6 +1775,43 @@ fn quen_recover_replays_a_left_journal_from_a_terminal() {
     assert!(!fx.path("data/state/journal.jsonl").exists());
 }
 
+/// `quen focus --to client`, Claude Code's hook before its prompts: exit 0 and nothing on stdout on every path (the
+/// hook's caller reads stdout as a decision, exit code 2 as a block), at most one line on stderr. The fixture's game
+/// isn't running, so nothing moves.
+#[test]
+fn the_focus_hook_exits_0_and_prints_nothing_on_stdout() {
+    let fx = Fixture::new();
+    fs::write(fx.path("broken.toml"), "game_exe witcher3.exe\n").unwrap();
+    for (args, config, stderr) in [
+        (&["--to", "client"][..], "config.toml", ""),
+        (
+            &["--to", "game"],
+            "config.toml",
+            "usage: quen focus --to client",
+        ),
+        (&[], "config.toml", "usage: quen focus --to client"),
+        (&["--to", "client"], "broken.toml", "quen reads only"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_quen"))
+            .arg("focus")
+            .args(args)
+            .env("QUEN_CONFIG", fx.path(config))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.code() == Some(0)
+                && out.stdout.is_empty()
+                && err.lines().count() <= 1
+                && err.contains(stderr)
+                && stderr.is_empty() == err.is_empty(),
+            "{args:?} {config}: {:?}, stderr {err}",
+            out.status
+        );
+    }
+}
+
 /// Mods in quen's parking folder with no journal in this data root are another data root's session's; a plan
 /// or launch from the game as it is would take them for the user's state. Both are refused, and nothing moves.
 #[test]
