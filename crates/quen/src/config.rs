@@ -19,8 +19,8 @@
 //!                                                                # adapter's own (quen_core::build::KnownBuilds)
 //! idle_focus = 'false'                                           # optional, default 'true': quen brings the agent's
 //!                                                                # client forward when it waits (status.rs)
-//! indicator = 'off'                                              # optional, default 'on': in a test session the
-//!                                                                # game shows quen's status line (status.rs)
+//! indicator = 'off'                                              # optional, default 'on': the game shows quen's
+//!                                                                # lasting status line (status.rs)
 //! window_sound = 'gui_global_panel_open'                         # optional, default none: a game sound event at each
 //!                                                                # measuring window's start and end
 //! # Optional features, each off unless set:
@@ -98,7 +98,7 @@ pub struct Config {
     /// Whether quen brings the agent's client forward when the agent waits with the game in front (status.rs); unset:
     /// true.
     pub idle_focus: Option<bool>,
-    /// Whether a test session's game shows quen's lasting status line (status.rs); unset: on.
+    /// Whether the game shows quen's lasting status line (status.rs); unset: on.
     pub indicator: Option<bool>,
     /// A game sound event played at each measuring window's start and end (status.rs); unset: none.
     pub window_sound: Option<String>,

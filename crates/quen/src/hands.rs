@@ -95,8 +95,8 @@ pub(crate) fn tools() -> Vec<Value> {
                 applied (in a play session, this hand-over's). A play session refuses while there is one, unless \
                 keep_writes with the user's OK; a test session gives the controls with them applied. Then quen's pause \
                 goes off and a camera path stops (pause, path: the game's replies), the game shows that the user has \
-                the controls (status: its reply, or why not): until hands_take in a test session with quen-w3 \
-                0.1.15+, else 8 s. Then the controls go to the user. kept: this hand-over's teleports, settime, \
+                the controls (status: its reply, or why not): until hands_take with quen-w3 0.1.15+ and the \
+                config's indicator on, else 8 s. Then the controls go to the user. kept: this hand-over's teleports, settime, \
                 weather and items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
                 front at the end (game, client or other). Refused: the user has them already, a wrong token, \
                 to_client with no client window found at connect. Failed: the pause or the path wasn't undone \

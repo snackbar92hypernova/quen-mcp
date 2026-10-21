@@ -676,8 +676,10 @@ pub(crate) fn note_pause(live: &crate::session::Live, reply: &Reply) {
 
 /// A whole-number argument, 0 to `max`.
 fn whole(args: &Value, key: &str, max: u32) -> Result<u32, String> {
-    args[key]
-        .as_u64()
+    let v = args
+        .get(key)
+        .ok_or(format!("{key} is required: a whole number from 0 to {max}"))?;
+    v.as_u64()
         .filter(|n| *n <= u64::from(max))
         .map(|n| n as u32)
         .ok_or(format!("{key} must be a whole number from 0 to {max}"))
@@ -1442,6 +1444,15 @@ pub(crate) mod tests {
             let out = fx.run(tool, args.clone());
             assert_eq!(out["refused"], true, "{tool} {args}: {out}");
         }
+        // The 0.1.15 live check: hour alone was refused as if day were out of range.
+        let out = fx.run("game_settime", json!({"token": "tok", "hour": 9}));
+        assert!(
+            out["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("day is required"),
+            "{out}"
+        );
         // No game loaded: the state-changing verbs wait for one; listsaves goes anyway.
         fs::write(
             fx.dir.join("game/bin/x64_dx12/W3QuenState.log"),

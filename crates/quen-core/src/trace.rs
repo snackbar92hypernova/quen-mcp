@@ -1003,6 +1003,14 @@ mod tests {
             (3, 2, 90.0)
         );
         assert_eq!((s.subjects[0].flags, s.subjects[1].flags), (2 | 64, 256));
+        // crowd_mean is found's mean: every actor within the radius, so above max when more stand there than it reads
+        // (the 0.1.15 live check: 32.5 with max 30).
+        let later = Sample {
+            t: 1.5,
+            ..s.clone()
+        };
+        let m = metrics(&[s.clone(), later], CONTACT_M).unwrap();
+        assert_eq!(m.crowd_mean, 3.0);
         let by_id = Sample::new(0.5, &actors, None, &Reference::Id(5)).unwrap();
         assert_eq!(
             (by_id.reference.unwrap().pos, by_id.subjects.len()),

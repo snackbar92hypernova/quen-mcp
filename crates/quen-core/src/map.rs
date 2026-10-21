@@ -18,8 +18,15 @@ pub const MAX_CELLS: usize = 10_000;
 pub const MAX_SIDE_M: f64 = 200.0;
 /// The picture's pixels per cell.
 pub const PX: usize = 8;
-/// Covered: the ground ray's hit this far above the navmesh z (a roof, an arch, an overhang).
+/// Covered: the ground ray's or the roof ray's hit this far above the navmesh z (a roof, an arch, an overhang).
 pub const COVER_M: f64 = 2.2;
+/// The roof ray: up from a walkable cell's navmesh z this far, where the ground ray (from at.z + z_range) didn't reach.
+/// It starts on the navmesh, in the open, so a low cave's ceiling is hit from below, not from inside the rock.
+pub const ROOF_UP_M: f64 = 6.0;
+/// GetWaterDepth above this is the game's no-water value (10000): its scripts read it as 0, six of them with this test
+/// (`btCondWaterDepth.ws`, `btTaskDiveCheck.ws`), three with == 10000 (`btTaskTeleport.ws`, the horse's
+/// `exploration.ws`).
+pub const NO_WATER_ABOVE: f64 = 1000.0;
 /// Ledge: no navmesh, the ground hit within this of the reference.
 pub const LEDGE_M: f64 = 0.3;
 /// The narrowest chokepoints a map lists.
@@ -127,7 +134,13 @@ impl Frame {
     }
 }
 
-/// One cell's scene.ground reading.
+/// A GetWaterDepth read-back as a depth: none for null and for the game's no-water value ([`NO_WATER_ABOVE`]). 0 or
+/// below is no water at the point (−28.7 on Novigrad's square, the 0.1.11 live check).
+pub fn water_depth(v: &Value) -> Option<f64> {
+    v.as_f64().filter(|d| *d <= NO_WATER_ABOVE)
+}
+
+/// One cell's scene.ground reading, and its roof ray's.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Reading {
     pub nav_z: Option<f64>,
@@ -135,8 +148,12 @@ pub struct Reading {
     pub free: Option<bool>,
     /// The ray down's hit z; none without a hit.
     pub top_z: Option<f64>,
-    /// GetWaterDepth (the scripts treat above 0 as water).
-    pub water_m: f64,
+    /// GetWaterDepth ([`water_depth`]): water when above 0.
+    pub water_m: Option<f64>,
+    /// GetWaterLevel: the water surface's z.
+    pub water_z: Option<f64>,
+    /// The roof ray's hit z ([`roofs`]); none without a hit or a ray.
+    pub roof_z: Option<f64>,
 }
 
 impl Reading {
@@ -146,9 +163,32 @@ impl Reading {
             nav_z: v["nav_z"].as_f64(),
             free: v["free"].as_bool(),
             top_z: v["ground"]["pos"][2].as_f64(),
-            water_m: v["water_depth"].as_f64().unwrap_or(0.0),
+            water_m: water_depth(&v["water_depth"]),
+            water_z: v["water_level"].as_f64(),
+            roof_z: None,
         }
     }
+}
+
+/// The roof rays a grid's readings need: per walkable cell (navmesh, a free circle) not covered by its ground ray, one
+/// ray from its navmesh z up [`ROOF_UP_M`], unless the ground ray started that high already. Cell index, from, to.
+pub fn roofs(
+    frame: &Frame,
+    z_range: f64,
+    cells: &[Option<Reading>],
+) -> Vec<(usize, [f64; 3], [f64; 3])> {
+    let top = frame.at[2] + z_range;
+    cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let c = c.as_ref().filter(|c| c.free == Some(true))?;
+            let z = c.nav_z?;
+            let covered = c.top_z.is_some_and(|t| t > z + COVER_M);
+            let [x, y] = frame.centre(i);
+            (!covered && top < z + ROOF_UP_M).then_some((i, [x, y, z], [x, y, z + ROOF_UP_M]))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,9 +197,9 @@ pub enum Class {
     Walkable,
     /// Navmesh, the circle not free.
     Tight,
-    /// Walkable under something: the ray hit over [`COVER_M`] above the navmesh z.
+    /// Walkable under something: the ground or roof ray hit over [`COVER_M`] above the navmesh z.
     Covered,
-    /// No navmesh, water.
+    /// No navmesh, a water depth above 0 and its surface at or above the ground hit (with no hit: within the band).
     Water,
     /// No navmesh, a hit in the band away from the reference: its height is the hit's z over it.
     Obstacle,
@@ -219,13 +259,25 @@ pub struct Classified {
     pub height: Vec<Option<f64>>,
 }
 
-pub fn classify(frame: &Frame, cells: &[Option<Reading>]) -> Classified {
+/// The cells' classes; the band is the map's z ± `z_range`.
+pub fn classify(frame: &Frame, z_range: f64, cells: &[Option<Reading>]) -> Classified {
     let nav = |r: &Reading| {
-        r.nav_z.map(|z| match (r.free, r.top_z) {
-            (Some(true), Some(top)) if top > z + COVER_M => Class::Covered,
-            (Some(true), _) => Class::Walkable,
-            _ => Class::Tight,
+        r.nav_z.map(|z| {
+            let over = |hit: Option<f64>| hit.is_some_and(|h| h > z + COVER_M);
+            match r.free {
+                Some(true) if over(r.top_z) || over(r.roof_z) => Class::Covered,
+                Some(true) => Class::Walkable,
+                _ => Class::Tight,
+            }
         })
+    };
+    // A deck or ground hit above the water wins (St. Gregory's Bridge, the 0.1.15 live check: the canal 31 m below).
+    let wet = |r: &Reading| {
+        r.water_m.is_some_and(|d| d > 0.0)
+            && r.water_z.is_some_and(|w| match r.top_z {
+                Some(top) => w >= top,
+                None => (w - frame.at[2]).abs() <= z_range,
+            })
     };
     let walkable = |want: fn(Class) -> bool| {
         cells
@@ -249,7 +301,7 @@ pub fn classify(frame: &Frame, cells: &[Option<Reading>]) -> Classified {
             if let Some(c) = nav(r) {
                 return c;
             }
-            if r.water_m > 0.0 {
+            if wet(r) {
                 return Class::Water;
             }
             let Some(top) = r.top_z else {
@@ -1335,7 +1387,7 @@ pub struct Grid {
     pub edges: Vec<Vec<[f64; 2]>>,
 }
 
-/// A cell's flags in the map's file: 1 nav_z, 2 free, 4 a ground hit, 8 water (depth above 0), 16 read, 32 walkable.
+/// A cell's flags in the map's file: 1 nav_z, 2 free, 4 a ground hit, 8 a water depth above 0, 16 read, 32 walkable.
 const NAV: u32 = 1;
 const FREE: u32 = 2;
 const HIT: u32 = 4;
@@ -1345,7 +1397,7 @@ const MASK: u32 = 32;
 
 impl Grid {
     pub fn new(frame: Frame, z_range: f64, radius: f64, cells: Vec<Option<Reading>>) -> Grid {
-        let classified = classify(&frame, &cells);
+        let classified = classify(&frame, z_range, &cells);
         let mask: Vec<bool> = classified.class.iter().map(|c| c.walkable()).collect();
         let clearance = clearance(&frame, &mask);
         Grid {
@@ -1426,15 +1478,14 @@ impl Grid {
                     READ | if c.nav_z.is_some() { NAV } else { 0 }
                         | if c.free == Some(true) { FREE } else { 0 }
                         | if c.top_z.is_some() { HIT } else { 0 }
-                        | if c.water_m > 0.0 { WET } else { 0 }
+                        | if c.water_m.is_some_and(|d| d > 0.0) {
+                            WET
+                        } else {
+                            0
+                        }
                         | if m { MASK } else { 0 }
                 })
             })
-            .collect();
-        let water: Vec<Option<f64>> = self
-            .cells
-            .iter()
-            .map(|c| c.map(|c| r(c.water_m, 3)))
             .collect();
         let class: Vec<usize> = self.classified.class.iter().map(|c| c.index()).collect();
         let heights: Vec<Option<f64>> = self
@@ -1452,10 +1503,12 @@ impl Grid {
         );
         out.insert("nav_z".into(), json!(z(|c| c.nav_z)));
         out.insert("top_z".into(), json!(z(|c| c.top_z)));
-        out.insert("water_m".into(), json!(water));
+        out.insert("water_m".into(), json!(z(|c| c.water_m)));
+        out.insert("water_z".into(), json!(z(|c| c.water_z)));
+        out.insert("roof_z".into(), json!(z(|c| c.roof_z)));
         out.insert(
             "flags".into(),
-            json!({"bits": "1 nav_z, 2 free, 4 ground hit, 8 water, 16 read, 32 walkable", "cells": flags}),
+            json!({"bits": "1 nav_z, 2 free, 4 ground hit, 8 water depth above 0, 16 read, 32 walkable", "cells": flags}),
         );
         out.insert(
             "class".into(),
@@ -1499,7 +1552,9 @@ impl Grid {
                         nav_z,
                         free: nav_z.map(|_| f & FREE != 0),
                         top_z: top[i].as_f64(),
-                        water_m: water[i].as_f64().unwrap_or(0.0),
+                        water_m: water_depth(&water[i]),
+                        water_z: v["water_z"][i].as_f64(),
+                        roof_z: v["roof_z"][i].as_f64(),
                     }
                 })
             })
@@ -1749,7 +1804,9 @@ mod tests {
                 nav_z,
                 free,
                 top_z,
-                water_m,
+                water_m: Some(water_m),
+                water_z: Some(9.5),
+                roof_z: None,
             })
         };
         let cells = vec![
@@ -1762,7 +1819,7 @@ mod tests {
             read(None, None, None, 0.0),
             None,
         ];
-        let c = classify(&frame, &cells);
+        let c = classify(&frame, 2.0, &cells);
         use Class::*;
         assert_eq!(
             c.class,
@@ -1786,7 +1843,7 @@ mod tests {
             read(None, None, Some(10.2), 0.0),
         ];
         let frame = Frame::new([0.0, 0.0, 10.0], [2.0, 1.0], 1.0).unwrap();
-        assert_eq!(classify(&frame, &ledge).class, [Walkable, Ledge]);
+        assert_eq!(classify(&frame, 2.0, &ledge).class, [Walkable, Ledge]);
         let read = Reading::from_ground(
             &json!({"nav_z": 3.5, "ground": {"pos": [1, 2, 3], "normal": [0, 0, 1]},
             "water_level": 0, "water_depth": -2.0, "free": false, "safe": null}),
@@ -1797,8 +1854,106 @@ mod tests {
                 nav_z: Some(3.5),
                 free: Some(false),
                 top_z: Some(3.0),
-                water_m: -2.0
+                water_m: Some(-2.0),
+                water_z: Some(0.0),
+                roof_z: None,
             }
+        );
+    }
+
+    /// GetWaterDepth's no-water value (10000, the Velen cellar of the 0.1.15 live check) is no depth, and dry land's
+    /// negative depth (Novigrad's square: −28.7) and 0 are no water: earth around a dry cellar reads as earth.
+    #[test]
+    fn the_no_water_value_and_dry_depths_are_not_water() {
+        assert_eq!(water_depth(&json!(10000.0)), None);
+        assert_eq!(water_depth(&json!(1000.5)), None);
+        assert_eq!(water_depth(&Value::Null), None);
+        assert_eq!(water_depth(&json!(-28.7)), Some(-28.7));
+        assert_eq!(water_depth(&json!(2.5)), Some(2.5));
+        let cellar = |depth: f64, top_z: Option<f64>| {
+            Reading::from_ground(
+                &json!({"nav_z": null, "ground": top_z.map(|z| json!({"pos": [0, 0, z]})),
+                "water_level": -0.2, "water_depth": depth, "free": null, "safe": null}),
+            )
+        };
+        let frame = Frame::new([0.0, 0.0, -1.0], [4.0, 1.0], 1.0).unwrap();
+        let cells = [
+            cellar(10000.0, None),
+            cellar(10000.0, Some(-1.5)),
+            cellar(-28.7, None),
+            cellar(0.0, Some(-1.5)),
+        ];
+        let c = classify(&frame, 2.0, &cells.map(Some));
+        use Class::*;
+        assert_eq!(c.class, [Tall, Obstacle, Tall, Obstacle]);
+        assert_eq!(cells[0].water_m, None);
+    }
+
+    /// Water below a deck: a ground hit above the water surface wins; with no hit in the band the water counts only
+    /// when its surface is in the band (the canal 31 m below the bridge is a drop: tall). A surface at or above the
+    /// hit (submerged ground) or in the band without a hit is water. The navmesh wins over water, as before.
+    #[test]
+    fn water_below_a_deck_is_the_deck() {
+        let frame = Frame::new([0.0, 0.0, 31.0], [6.0, 1.0], 1.0).unwrap();
+        let cell = |nav_z: Option<f64>, top_z: Option<f64>, water_z: f64| {
+            Some(Reading {
+                nav_z,
+                free: nav_z.map(|_| true),
+                top_z,
+                water_m: Some(4.0),
+                water_z: Some(water_z),
+                roof_z: None,
+            })
+        };
+        let cells = [
+            cell(None, Some(32.0), 0.1),
+            cell(None, None, 0.1),
+            cell(None, Some(29.5), 30.0),
+            cell(None, None, 30.0),
+            cell(None, Some(31.0), 31.0),
+            cell(Some(31.5), Some(31.0), 32.0),
+        ];
+        let c = classify(&frame, 2.0, &cells);
+        use Class::*;
+        assert_eq!(c.class, [Obstacle, Tall, Water, Water, Water, Walkable]);
+    }
+
+    /// Cover past the band: a roof ray up ROOF_UP_M from each walkable cell's navmesh z the ground ray didn't cover, none
+    /// for a tight cell, one the ground ray covered, or a band that already reaches that high; its hit over COVER_M
+    /// above the navmesh z makes the cell covered, a lower one doesn't.
+    #[test]
+    fn the_roof_ray_sees_cover_above_the_band() {
+        let frame = Frame::new([0.0, 0.0, 10.0], [5.0, 1.0], 1.0).unwrap();
+        let cell = |free: bool, top_z: f64| {
+            Some(Reading {
+                nav_z: Some(10.5),
+                free: Some(free),
+                top_z: Some(top_z),
+                ..Reading::default()
+            })
+        };
+        let mut cells = vec![
+            cell(true, 10.0),
+            cell(true, 10.0),
+            cell(false, 10.0),
+            cell(true, 12.9),
+            None,
+        ];
+        let rays = roofs(&frame, 2.0, &cells);
+        let up: Vec<usize> = rays.iter().map(|r| r.0).collect();
+        assert_eq!(up, [0, 1], "walkable, uncovered cells only");
+        assert_eq!(rays[0].1, [-2.0, 0.0, 10.5]);
+        assert_eq!(rays[0].2, [-2.0, 0.0, 10.5 + ROOF_UP_M]);
+        assert!(
+            roofs(&frame, 6.5, &cells).is_empty(),
+            "the ground ray started at 16.5 m, ROOF_UP_M above the navmesh"
+        );
+        cells[0].as_mut().unwrap().roof_z = Some(13.0);
+        cells[1].as_mut().unwrap().roof_z = Some(12.5);
+        use Class::*;
+        assert_eq!(
+            classify(&frame, 2.0, &cells).class,
+            [Covered, Walkable, Tight, Covered, Unread]
         );
     }
 
@@ -2139,7 +2294,9 @@ mod tests {
                 nav_z: Some(1.5),
                 free: Some(free),
                 top_z: Some(1.0),
-                water_m: 0.0,
+                water_m: Some(0.0),
+                water_z: Some(-0.5),
+                roof_z: free.then_some(4.0),
             })
         };
         let cells = vec![
