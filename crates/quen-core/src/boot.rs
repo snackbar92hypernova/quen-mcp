@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::journal::{Action, Fs, Journal, sha256_hex};
 use crate::park::{self, Entry, Listing};
-use crate::reshade::{self, Value};
+use crate::reshade::{self, Missing, Value};
 use crate::settings;
 
 /// The parking folder in the game folder: parked Mods folders go to its `Mods\`, bin files to its `bin\`.
@@ -821,11 +821,18 @@ fn reshade_ini(
 ) -> Result<Vec<u8>, String> {
     let mut out = data.to_vec();
     if let Some(path) = load_from_dll_main {
+        // Live 2026-10-22: an ini without [ADDON] LoadFromDllMain (ReShade's fresh one) loads no devkit. Emptying the
+        // line leaves such an ini as it is; loading the devkit adds the key, and the section if need be.
+        let missing = if path.is_empty() {
+            Missing::Skip
+        } else {
+            Missing::AddSection
+        };
         out = reshade::set_values(
             &out,
             "ADDON",
             &[("LoadFromDllMain", Value::Text(path))],
-            false,
+            missing,
         )?;
     }
     let Some(renodx) = renodx else {
@@ -835,7 +842,12 @@ fn reshade_ini(
         .addon
         .rsplit_once('.')
         .map_or(renodx.addon, |(stem, _)| stem);
-    out = reshade::set_values(&out, stem, &[("DevAutoReload", Value::Number(1.0))], true)?;
+    out = reshade::set_values(
+        &out,
+        stem,
+        &[("DevAutoReload", Value::Number(1.0))],
+        Missing::Add,
+    )?;
     // The harness's parse_kv: `+Key` may be added; a key named twice keeps its first place and its last value.
     let mut values: Vec<(&str, f64, bool)> = Vec::new();
     for &(key, value) in renodx.preset {
@@ -853,7 +865,8 @@ fn reshade_ini(
             .map(|&(k, v, _)| (k, Value::Number(v)))
             .collect();
         if !some.is_empty() {
-            out = reshade::set_values(&out, &preset, &some, add)?;
+            let missing = if add { Missing::Add } else { Missing::Refuse };
+            out = reshade::set_values(&out, &preset, &some, missing)?;
         }
     }
     Ok(out)
@@ -1071,6 +1084,55 @@ mod tests {
         let mut after = fs.files();
         after.retain(|p, _| !p.starts_with("QUEN"));
         assert_eq!(after, before);
+    }
+
+    /// Live 2026-10-22: the launch was refused over a ReShade.ini without [ADDON], as ReShade writes it fresh. With
+    /// the devkit off, such an ini (or an [ADDON] without the key) gets no change; with it on, the section or the key
+    /// is added, and the replay gives back the user's bytes. [ADDON] twice is still refused.
+    #[test]
+    fn an_ini_without_the_devkit_line_is_left_or_gets_it() {
+        let ini = Path::new("GAME/bin/x64_dx12/ReShade.ini");
+        let path = r"devkit\renodx-devkit.addon64";
+        let line = format!("LoadFromDllMain={path}\r\n");
+        let fresh = "\u{feff}[GENERAL]\r\nPresetPath=.\\ReShadePreset.ini\r\n";
+        let no_key = "\u{feff}[ADDON]\r\nOther=1\r\n\r\n[GENERAL]\r\n";
+        let cases = [
+            (fresh, format!("{fresh}[ADDON]\r\n{line}")),
+            (
+                no_key,
+                no_key.replace("Other=1\r\n", &format!("Other=1\r\n{line}")),
+            ),
+        ];
+        for (data, want) in cases {
+            let fs = game();
+            fs.put(ini, data);
+            let before = fs.files();
+            let mut inp = inputs(&[], &[]);
+            let rewrite = |changes: &[Change]| {
+                changes.iter().find_map(|c| match c {
+                    Change::Rewrite { path, bytes, .. } if path == ini => Some(bytes.clone()),
+                    _ => None,
+                })
+            };
+            inp.load_from_dll_main = Some("");
+            assert_eq!(rewrite(&plan(&fs, &inp).unwrap()), None, "{data:?}");
+            inp.load_from_dll_main = Some(path);
+            let changes = plan(&fs, &inp).unwrap();
+            assert_eq!(rewrite(&changes), Some(want.into_bytes()), "{data:?}");
+            let journal_path = Path::new("QUEN/journal.jsonl");
+            let mut journal = Journal::create(&fs, journal_path).unwrap();
+            apply(&fs, &mut journal, &changes, &|| false).unwrap();
+            let report = replay(&fs.read(journal_path).unwrap(), &fs);
+            assert!(report.clean(), "{report:#?}");
+            let mut after = fs.files();
+            after.retain(|p, _| !p.starts_with("QUEN"));
+            assert_eq!(after, before);
+        }
+        let twice = b"[ADDON]\r\nLoadFromDllMain=\r\n[ADDON]\r\n";
+        for path in ["", path] {
+            let err = reshade_ini(twice, None, Some(path)).unwrap_err();
+            assert_eq!(err, "[ADDON] found 2 times");
+        }
     }
 
     /// A synthetic game: settings, general.ini, ReShade and two mods; `steam_appid.txt` missing.
