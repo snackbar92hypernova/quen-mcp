@@ -444,9 +444,12 @@ const SETUP: [&str; 11] = [
 ///   its own). cvars and console and exec lines stay: what they change may outlast a load.
 /// - A time, a weather, a position (`game_teleport` or `game_place`) or a cvar of one name that a later call sets again,
 ///   with no console or exec line between (such a line may depend on it, e.g. a spawn where the player stands).
+/// - A photo call or camera pose whose photo mode the replay doesn't open (`photo`: the launch opens it), which its tool
+///   would refuse: its `enter` was a run_plan step, which isn't noted (the 0.1.12 live check), or a load closed it; an
+///   `enter` while it is open.
 // ponytail: a closed list of what a load or a later call undoes, from finding 33 and the tools' own words; a console or
 // exec line is never dropped, since what it changes is unknown.
-fn replayed(setup: &[Value]) -> Vec<Value> {
+fn replayed(setup: &[Value], photo: bool) -> Vec<Value> {
     let tool = |s: &Value| s["tool"].as_str().unwrap_or_default().to_string();
     let action = |s: &Value| s["args"]["action"].as_str().map(str::to_string);
     let mut keep = vec![true; setup.len()];
@@ -508,6 +511,26 @@ fn replayed(setup: &[Value]) -> Vec<Value> {
             .any(|s| kind(s).as_deref() == Some(&k))
         {
             keep[i] = false;
+        }
+    }
+    // Photo mode as the calls kept so far leave it.
+    let mut open = photo;
+    for (i, step) in setup.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        match (tool(step).as_str(), action(step).as_deref()) {
+            ("game_photo", Some("enter")) => {
+                keep[i] = !open;
+                open = true;
+            }
+            ("game_photo", Some("exit")) => {
+                keep[i] = open;
+                open = false;
+            }
+            ("game_photo" | "game_camera", _) => keep[i] = open,
+            ("game_load", _) => open = false,
+            _ => {}
         }
     }
     setup
@@ -1664,7 +1687,13 @@ impl<'a> Session<'a> {
                 .to_string()
                 .into();
         };
-        let (setup, mut repeat) = (replayed(&last.setup), last.args.clone());
+        // The launch enters photo mode unless its arguments say photo false.
+        let photo = last
+            .args
+            .get("photo")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let (setup, mut repeat) = (replayed(&last.setup, photo), last.args.clone());
         let skipped = last.setup.len() - setup.len();
         if plan {
             let mut done = self.launch(call, &repeat, true);
@@ -2614,11 +2643,41 @@ mod tests {
         for (n, step) in setup.iter_mut().enumerate() {
             step["n"] = json!(n);
         }
-        let kept: Vec<u64> = replayed(&setup)
+        let kept: Vec<u64> = replayed(&setup, false)
             .iter()
             .map(|k| k["n"].as_u64().unwrap())
             .collect();
         assert_eq!(kept, [1, 2, 4, 9, 10, 11, 13, 14, 15, 18, 19, 20, 21]);
+        // The 0.1.12 live check: an exit whose enter was a run_plan step (not noted) would be refused, so it goes; with
+        // the launch's own photo mode open it stays, a load closes it, and an enter into an open one goes.
+        let exit = s("game_photo", json!({"action": "exit"}));
+        let pose = s("game_camera", json!({"pos": [0, 0, 0]}));
+        let load = s("game_load", json!({"save": "a"}));
+        let enter = s("game_photo", json!({"action": "enter"}));
+        let exec = s("game_exec", json!({"line": "x()"}));
+        let lone = [exec.clone(), exit.clone()];
+        assert_eq!(replayed(&lone, false), std::slice::from_ref(&exec));
+        assert_eq!(replayed(&lone, true), lone);
+        let after = [pose.clone(), exit.clone(), pose.clone()];
+        assert_eq!(replayed(&after, true), [pose, exit.clone()]);
+        assert_eq!(replayed(&[load.clone(), exit], true), [load]);
+        assert_eq!(replayed(&[enter.clone(), exec.clone()], true), [exec]);
+    }
+
+    #[test]
+    fn the_relaunch_skips_nothing_else_by_photo_mode() {
+        let s = |tool: &str, args: Value| json!({"tool": tool, "args": args});
+        let enter = s("game_photo", json!({"action": "enter"}));
+        let time = s("game_photo", json!({"action": "time", "minute": 600}));
+        let exec = s("game_exec", json!({"line": "x()"}));
+        // A visit with a line inside it isn't moot, and its calls stand in their open photo mode.
+        let visit = [
+            enter.clone(),
+            time,
+            exec,
+            s("game_photo", json!({"action": "exit"})),
+        ];
+        assert_eq!(replayed(&visit, false), visit);
     }
 
     /// Feature tests 2b: a boot quen recovered kept the end's "close it, then session_recover". Once replayed, the

@@ -136,7 +136,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "game_place",
             "description": "Place the player on the navmesh at pos: z from NavigationComputeZ within 5 m of pos's z \
-                (default the player's), then a free circle of radius there; with search, the nearest safe spot within \
+                (default the player's), then a free circle of radius there (navmesh: nav_z, free, safe as read); with \
+                search, the nearest safe spot within \
                 it if the circle isn't free (moved_m). Facing face (a point) or yaw, default the current heading. Then \
                 the teleport verb, as game_teleport sends it (journaled; every save the game writes after it counts as \
                 tainted; sent: its pos and yaw), then placed: the player's pose read back (world_get; the game sets him \
@@ -703,7 +704,14 @@ fn frame(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         };
         if let Some(tag) = &tag {
             match camera::grab(session, &cx.live.token, &format!("{tag}-{label}"), "sdr") {
-                Ok(id) => side.insert("capture_id".into(), json!(id)),
+                // The 0.1.12 live check: a plan's result lacked them. Each side's file and row are game_frame's.
+                Ok((id, path)) => {
+                    call.row("captures", id);
+                    if let Some(path) = path {
+                        call.artifact(&path);
+                    }
+                    side.insert("capture_id".into(), json!(id))
+                }
                 Err(e) => {
                     return Err(failed(
                         format!("side {label}, capture: {}", why(e)),
@@ -786,7 +794,10 @@ fn place(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     check(&verb)?;
     let ground = send(&cx, verb, &fields)?;
     let ground = items(&ground, 1, &fields)?.remove(0);
-    fields.insert("ground".into(), ground.clone());
+    // What the placement reads: the navmesh. The read's own ground ray, from 5 m up, can hit an overhang (the 0.1.12 live
+    // check: 15.236 at a wall's foot), so it isn't reported here.
+    let navmesh = json!({"nav_z": ground["nav_z"], "free": ground["free"], "safe": ground["safe"]});
+    fields.insert("navmesh".into(), navmesh);
     let Some(nav_z) = ground["nav_z"].as_f64() else {
         let why = format!(
             "no navmesh within {PLACE_RANGE} m of z {z} at x {}, y {}: nothing moved",
@@ -1073,9 +1084,19 @@ mod tests {
         // world.get, scene.frame (the subject), scene.ray (every side), cam.noclip, then cam.set and scene.frame a side.
         let server = framing_game(&fx, 4 + 2 * 3);
         let mut session = fx.session();
-        let args = json!({"token": "tok", "sides": ["front", "back", "-90"], "distance": 3, "height": 0.5, "fov": 35});
+        let args = json!({"token": "tok", "sides": ["front", "back", "-90"], "distance": 3, "height": 0.5, "fov": 35,
+                          "tag": "f"});
+        let mut ids = 40;
+        crate::camera::tests::set_grab(Some(Box::new(move |_| {
+            ids += 1;
+            Ok(ids)
+        })));
         let out = run(&mut session, "game_frame", args);
+        crate::camera::tests::set_grab(None);
         assert_eq!(out["ok"], true, "{out}");
+        // The 0.1.12 live check: each side's capture row in game_frame's own envelope (a plan's merges them).
+        assert_eq!(out["ledger"]["captures"], json!([41, 42, 43]), "{out}");
+        assert_eq!(out["sides"][2]["capture_id"], 43, "{out}");
         assert_eq!(out["subject"]["aim_at"], json!([100.0, 200.0, 31.2]));
         let sides = out["sides"].as_array().unwrap();
         assert_eq!(sides.len(), 3);

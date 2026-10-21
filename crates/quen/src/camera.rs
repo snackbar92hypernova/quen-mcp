@@ -4,6 +4,7 @@
 //! command channel (channel.rs). quen sends a path once; the game interpolates it, one camera set per game tick
 //! (W3Quen.asi ports quen-core's `sweep::Path`), and in frame step sets each frame when quen asks for it.
 
+use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -799,7 +800,7 @@ fn step(
         fields.insert("off".into(), off_json(worst));
         sleep(p.settle);
         let tag = format!("{}-{n:05}", p.tag);
-        let capture = grab(session, &cx.live.token, &tag, p.method)?;
+        let (capture, _) = grab(session, &cx.live.token, &tag, p.method)?;
         let sha = ledger
             .add_sweep_frame(&SweepFrame {
                 run_id: run,
@@ -828,18 +829,24 @@ fn step(
     Ok(done)
 }
 
-/// One frame: game_screenshot tagged `tag`, and its first capture row (the .npy of an hdr shot, else the .png). The
-/// screenshot's own timing and artifacts stay out of sweep_play's envelope: its run and frames name them.
-pub(crate) fn grab(session: &Session, token: &str, tag: &str, method: &str) -> Result<i64, Done> {
+/// One frame: game_screenshot tagged `tag`, and its first capture row (the .npy of an hdr shot, else the .png) and that
+/// file. The screenshot's own timing and artifacts stay out of sweep_play's envelope: its run and frames name them.
+pub(crate) fn grab(
+    session: &Session,
+    token: &str,
+    tag: &str,
+    method: &str,
+) -> Result<(i64, Option<PathBuf>), Done> {
     #[cfg(test)]
     if let Some(got) = tests::grab(tag) {
-        return got;
+        return got.map(|id| (id, None));
     }
     let mut shot = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
     let args = json!({"token": token, "tag": tag, "method": method});
     let fields = capture::screenshot(session, &mut shot, &args)?;
+    let path = fields["captures"][0]["path"].as_str().map(PathBuf::from);
     match fields["captures"][0]["id"].as_i64() {
-        Some(id) => Ok(id),
+        Some(id) => Ok((id, path)),
         None => Err(Done::Failed(format!("frame {tag}: no capture row"), fields)),
     }
 }
@@ -857,7 +864,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    type Grab = Box<dyn FnMut(&str) -> Result<i64, Done>>;
+    pub(crate) type Grab = Box<dyn FnMut(&str) -> Result<i64, Done>>;
 
     thread_local! {
         /// Unit tests' frame grab: the tag in, a capture row's id out. Unset, game_screenshot runs.
@@ -866,6 +873,11 @@ pub(crate) mod tests {
 
     pub(super) fn grab(tag: &str) -> Option<Result<i64, Done>> {
         GRAB.with_borrow_mut(|g| g.as_mut().map(|g| g(tag)))
+    }
+
+    /// Sets the unit tests' frame grab (scene.rs's game_frame tests).
+    pub(crate) fn set_grab(grab: Option<Grab>) {
+        GRAB.set(grab);
     }
 
     fn run(session: &Session, tool: &str, args: Value) -> Value {

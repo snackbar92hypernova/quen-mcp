@@ -58,6 +58,11 @@ pub(crate) const READY_MAX: Duration = Duration::from_secs(10);
 // ponytail: when one escape closed the focus-loss menu, it did within the old 10 s wait; 3 s each is a guess.
 const MENU_ESCAPES: usize = 3;
 pub(crate) const MENU_WAIT: Duration = Duration::from_secs(3);
+/// How long quen's state must hold before quen closes a menu it shows, and the longest wait for that.
+// ponytail: 1 s against the 0.27 s flicker after a photo exit (one live check); the wait cap covers a state that
+// keeps changing.
+const HELD: Duration = Duration::from_secs(1);
+const HELD_MAX: Duration = Duration::from_secs(3);
 /// How long an ASI's `*_SetMode` may run in the game.
 const CALL_MAX: Duration = Duration::from_secs(10);
 /// game_scriptlog: the most lines it returns, the end of the log it reads, and the longest line it returns.
@@ -442,7 +447,7 @@ impl Ctx<'_> {
     }
 
     /// Waits up to `max` for quen's last state flags to pass `want`; the last flags seen if they don't.
-    fn wait_for(
+    pub(crate) fn wait_for(
         &self,
         call: &Call,
         max: Duration,
@@ -468,7 +473,7 @@ impl Ctx<'_> {
     /// What it did, for the result's `menu`. Photo mode has no focus-loss menu (seen in the first experiment boot), and
     /// escape there would leave photo mode.
     pub(crate) fn close_menu(&self, call: &Call, max: Duration) -> Result<String, String> {
-        if !self.last_flags().is_some_and(menu_to_close) {
+        if !self.held_flags(call).is_some_and(menu_to_close) {
             let old =
                 doctor::package_version(self.config).filter(|v| doctor::BEFORE_MENU.contains(v));
             return Ok(match old {
@@ -660,6 +665,25 @@ impl Ctx<'_> {
     /// quen's last state flags in this launch (`state_flags`); none at the main menu before the first load.
     pub(crate) fn last_flags(&self) -> Option<i64> {
         state_flags(self.config, self.live.launched).last().copied()
+    }
+
+    /// quen's last state flags once its last push is [`HELD`] old, waited for up to [`HELD_MAX`]: a state that changes
+    /// again within it isn't one to act on. The 0.1.12 live check: closing photo mode pushed the menu bit and cleared it
+    /// 0.27 s later, and an escape sent on that bit opened the pause menu. A log without push ticks: the last flags.
+    pub(crate) fn held_flags(&self, call: &Call) -> Option<i64> {
+        let start = Instant::now();
+        loop {
+            let text = state_text(self.config, self.live.launched);
+            let last = bridge_log::flags(&text).last().copied();
+            let pushed = bridge_log::pushes(&text).last().map(|(t, _)| *t);
+            let age = pushed.map(|t| crate::win::tick().saturating_sub(t));
+            match age.filter(|a| *a < HELD.as_millis() as u64) {
+                Some(a) if start.elapsed() < HELD_MAX && !call.stopped() => {
+                    sleep(Duration::from_millis(HELD.as_millis() as u64 - a).min(POLL));
+                }
+                _ => return last,
+            }
+        }
     }
 
     /// Waits out [`photo_settle`] on quen's state log, before a key goes to the game.
@@ -2355,6 +2379,62 @@ if os.path.exists(act): exec(open(act).read())
             "{out}"
         );
         assert_eq!(fx.calls().len(), 6, "typed into the menu");
+    }
+
+    /// The 0.1.12 live check (lc1c): closing photo mode pushed the menu bit, then none 0.27 s later; an escape sent on the
+    /// first push opened the real pause menu. A menu bit is acted on only once it has held for a second: the flicker
+    /// sends nothing, from close_menu and from the measure tools' bring-back; a menu that holds gets its escape.
+    #[test]
+    fn a_menu_bit_that_clears_at_once_is_left_alone() {
+        let fx = Fake::new("menu-flicker");
+        let log = fx.dir.join("game/bin/x64_dx12/W3QuenState.log");
+        let session = fx.session();
+        let call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let cx = ctx(&session, &json!({"token": "tok"}), &[]).unwrap();
+        let quick = Duration::from_millis(300);
+        // Photo mode open long ago, its exit's menu bit now, gameplay 0.27 s later (pushed by a thread, as the game would).
+        let flicker = |log: &std::path::Path| {
+            let now = crate::win::tick();
+            fs::write(
+                log,
+                format!(
+                    "{} push=26 flags=2177\n{now} push=27 flags=2049\n",
+                    now - 5000
+                ),
+            )
+            .unwrap();
+            let log = log.to_path_buf();
+            std::thread::spawn(move || {
+                sleep(Duration::from_millis(270));
+                let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+                writeln!(f, "{} push=28 flags=1", crate::win::tick()).unwrap();
+            })
+        };
+        let pushed = flicker(&log);
+        let said = cx.close_menu(&call, quick).unwrap();
+        pushed.join().unwrap();
+        assert!(said.contains("no menu to close"), "{said}");
+        let pushed = flicker(&log);
+        let back = crate::measure::game_back(&cx, &call);
+        pushed.join().unwrap();
+        assert!(matches!(back, Ok(None)), "brought back");
+        assert!(
+            fx.calls().is_empty(),
+            "an escape went out: {:?}",
+            fx.calls()
+        );
+        // The pause menu, there since 2 s: escaped, as before.
+        let state = log.clone();
+        fx.on_input(move |_| {
+            let mut f = fs::OpenOptions::new().append(true).open(&state).unwrap();
+            writeln!(f, "{} push=30 flags=1", crate::win::tick()).unwrap();
+            Ok(())
+        });
+        let held = crate::win::tick() - 2000;
+        fs::write(&log, format!("{held} push=29 flags=2049\n")).unwrap();
+        let said = cx.close_menu(&call, quick).unwrap();
+        assert!(said.starts_with("closed"), "{said}");
+        assert_eq!(fx.calls(), ["keys escape"]);
     }
 
     /// Feature tests 4: at a play boot's main menu, quen's state log is the previous boot's until the first push of

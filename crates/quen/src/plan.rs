@@ -434,11 +434,12 @@ fn before(
     if cx.live.job.pids().unwrap_or_default().is_empty() {
         return Err("the game exited".into());
     }
-    let last = cx.last_flags();
-    if !last.is_some_and(game::in_game) {
+    // A long teleport fades (flags 257 after a 215 m game_place, the 0.1.12 live check): waited out.
+    if let Err(last) = cx.wait_for(call, game::READY_MAX, game::in_game) {
         return Err(format!(
-            "quen's state shows {}, neither gameplay nor photo mode",
-            game::shown(last)
+            "quen's state showed {} for {} s, neither gameplay nor photo mode",
+            game::shown(last),
+            game::READY_MAX.as_secs()
         ));
     }
     if tool == "wait" || !notice::needs_front(tool) {
@@ -514,6 +515,7 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
         return Err(why.into());
     }
     let start = Instant::now();
+    let mut aborted = None;
     {
         let cx = ctx(session, &token, &[])?;
         // The checks before every step that need no change, before the plan's file is written.
@@ -534,11 +536,19 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             && let Some(notice) = notice::measuring(&cx, call, estimate.ceil() as u64, &mut None)
         {
             fields.insert("notice".into(), json!(notice));
+            // Its 9 s are the plan's own, not its first capture's (the 0.1.12 live check: in game_frame's s).
+            let t = Instant::now();
+            if let Err(why) = notice::clear(cx.live, call) {
+                aborted = Some(why);
+            }
+            let secs = (t.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+            fields.insert("notice_clear_s".into(), json!(secs));
         }
         cx.live.in_plan.set(true);
     }
-    let (mut table, mut envelopes, mut aborted, mut ran) = (Vec::new(), Vec::new(), None, false);
-    'run: for (phase, steps) in &plan.phases[..2] {
+    let (mut table, mut envelopes, mut ran) = (Vec::new(), Vec::new(), false);
+    let cleared = aborted.is_none();
+    'run: for (phase, steps) in plan.phases[..2].iter().filter(|_| cleared) {
         for (i, step) in steps.iter().enumerate() {
             let at = format!("{phase} step {} ({})", i + 1, step.tool);
             let checked = ctx(session, &token, &[])
@@ -598,9 +608,15 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             );
             continue;
         }
+        // A fade is waited out here too (the 0.1.12 live check: the teardown was refused under one), on a call of its
+        // own so a cancel of the plan doesn't end the wait; then the step runs whatever quen's state shows.
+        let t = Instant::now();
+        if let Ok(cx) = ctx(session, &token, &[]) {
+            let own = session.call(call.conn.clone(), Value::Null, None);
+            let _ = cx.wait_for(&own, game::READY_MAX, game::in_game);
+        }
         let mut step_args = step.args.clone();
         step_args["token"] = token["token"].clone();
-        let t = Instant::now();
         let (done, each) = session.nested(call, &step.tool, &step_args, false, false);
         let mut envelope = session.envelope(&step.tool, each, done);
         call.merge(&envelope);
@@ -824,6 +840,55 @@ mod tests {
             (est - took).abs() <= 0.2 * took,
             "estimate {est} s, ran {took} s"
         );
+    }
+
+    /// The 0.1.12 live check (lc1b): a long move fades the game (flags 257), and the next step and the teardown were
+    /// refused. Each waits for gameplay or photo mode first: here each exec line fades the game for 1 s.
+    #[test]
+    fn a_fade_is_waited_out_before_a_step_and_the_teardown() {
+        let fx = photo("plan-fade");
+        let log = fx.dir.join("game/bin/x64_dx12/W3QuenState.log");
+        let stop = Arc::new(AtomicBool::new(false));
+        let answer = Box::new(move |r: &Request| {
+            let Verb::Exec { function, .. } = &r.verb else {
+                panic!("{:?}", r.verb)
+            };
+            fs::write(&log, "push flags=257\n").unwrap();
+            let log = log.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                fs::write(log, "push flags=1\n").unwrap();
+            });
+            let data = json!({"line": format!("{function}()"), "log": ""});
+            vec![reply(r.id, function != "nope", "ok", Some(data))]
+        });
+        let server = fake_game_until(&token(&fx), answer, stop.clone());
+        let mut session = fx.session();
+        let plan = json!({"tag": "fade", "setup": [{"game_exec": {"line": "on()"}}],
+            "steps": [{"game_exec": {"line": "nope()"}}],
+            "teardown": [{"game_exec": {"line": "off()"}}]});
+        let t = Instant::now();
+        let out = run(&mut session, args(plan));
+        stop.store(true, Ordering::Relaxed);
+        let sent: Vec<String> = server
+            .join()
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.verb {
+                Verb::Exec { function, .. } => Some(function),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, ["on", "nope", "off"], "{out}");
+        assert!(
+            out["aborted"]
+                .as_str()
+                .unwrap()
+                .starts_with("steps step 1 (game_exec): "),
+            "{out}"
+        );
+        assert_eq!(out["teardown"][0]["ok"], true, "{out}");
+        assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     /// A step that doesn't succeed ends the run there; the teardown still runs, every step of it; the steps after it
