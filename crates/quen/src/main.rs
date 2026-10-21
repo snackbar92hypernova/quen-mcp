@@ -25,6 +25,8 @@ mod game;
 #[cfg(windows)]
 mod hands;
 #[cfg(windows)]
+mod image;
+#[cfg(windows)]
 mod input;
 #[cfg(windows)]
 mod ledger;

@@ -48,7 +48,7 @@ const BT709_TO_BT2020: [[f64; 3]; 3] = [
     ],
 ];
 /// Its inverse, for decoding PQ BT.2020 back to scRGB.
-const BT2020_TO_BT709: [[f64; 3]; 3] = [
+pub(crate) const BT2020_TO_BT709: [[f64; 3]; 3] = [
     [
         1.660_491_002_108_434,
         -0.587_641_138_788_550,
@@ -66,7 +66,7 @@ const BT2020_TO_BT709: [[f64; 3]; 3] = [
     ],
 ];
 /// BT.709 luminance weights.
-const BT709_LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
+pub(crate) const BT709_LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 
 /// scRGB value to absolute nits.
 pub fn scrgb_to_nits(v: f32) -> f32 {
@@ -96,7 +96,7 @@ fn unit(v: f32) -> f32 {
     if v > 0.0 { v.min(1.0) } else { 0.0 }
 }
 
-fn mat3(m: &[[f64; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn mat3(m: &[[f64; 3]; 3], v: [f32; 3]) -> [f32; 3] {
     let v = v.map(f64::from);
     m.map(|row| (row[0] * v[0] + row[1] * v[1] + row[2] * v[2]) as f32)
 }

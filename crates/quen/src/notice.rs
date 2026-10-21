@@ -165,7 +165,7 @@ pub(crate) fn idle(session: &Session) {
 /// Whether `tool` needs the game in front: it sends input, captures or measures frames, or waits for the world to move.
 pub(crate) fn needs_front(tool: &str) -> bool {
     match tool {
-        "game_scriptlog" | "game_listsaves" | "game_cvar" => false,
+        "game_scriptlog" | "game_listsaves" | "game_cvar" | "measure_image" => false,
         tool => {
             tool.starts_with("game_")
                 || tool.starts_with("measure_")

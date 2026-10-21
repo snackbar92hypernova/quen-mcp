@@ -560,6 +560,10 @@ impl Drop for Pin {
 
 /// The ledger's `method` for the HDR fallback; its rows say `includes_desktop`.
 const DESKTOP_DUPLICATION: &str = "desktop_duplication";
+/// The methods of the image files this tool writes: what `measure_image` reads.
+pub(crate) const IMAGE_METHODS: [&str; 3] = [PRINTWINDOW, WGC_FP16, DESKTOP_DUPLICATION];
+const PRINTWINDOW: &str = "printwindow";
+const WGC_FP16: &str = "wgc_fp16";
 
 /// A grabbed frame, the method that took it, and why WGC didn't, if it didn't.
 struct Grab {
@@ -628,7 +632,7 @@ fn grab(
         let image = gdi(window, rect)?;
         return Ok(Grab {
             image,
-            method: "printwindow",
+            method: PRINTWINDOW,
             wgc_error: None,
         });
     }
@@ -656,7 +660,7 @@ fn hdr(
         Ok(image) => {
             return Ok(Grab {
                 image,
-                method: "wgc_fp16",
+                method: WGC_FP16,
                 wgc_error: None,
             });
         }

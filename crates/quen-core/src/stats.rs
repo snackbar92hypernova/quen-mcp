@@ -275,7 +275,8 @@ pub fn ab_verdict<L: AsRef<str>>(windows: &[(L, Stats)]) -> Result<AbVerdict, Er
     })
 }
 
-fn summarise(mut values: Vec<f64>) -> Option<Summary> {
+/// Count, mean, median and p95 (linear between ranks, numpy's default) of `values`; None when empty.
+pub fn summarise(mut values: Vec<f64>) -> Option<Summary> {
     if values.is_empty() {
         return None;
     }

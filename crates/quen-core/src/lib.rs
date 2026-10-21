@@ -10,6 +10,7 @@ pub mod disk; // the capture root on disk: usage by boot, kind and age, and a cl
 pub mod drift; // measure_ab's drift guard: window 1 against the rest, the world fingerprint between windows
 pub mod gamedata; // the game's bundles and CR2W files (and REDkit's depot), read-only, and the data tools' questions
 pub mod hdr; // half float -> scRGB -> BT.2020 PQ, 16-bit PNG with cICP, EXR, .npy
+pub mod image; // measure_image: quen's screenshots decoded (srgb8, PQ PNG, scRGB .npy), crops and their metrics
 pub mod input; // w3ctl key tokens and input plans, console_type lines and its prompt check
 pub mod journal; // append-only session journal and replay
 pub mod ledger; // SQLite schema, migrations, ingest, doc-reference scanner, harness history import

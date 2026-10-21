@@ -123,7 +123,7 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
         | "world_ground" | "world_ray" | "world_nav" | "game_scriptlog" | "measure_presentmon"
         | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk" | "mem_find" | "mem_regions"
-        | "sweep_save" | "capture_clean" => true,
+        | "sweep_save" | "capture_clean" | "measure_image" => true,
         tool => tool.starts_with("session_") || tool.starts_with("hands_"),
     }
 }

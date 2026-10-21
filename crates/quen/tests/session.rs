@@ -942,6 +942,33 @@ fn a_client_with_a_short_timeout_polls_long_calls_as_jobs() {
     assert_eq!(recovered["replayed"], false, "{recovered}");
 }
 
+/// Claude Code waits for every call, so its job_status waits until the job ends, past the 20 s budget other clients
+/// get: a plan run with wait: false costs one job_status call.
+#[test]
+fn claude_codes_job_status_waits_until_the_job_ends() {
+    let fx = Fixture::new();
+    let mut quen = Quen::start(&fx);
+    fx.hold("continue");
+    let job = quen.call("session_launch", json!({"user_ok": true, "wait": false}));
+    assert!(job["job"].is_string(), "{job}");
+    fx.wait_at("continue");
+    let id = quen.post(
+        "tools/call",
+        json!({"name": "job_status", "arguments": {"job": job["job"]}}),
+    );
+    sleep(Duration::from_secs(21));
+    fs::write(fx.path("harness/go"), "").unwrap();
+    let launched = result(&quen.response(id));
+    assert_eq!(
+        launched["ok"], true,
+        "job_status answered before the job ended: {launched}"
+    );
+    assert_eq!(launched["tool"], "session_launch");
+    let ended = quen.tool("session_end", json!({"token": launched["token"]}));
+    assert_eq!(ended["ok"], true, "{ended}");
+    fx.assert_restored();
+}
+
 /// job_cancel is the cancel flag: the step in flight ends, then the launch unwinds, and job_status returns the
 /// envelope of that failure. Progress for the call stops once it answered a job: its request is done (MCP).
 #[test]

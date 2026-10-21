@@ -206,6 +206,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "measure_presentmon" => presentmon(session, call, args),
         "measure_trace" => trace_window(session, call, args),
         "measure_ab" => ab(session, call, args),
+        "measure_image" => crate::image::call(session, call, args),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
     };
     out.map_or_else(|done| done, Done::Ok)
@@ -686,12 +687,12 @@ fn record(
     Ok(ids)
 }
 
-/// Adds the ledger ids (or why there are none) to `fields`.
-fn ledger(fields: &mut Fields, recorded: Result<Vec<i64>, String>) {
+/// Names the ledger ids in the envelope's `ledger` (beside the CSV's captures row), or why there are none in `fields`.
+fn ledger(call: &mut Call, fields: &mut Fields, recorded: Result<Vec<i64>, String>) {
     match recorded {
-        Ok(ids) => fields.insert("ledger".into(), json!({"measurements": ids})),
-        Err(why) => fields.insert("ledger_error".into(), json!(why)),
-    };
+        Ok(ids) => ids.into_iter().for_each(|id| call.row("measurements", id)),
+        Err(why) => drop(fields.insert("ledger_error".into(), json!(why))),
+    }
 }
 
 fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -741,6 +742,7 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
         fields.insert("notice".into(), json!(notice));
     }
     ledger(
+        call,
         &mut fields,
         record(
             &cx,
@@ -1047,6 +1049,7 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
         budget(&sampler, std::slice::from_ref(&window)),
     );
     ledger(
+        call,
         &mut fields,
         record(
             &cx,
@@ -1484,6 +1487,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     let run_id = run_id(&cx, &run.tag);
     let sampler = run.sampler.as_ref();
     ledger(
+        call,
         &mut fields,
         record(
             &cx,

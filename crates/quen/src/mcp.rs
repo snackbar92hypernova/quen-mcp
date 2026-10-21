@@ -24,8 +24,8 @@ use serde_json::{Map, Value, json};
 use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
-    camera, capture, channel, config, data, disk, doctor, focus, game, hands, ledger, measure, mem,
-    photo, plan, save, scene, setup,
+    camera, capture, channel, config, data, disk, doctor, focus, game, hands, image, ledger,
+    measure, mem, photo, plan, save, scene, setup,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -34,8 +34,9 @@ const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11
 const LINGER: Duration = Duration::from_secs(5);
 /// How long a session call runs before its client gets `{job, state}` instead of the result, and how long
 /// `job_status` waits for a job to end. Claude Code (`clientInfo.name` claude-code) waits for every call: its tool
-/// timeout is about 28 h. Other clients often give up after 60 s (docs/clients.md). `QUEN_JOB_BUDGET_S` on `quen mcp`
-/// sets another for its client; 0 waits for every call.
+/// timeout is about 28 h, so it has no budget, and its `job_status` waits until the job ends. Other clients often give
+/// up after 60 s (docs/clients.md). `QUEN_JOB_BUDGET_S` on `quen mcp` sets another for its client; 0 waits for every
+/// call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
 const LONG: [&str; 18] = [
@@ -63,8 +64,8 @@ const LONG: [&str; 18] = [
 /// every unannotated call). Their own files there count as nothing changed: ledger_query's and mem_diff's spill files,
 /// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors,
 /// world_frame, world_ground, world_ray, world_nav and game_listsaves read through the game's channel; game_scriptlog
-/// reads the game's script log.
-const READ_ONLY: [&str; 26] = [
+/// reads the game's script log; measure_image reads quen's screenshots and writes its measurement rows.
+const READ_ONLY: [&str; 27] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -91,6 +92,7 @@ const READ_ONLY: [&str; 26] = [
     "data_find",
     "data_read",
     "data_scan",
+    "measure_image",
 ];
 
 /// A tool call for the session thread, a connection that closed, the config file changed (quen_setup wrote it, or a
@@ -254,17 +256,25 @@ impl Job {
         }
         let job = self.clone();
         thread::spawn(move || {
-            if !job.wait(budget) {
+            if !job.wait(Some(budget)) {
                 job.detach();
             }
         });
     }
 
-    /// Waits up to `max` for the call to end; whether it has.
-    fn wait(&self, max: Duration) -> bool {
+    /// Waits up to `max` for the call to end (None: until it does); whether it has.
+    fn wait(&self, max: Option<Duration>) -> bool {
         let state = self.lock();
-        let waited = self.changed.wait_timeout_while(state, max, |s| !s.done);
-        waited.unwrap_or_else(PoisonError::into_inner).0.done
+        match max {
+            Some(max) => {
+                let waited = self.changed.wait_timeout_while(state, max, |s| !s.done);
+                waited.unwrap_or_else(PoisonError::into_inner).0.done
+            }
+            None => {
+                let waited = self.changed.wait_while(state, |s| !s.done);
+                waited.unwrap_or_else(PoisonError::into_inner).done
+            }
+        }
     }
 
     /// What `job_status` returns until the call ends.
@@ -285,7 +295,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `job_status` and `job_cancel`, answered from a thread of their own: they wait up to the budget for the job to end.
+/// `job_status` and `job_cancel`, answered from a thread of their own: they wait up to the connection's budget for the
+/// job to end, and with none (Claude Code) until it does.
 fn poll(shared: &Shared, conn: &Arc<Conn>, id: Value, name: &str, args: &Value) {
     let wanted = args["job"].as_str().unwrap_or_default();
     let found = lock(&JOBS)
@@ -314,7 +325,7 @@ fn poll(shared: &Shared, conn: &Arc<Conn>, id: Value, name: &str, args: &Value) 
             shared.cancel(conn.id, &job.request);
         }
     }
-    let (conn, max) = (conn.clone(), conn.budget().unwrap_or(JOB_BUDGET));
+    let (conn, max) = (conn.clone(), conn.budget());
     thread::spawn(move || {
         let result = if job.wait(max) {
             lock(&JOBS).retain(|j| !Arc::ptr_eq(j, &job));
@@ -573,7 +584,8 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
             if let Some(args) = args.as_object_mut() {
                 args.remove("wait_for_previous");
             }
-            match name {
+            // Its end counts as its start does (notice::idle); a session-thread call's end is touched there.
+            let out = match name {
                 "session_status" => tool_result(&session::status(shared)),
                 "job_status" | "job_cancel" => return poll(shared, conn, id, name, &args),
                 // With licence it runs wcc_lite under the game lock: on the session thread, below.
@@ -624,7 +636,9 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
                     return;
                 }
                 _ => return conn.send(&error(id, -32602, &format!("unknown tool {name:?}"))),
-            }
+            };
+            shared.touch(conn.id);
+            out
         }
         _ => return conn.send(&error(id, -32601, &format!("method {method:?} not found"))),
     };
@@ -931,6 +945,7 @@ pub(crate) fn tools() -> Value {
     list.extend(scene::tools());
     list.push(photo::tool());
     list.extend(measure::tools());
+    list.push(image::tool());
     list.push(plan::tool());
     list.extend(mem::tools());
     list.extend(data::tools());
@@ -945,10 +960,11 @@ pub(crate) fn tools() -> Value {
     list.push(json!({
         "name": "job_status",
         "description": "The result of a long call that answered {job, state} instead (wait: false, or it outlived the \
-            client's job budget: 20 s unless the server's QUEN_JOB_BUDGET_S says otherwise). Waits up to that budget \
-            for the call to end, then returns the call's own envelope, exactly as the call itself would have, and \
-            forgets the job; until then {job, tool, state (queued or running), elapsed_s, message (its latest \
-            progress), cancelling}. Changes nothing. Only the connection that made the call sees its job.",
+            client's job budget: 20 s unless the server's QUEN_JOB_BUDGET_S says otherwise; Claude Code has none). \
+            Waits for the call to end, up to that budget (Claude Code: until it ends), then returns the call's own \
+            envelope, exactly as the call itself would have, and forgets the job; until then {job, tool, state \
+            (queued or running), elapsed_s, message (its latest progress), cancelling}. Changes nothing. Only the \
+            connection that made the call sees its job.",
         "inputSchema": job.clone(),
     }));
     list.push(json!({
