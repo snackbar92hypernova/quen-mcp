@@ -181,6 +181,40 @@ param(
             }
         }
         function Find-Claude { (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
+        # Claude Code's settings: the text of $path with quen's PreToolUse hook for $quen in it (INSTALL.md section 4),
+        # every other setting and hook as it was; $null when it is there already. quen's hook (quen.exe, args focus --to
+        # client) leaves every group it is in, a group left with none goes, and it comes last in a group of its own. The
+        # matcher is every tool quen marks for a prompt (a quen test pins it). Refused when the file isn't a JSON object.
+        # ponytail: PowerShell 7 reads date-like strings as dates and writes them back in its own format; Windows
+        # PowerShell 5.1, which this script is tested with, doesn't. Claude Code's settings hold none today.
+        function With-Hook($path, $quen) {
+            $text = if (Test-Path -LiteralPath $path) { [IO.File]::ReadAllText($path) } else { '' }
+            $s = [pscustomobject]@{}
+            if ($text.Trim()) {
+                try { $s = $text | ConvertFrom-Json } catch { Refuse "$path isn't valid JSON ($($_.Exception.Message)). Fix it, or answer no to the hook" }
+            }
+            if ($s -isnot [Management.Automation.PSCustomObject] -or ($null -ne $s.hooks -and $s.hooks -isnot [Management.Automation.PSCustomObject])) {
+                Refuse "$path isn't a JSON object with hooks as an object. Fix it, or answer no to the hook"
+            }
+            $before = ConvertTo-Json $s -Depth 100 -Compress
+            if ($null -eq $s.hooks) { $s | Add-Member hooks ([pscustomobject]@{}) -Force }
+            $groups = @(foreach ($g in @($s.hooks.PreToolUse | Where-Object { $null -ne $_ })) {
+                    $kept = @($g.hooks | Where-Object { -not ([IO.Path]::GetFileName("$($_.command)") -eq 'quen.exe' -and "$($_.args)" -eq 'focus --to client') })
+                    if ($kept.Count -lt @($g.hooks).Count) {
+                        if (-not $kept.Count) { continue }
+                        $g.hooks = $kept
+                    }
+                    $g
+                })
+            $groups += [pscustomobject]@{
+                matcher = '^mcp__quen__(session_launch|game_save|hands_take|mem_patch_instances|capture_clean)$'
+                hooks   = @([pscustomobject]@{ type = 'command'; command = $quen; args = @('focus', '--to', 'client'); timeout = 5 })
+            }
+            # In place, so the other hooks keep their order.
+            if ($s.hooks.PSObject.Properties['PreToolUse']) { $s.hooks.PreToolUse = $groups } else { $s.hooks | Add-Member PreToolUse $groups }
+            if ((ConvertTo-Json $s -Depth 100 -Compress) -ceq $before) { return $null }
+            ConvertTo-Json $s -Depth 100
+        }
         function Stop-Quen($procs) {
             Change "stop quen.exe (pid $($procs.Id -join ', '))" {
                 $procs | Stop-Process -Force
@@ -368,6 +402,12 @@ param(
             }
             $addPath = $addPath -and (Ask "Add $bin to your user PATH, so a terminal finds quen?")
             $register = $claude -and (Ask "Register quen in Claude Code for all your projects (claude mcp add --scope user quen -- $exe mcp)? It replaces a user-scope server named quen")
+            # The desktop app's Claude Code needs no claude on PATH: its settings folder says it is used here.
+            $settings = Join-Path $env:USERPROFILE '.claude\settings.json'
+            $hook = ($claude -or (Test-Path -LiteralPath (Split-Path $settings))) -and (Ask ("Add a hook to $settings that brings " +
+                    "Claude Code's window to the front before its prompts for quen's calls, while the game is in front? It never answers them (INSTALL.md section 4)"))
+            $hookText = if ($hook) { With-Hook $settings $exe }
+            if ($hook -and -not $hookText) { Say "quen's hook is already in $settings" }
 
             try {
                 if ($procs) { Stop-Quen $procs }
@@ -382,6 +422,16 @@ param(
                         $r = Run $claude mcp add --scope user quen '--' $exe mcp
                         Write-Host "  $($r.out -join ' ')"
                         if ($r.code) { Say "claude mcp add failed (exit $($r.code)): register quen yourself (INSTALL.md section 4)" }
+                    }
+                }
+                if ($hookText) {
+                    Change "add quen's hook to $settings (the file backed up first)" {
+                        if (Test-Path -LiteralPath $settings) {
+                            $backup = "$settings.quen-backup-$(Get-Date -Format yyyyMMdd-HHmmss)"
+                            Copy-Item -LiteralPath $settings -Destination $backup
+                            Write-Host "  backed up to $backup"
+                        } else { [void][IO.Directory]::CreateDirectory((Split-Path $settings)) }
+                        [IO.File]::WriteAllText($settings, $hookText, (New-Object Text.UTF8Encoding $false))
                     }
                 }
                 if ($package) {

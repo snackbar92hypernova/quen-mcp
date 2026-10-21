@@ -26,7 +26,7 @@ irm https://github.com/snackbar92hypernova/quen-mcp/releases/latest/download/ins
 
 What it does, with every check before the first change:
 1. Downloads the latest release (`-Version <x.y.z>` for another) into a new temp folder, or uses the release files in `-From <folder>`. It checks every zip against the release's `SHA256SUMS.txt` before opening it.
-2. Puts `quen.exe` in `%USERPROFILE%\.quen\bin`. It offers to add that folder to your user PATH, and, when `claude` is on your PATH, to register quen in Claude Code (`claude mcp add --scope user quen -- <path> mcp`). It prints the lines for VS Code and Cursor (section 4).
+2. Puts `quen.exe` in `%USERPROFILE%\.quen\bin`. It offers to add that folder to your user PATH, and, when `claude` is on your PATH, to register quen in Claude Code (`claude mcp add --scope user quen -- <path> mcp`). When `claude` is on your PATH or `%USERPROFILE%\.claude` exists, it offers to add the hook that brings Claude Code's window to the front for its prompts before quen's calls (section 4): it backs `settings.json` up first, keeps every other setting and hook, and refuses, changing nothing, when the file isn't valid JSON. It prints the lines for VS Code and Cursor (section 4).
 3. Installs quen's in-game package into the game folder `quen setup` reports, or `-GameDir <folder>` (`-NoGamePackage` skips it). It refuses while the game runs or the Native Bridge is missing, lists each file it will place or move, and asks. An old `Mods\modQuen`, any `Mods\modQuenRpc` and an old `W3Quen.asi` go to the Recycle Bin.
 4. With `-WithRenderDoc`, unzips quen's Streamline dev interposer into `%USERPROFILE%\.quen\tools\streamline`.
 5. Runs `quen doctor` and prints what is missing, with where to get it.
@@ -237,6 +237,34 @@ claude mcp add --scope user quen -- quen mcp
 ```
 
 Nothing to set for time: its tool timeout is about 28 hours.
+
+**The chat in front for Claude Code's prompts (optional).** Claude Code asks you before every call of `session_launch`, `game_save`, `hands_take`, `mem_patch_instances` and `capture_clean`, in its own window, before the call reaches quen. While the game is in front, that window is behind it. A PreToolUse hook brings it forward: before each of those calls Claude Code runs `quen focus --to client`, which brings the window of the Claude Code that runs it (the desktop app, or the terminal the CLI runs in) to the front, only while the game's window is in front; otherwise it does nothing. It never answers the prompt: approving or denying stays yours. `install.ps1` offers to add it. By hand, merge this into `%USERPROFILE%\.claude\settings.json`, with quen.exe's full path, every backslash doubled:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__quen__(session_launch|game_save|hands_take|mem_patch_instances|capture_clean)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\<you>\\.quen\\bin\\quen.exe",
+            "args": ["focus", "--to", "client"],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- The matcher names quen's tools as Claude Code does for a server registered as `quen`.
+- The hook needs no live session, prints nothing and exits 0 whatever happens. When it finds no window to bring forward, the prompt stays where it was.
+- No hook after the call: the game stays behind the chat until the agent brings it back (`focus` `to: "game"`), as after any question.
+- Claude Code runs these hooks in the CLI and in the desktop app, not in cloud sessions.
+- Codex and the other clients below: quen sets up no such hook for them. There the agent calls `focus` `to: "client"` before such a call (`quen_guide` says so).
 
 **Codex CLI: start `quen serve --stay` first.** Codex runs each MCP server inside a Windows job that closes everything when Codex closes, and won't let quen's background `quen serve` leave it, so quen won't start it there: closing Codex would kill the game mid-save. Start it yourself instead, before opening Codex:
 

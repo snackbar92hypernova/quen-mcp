@@ -32,8 +32,9 @@ pub(crate) fn tool() -> Value {
         "name": "game_save",
         "description": "Write a new manual save, as the game's menu does into its \"Empty save slot\": the game \
             names it (ManualSave_...), never overwrites one, and lists it with the user's own saves. The client asks \
-            the user on every call (user_ok is only your word): never route around a denial. quen checks gamesaves \
-            before and after: one new save (its .sav, .png, .json) and nothing else. Answers save (the name \
+            the user on every call (user_ok is only your word): never route around a denial. Call focus to client \
+            first: the prompt shows in the client's window. quen checks gamesaves before and after: one new save \
+            (its .sav, .png, .json) and nothing else. Answers save (the name \
             game_load takes), files, tainted. Refused, nothing sent: no user_ok; quen's state not plain gameplay (the \
             main menu, photo mode, a scene, cutscene, fade or the dialogue flag); a write that taints saves earlier in \
             this boot (tainted_by) without tainted_ok; the game's own save lock (combat, a menu: game_text); with \
