@@ -2461,6 +2461,15 @@ fn main() {
         assert_eq!(again["refused"], true, "{again}");
     }
 
+    /// The game's replies to the measuring line, as modQuen gives them: shown, then up already.
+    fn notices() -> impl Fn(&Request) -> &'static str + Send {
+        let sent = AtomicBool::new(false);
+        move |r| match r.verb {
+            Verb::Notice { .. } if sent.swap(true, Ordering::SeqCst) => status::ALREADY,
+            _ => "notice shown",
+        }
+    }
+
     /// The status line is down before every window: the game gets the hide before PresentMon starts, PresentMon starts
     /// HIDE_WAIT or more after the game's reply, and the result carries the budget line and the measuring state's reply.
     #[test]
@@ -2471,21 +2480,29 @@ fn main() {
         let calls = fx.dir.join("harness/calls.txt");
         let hidden = Arc::new(std::sync::Mutex::new(None));
         let (seen, started) = (hidden.clone(), calls.clone());
+        let notice = notices();
         let answer = Box::new(move |r: &Request| {
             if r.verb == (Verb::NoticeHide {}) {
                 assert!(!started.exists(), "a window started before the hide");
                 *seen.lock().unwrap() = Some(SystemTime::now());
             }
-            vec![reply(r.id, true, "notice shown", None)]
+            vec![reply(r.id, true, notice(r), None)]
         });
-        let server = fake_game(&token(&fx), 2, answer);
+        let server = fake_game(&token(&fx), 3, answer);
         let args = json!({"token": "tok", "tag": "st", "secs": 1});
         let out = fx.run("measure_presentmon", args);
         assert_eq!(out["ok"], true, "{out}");
         let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
         assert!(
-            matches!(sent[..], [Verb::Notice { .. }, Verb::NoticeHide {}]),
-            "{sent:?}"
+            matches!(
+                sent[..],
+                [
+                    Verb::Notice { .. },
+                    Verb::Notice { .. },
+                    Verb::NoticeHide {}
+                ]
+            ),
+            "the line, again until the game says it is up, then its hide: {sent:?}"
         );
         let hid = hidden.lock().unwrap().expect("hidden");
         let window = fs::metadata(&calls).unwrap().modified().unwrap();
@@ -2530,20 +2547,28 @@ fn main() {
         fx.shared.set_hands(Some(Hands::Agent));
         let hid = Arc::new(AtomicBool::new(false));
         let seen = hid.clone();
+        let says = notices();
         let notice = Box::new(move |r: &Request| {
             if matches!(r.verb, Verb::NoticeHide {}) {
                 seen.store(true, Ordering::SeqCst);
             }
-            vec![reply(r.id, true, "notice shown", None)]
+            vec![reply(r.id, true, says(r), None)]
         });
-        let server = fake_game(&token(&fx), 2, notice);
+        let server = fake_game(&token(&fx), 3, notice);
         let args = json!({"token": "tok", "tag": "gap", "secs": 30});
         let in_hide_wait = || hid.load(Ordering::SeqCst);
         let (out, took) = cancel_when(&fx, &in_hide_wait, "measure_presentmon", args);
         let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
         assert!(
-            matches!(sent[..], [Verb::Notice { .. }, Verb::NoticeHide {}]),
-            "the line, then its hide: {sent:?}"
+            matches!(
+                sent[..],
+                [
+                    Verb::Notice { .. },
+                    Verb::Notice { .. },
+                    Verb::NoticeHide {}
+                ]
+            ),
+            "the line, again until the game says it is up, then its hide: {sent:?}"
         );
         let reason = out["reason"].as_str().unwrap_or_default();
         assert!(
@@ -2554,7 +2579,10 @@ fn main() {
             "{out}"
         );
         assert!(fx.calls().is_empty(), "a window started: {:?}", fx.calls());
-        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert!(
+            took < status::MEASURING_SHOWN + Duration::from_secs(2),
+            "the measuring line's wait and the hide's, no window: {took:?}"
+        );
         // During the window: PresentMon killed, no rows.
         let fx = served("pmcancel-window");
         fake_presentmon(&fx);

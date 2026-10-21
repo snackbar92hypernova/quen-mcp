@@ -183,7 +183,8 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 
 # Optional: with quen-w3 0.1.15 or later, the game shows one lasting line of quen's: the agent at work, measuring,
 # your controls (in a play session from the launch), or the agent waiting for you. quen takes it down 0.5 s before each of its screenshots
-# and measurement windows. 'off' leaves the short notices at hand-overs, measurements and waits only. Default 'on'.
+# and measurement windows. 'off' leaves the short notices at hand-overs (and a play session's launch), measurements and
+# waits only. Default 'on'.
 # indicator = 'off'
 
 # Optional: a game sound event played 0.5 s before each measurement window starts and when it ends, so you hear it
