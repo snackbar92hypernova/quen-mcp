@@ -463,7 +463,8 @@ fn in_front(cx: &Ctx, call: &Call) -> Result<HWND, Done> {
 /// game does, which closes it: what that did, for the result's `game_back`. Refused, nothing measured, while the user
 /// has the controls, or when it can't be.
 pub(crate) fn game_back(cx: &Ctx, call: &Call) -> Result<Option<Fields>, Done> {
-    let last = cx.last_flags();
+    // A menu bit that clears within a second (closing photo mode pushes one) is no menu: an escape would open one.
+    let last = cx.held_flags(call);
     if !last.is_some_and(game::menu_to_close) {
         return Ok(None);
     }
