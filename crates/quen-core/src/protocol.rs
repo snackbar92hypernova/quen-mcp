@@ -83,10 +83,20 @@ pub enum Verb {
     /// Read the player's position and heading, the game time (day and hour) and the weather's name; changes nothing.
     #[serde(rename = "world.get")]
     WorldGet {},
-    /// Show `text` on screen for a few seconds (the game's notification); changes nothing in the game. 1 to
-    /// [`MAX_NOTICE_BYTES`] bytes, no control character.
+    /// Show `text` on screen (the game's notification) for `duration_ms`, 1 to [`MAX_NOTICE_MS`] (from quen-w3 0.1.15;
+    /// none: 8 s); changes nothing in the game. 1 to [`MAX_NOTICE_BYTES`] bytes, no control character.
     #[serde(rename = "notice")]
-    Notice { text: String },
+    Notice {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
+    },
+    /// Take the notification down (from quen-w3 0.1.15): its 0.3 s fade starts on the tick that replies.
+    #[serde(rename = "notice.hide")]
+    NoticeHide {},
+    /// Play the game's sound event `event` (from quen-w3 0.1.15), a name as [`crate::trace::plain_name`] checks it.
+    #[serde(rename = "sound")]
+    Sound { event: String },
     /// Open (`on`) or close photo mode by the game's own functions, never by keys; closing skips its exit dialog.
     #[serde(rename = "photo.mode")]
     PhotoMode { on: bool },
@@ -229,6 +239,8 @@ pub enum PhotoListed {
 
 /// The longest notice text, in bytes.
 pub const MAX_NOTICE_BYTES: usize = 160;
+/// The longest notice, in milliseconds: an hour.
+pub const MAX_NOTICE_MS: u32 = 3_600_000;
 /// The longest `photo.list` filter, in bytes.
 pub const MAX_FILTER_BYTES: usize = 200;
 /// The longest `photo.tick` time, in seconds (photo mode's menu itself passes 0.00001 s and 1 s).
@@ -427,15 +439,19 @@ impl Verb {
             Verb::Load { save: name } | Verb::Weather { name } if name.is_empty() => {
                 Err(Error::Invalid("an empty name".into()))
             }
-            Verb::Notice { text }
+            Verb::Notice { text, duration_ms }
                 if text.is_empty()
                     || text.len() > MAX_NOTICE_BYTES
-                    || text.bytes().any(|b| b < 0x20) =>
+                    || text.bytes().any(|b| b < 0x20)
+                    || duration_ms.is_some_and(|ms| !(1..=MAX_NOTICE_MS).contains(&ms)) =>
             {
                 Err(Error::Invalid(format!(
-                    "a notice is 1 to {MAX_NOTICE_BYTES} bytes, no control character"
+                    "a notice is 1 to {MAX_NOTICE_BYTES} bytes, no control character, for 1 to {MAX_NOTICE_MS} ms"
                 )))
             }
+            Verb::Sound { event } if !crate::trace::plain_name(event) => Err(Error::Invalid(
+                "a sound event is 1 to 64 letters, digits and _".into(),
+            )),
             Verb::CamPath {
                 mode,
                 fps,
@@ -712,6 +728,15 @@ mod tests {
             Verb::WorldGet {},
             Verb::Notice {
                 text: "quen: you have the controls".into(),
+                duration_ms: None,
+            },
+            Verb::Notice {
+                text: "quen: agent at work".into(),
+                duration_ms: Some(MAX_NOTICE_MS),
+            },
+            Verb::NoticeHide {},
+            Verb::Sound {
+                event: "gui_global_panel_open".into(),
             },
             Verb::PhotoMode { on: true },
             Verb::PhotoGet {},
@@ -1356,17 +1381,33 @@ mod tests {
             })),
             Err(Error::Invalid(_))
         ));
-        let notice = |text: String| encode_request(&request(Verb::Notice { text }));
-        assert!(notice("é".repeat(MAX_NOTICE_BYTES / 2)).is_ok());
-        for text in [
-            String::new(),
-            "x".repeat(MAX_NOTICE_BYTES + 1),
-            "a\nb".into(),
-            "\t".into(),
+        let notice = |text: String, duration_ms| {
+            encode_request(&request(Verb::Notice { text, duration_ms }))
+        };
+        assert!(notice("é".repeat(MAX_NOTICE_BYTES / 2), None).is_ok());
+        for ms in [1, MAX_NOTICE_MS] {
+            assert!(notice("x".into(), Some(ms)).is_ok(), "{ms}");
+        }
+        for (text, ms) in [
+            (String::new(), None),
+            ("x".repeat(MAX_NOTICE_BYTES + 1), None),
+            ("a\nb".into(), None),
+            ("\t".into(), None),
+            ("x".into(), Some(0)),
+            ("x".into(), Some(MAX_NOTICE_MS + 1)),
         ] {
             assert!(
-                matches!(notice(text.clone()), Err(Error::Invalid(_))),
-                "{text:?}"
+                matches!(notice(text.clone(), ms), Err(Error::Invalid(_))),
+                "{text:?} {ms:?}"
+            );
+        }
+        for event in ["", "a b", "gui-x", &"x".repeat(65)] {
+            let sound = request(Verb::Sound {
+                event: event.into(),
+            });
+            assert!(
+                matches!(encode_request(&sound), Err(Error::Invalid(_))),
+                "{event:?}"
             );
         }
     }

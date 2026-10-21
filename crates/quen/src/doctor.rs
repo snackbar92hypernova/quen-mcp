@@ -59,6 +59,19 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.15: notice's duration, notice.hide and sound (the status line, status.rs) in both files.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.15",
+        sha256: "2eea072f4da8705f07d3369b24cb4969023422feee33f8c0fb1631121b8efea3",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.15",
+        sha256: "a86e13513df2e80354684daaa598719b6330fde1ff4fd9ca222ca57fc7954160",
+        exact: true,
+    },
     // 0.1.14: scene.frame's share and centre from a body box for actors with a head bone (finding 89), in quen.ws; the
     // ASI differs from 0.1.13's only in its version.
     Pin {
@@ -349,6 +362,25 @@ pub(crate) const BEFORE_SCENE: &[&str] = &[
     "quen-w3 0.1.12",
 ];
 
+/// The package releases from before notice's duration and the notice.hide and sound verbs (quen-w3 0.1.15): the status
+/// line shows at transitions only, for 8 s, and captures wait until 9 s after it (status.rs).
+pub(crate) const BEFORE_STATUS: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+    "quen-w3 0.1.9",
+    "quen-w3 0.1.10",
+    "quen-w3 0.1.11",
+    "quen-w3 0.1.12",
+    "quen-w3 0.1.13",
+    "quen-w3 0.1.14",
+];
+
 /// Whether measure_ab's console actions go as exec verbs: only for a pinned package with the verb (an unpinned dev
 /// build may lack it, so its lines are typed, as before).
 pub(crate) fn has_exec(version: Option<&str>) -> bool {
@@ -461,7 +493,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them); from quen-w3 \
         0.1.13, world_frame, world_ground, world_ray, world_nav, game_frame, game_place and game_exec (and \
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
-        x, y from a box around an actor's body",
+        x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
+        its 0.5 s hide before captures and windows",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",

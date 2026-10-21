@@ -37,8 +37,6 @@ mod measure;
 #[cfg(windows)]
 mod mem;
 #[cfg(windows)]
-mod notice;
-#[cfg(windows)]
 mod photo;
 #[cfg(windows)]
 mod plan;
@@ -56,6 +54,8 @@ mod scene;
 mod session;
 #[cfg(windows)]
 mod setup;
+#[cfg(windows)]
+mod status;
 #[cfg(windows)]
 mod w3;
 #[cfg(windows)]

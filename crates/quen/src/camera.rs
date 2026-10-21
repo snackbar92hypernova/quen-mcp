@@ -22,8 +22,8 @@ use crate::capture;
 use crate::channel::{self, REPLY_MAX};
 use crate::doctor;
 use crate::game::{self, Ctx, Fields, schema, text};
-use crate::notice;
 use crate::session::{self, Call, Done, Session};
+use crate::status;
 
 /// How long real-time playback is given past the sweep's end before quen reads the camera back.
 const END_MARGIN: Duration = Duration::from_millis(500);
@@ -603,8 +603,8 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         Mode::Step => f64::from(path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0)) / 2.0,
     };
     // On the connection the checks opened: a second one beside it finds the ASI's pipe busy (finding 80).
-    if let Some(notice) = notice::measuring(&cx, call, secs.ceil() as u64, &mut first) {
-        fields.insert("notice".into(), json!(notice));
+    if let Some(shown) = status::measuring(&cx, call, secs.ceil() as u64, &mut first) {
+        fields.insert("status".into(), json!(shown));
     }
     let pause = p.mode == Mode::Step || p.sweep.world.paused;
     let (mut paused, mut loaded) = (false, false);
@@ -633,9 +633,9 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             paused = true;
             fields.insert("pause".into(), json!(reply.text));
         }
-        // A real-time path plays from its load, and step mode's frames are captured after it: the notice is gone first,
-        // its wait a lap of its own (finding 86: it hid inside frames).
-        notice::clear(cx.live, call)?;
+        // A real-time path plays from its load, and step mode's frames are captured after it: the status line is down
+        // first, its wait a lap of its own (finding 86: a notice hid inside frames), and stays down to the sweep's end.
+        status::hide(&cx, call, false)?;
         let verb = Verb::CamPath {
             mode: p.mode,
             fps: p.fps,

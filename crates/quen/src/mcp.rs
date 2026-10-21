@@ -584,7 +584,7 @@ fn handle(shared: &Shared, tx: &Sender<Msg>, conn: &Arc<Conn>, line: &str) {
             if let Some(args) = args.as_object_mut() {
                 args.remove("wait_for_previous");
             }
-            // Its end counts as its start does (notice::idle); a session-thread call's end is touched there.
+            // Its end counts as its start does (status::poll); a session-thread call's end is touched there.
             let out = match name {
                 "session_status" => tool_result(&session::status(shared)),
                 "job_status" | "job_cancel" => return poll(shared, conn, id, name, &args),

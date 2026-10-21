@@ -22,7 +22,8 @@
 //   0.1.4) writes a new manual save as the menu's "Empty save slot" does; the game names the file. world.get (from
 //   quen-w3 0.1.5) reads back "x y z heading day hour rain snow skyclear weather" (rain, snow and skyclear from quen-w3
 //   0.1.9) and changes nothing. notice (from quen-w3 0.1.8) shows quen's text on screen for 8 s, as QUEN_Say does, and
-//   changes nothing. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
+//   changes nothing; from quen-w3 0.1.15 for the time quen gives, with notice.hide to take it down and sound to play a
+//   sound event. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
 //   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1. world.actors (from
 //   quen-w3 0.1.10) reads back the actors near the player (QUENRPC_Actors) and changes nothing; from quen-w3 0.1.12 by
 //   tag or class, each with its id. From quen-w3 0.1.13 four more reads that change nothing: scene.frame, what the
@@ -884,6 +885,9 @@ function QUENRPC_PhotoPose() : string
 	var paths : array<string>;
 	var t : GameTime;
 	var gui : CR4GuiManager;
+	var popup : CR4OverlayPopup;
+	var note : CScriptedFlashSprite;
+	var field : CScriptedFlashTextField;
 	var fx : CR4PhotomodeEffects;
 	var item, cls : name;
 	var ids : array<SItemUniqueId>;
@@ -1312,15 +1316,54 @@ function QUENRPC_PhotoPose() : string
 			return;
 
 		case "notice":
-			// quen's own text, which the ASI checked: 1 to 160 bytes, no control character.
+			// "<duration_ms> <text>", which the ASI checked: 1 to 3600000 ms (8000 from a quen before 0.1.15), 1 to 160
+			// bytes, no control character. Only on the overlay popup there is: without one, the GUI manager's ShowNotification
+			// requests it with the text, which may then show after a notice.hide found none to hide. queue false: quen's
+			// replaces a notification on screen (OverlayPopupMenu.as showNotification). From 0.1.15, the same text still
+			// up (OverlayPopupMenu.as notificationModule visible, its tfMessage, the probe boot's reads) is kept as it is,
+			// so quen's re-send every 10 s doesn't take it down and back up.
+			QUENRPC_Split(args, head, text);
 			gui = theGame.GetGuiManager();
-			if (!gui)
+			if (gui)
+				popup = (CR4OverlayPopup)gui.GetPopup('OverlayPopup');
+			if (!popup || !popup.GetPopupFlash())
 			{
-				QUEN_Reply(handle, false, "no GUI manager to show a notice", "");
+				QUEN_Reply(handle, false, "no overlay popup to show a notice on (a load, the main menu)", "");
 				return;
 			}
-			gui.ShowNotification(args, 8000);
+			note = popup.GetPopupFlash().GetChildFlashSprite("notificationModule");
+			if (note)
+				field = note.GetChildFlashTextField("tfMessage");
+			if (note && field && note.GetVisible() && note.GetAlpha() > 0 && field.GetText() == text)
+			{
+				QUEN_Reply(handle, true, "notice already shown", "");
+				return;
+			}
+			popup.ShowNotification(text, StringToFloat(head), false);
 			QUEN_Reply(handle, true, "notice shown", "");
+			return;
+
+		case "notice.hide":
+			// From 0.1.15: ClearNotificationsQueue, so no queued notification follows into quen's capture: the 0.3 s fade
+			// of hideNotification (OverlayPopupMenu.as), measured 0.312 s in the probe boot. No overlay popup: no
+			// notification to hide.
+			gui = theGame.GetGuiManager();
+			if (gui)
+				popup = (CR4OverlayPopup)gui.GetPopup('OverlayPopup');
+			if (!popup)
+			{
+				QUEN_Reply(handle, true, "no notice to hide (no overlay popup)", "");
+				return;
+			}
+			popup.ClearNotificationsQueue();
+			QUEN_Reply(handle, true, "notice hidden", "");
+			return;
+
+		case "sound":
+			// From 0.1.15: a sound event by its name (1 to 64 letters, digits and _, the ASI checked), as the GUI's own
+			// sounds play (theSound.SoundEvent("gui_global_denied")). An unknown name plays nothing, unseen here.
+			theSound.SoundEvent(args);
+			QUEN_Reply(handle, true, "sound played", "");
 			return;
 
 		case "items.add":

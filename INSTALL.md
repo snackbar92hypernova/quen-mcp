@@ -181,6 +181,15 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # game call. 'false' turns that off: the game then shows a notice that the agent waits for you in the chat. Default 'true'.
 # idle_focus = 'false'
 
+# Optional: in a test session, with quen-w3 0.1.15 or later, the game shows one lasting line of quen's: the agent at
+# work, measuring, your controls, or the agent waiting for you. quen takes it down 0.5 s before each of its screenshots
+# and measurement windows. 'off' leaves the short notices at hand-overs, measurements and waits only. Default 'on'.
+# indicator = 'off'
+
+# Optional: a game sound event played 0.5 s before each measurement window starts and when it ends, so you hear it
+# while the line is down. Unset by default: no sound. gui_global_panel_open is the game's panel-open sound.
+# window_sound = 'gui_global_panel_open'
+
 # Optional: game builds you have verified, beside the ones quen knows (Steam 5.01). Each entry is
 # <platform> <sha256 of witcher3.exe> <label>, platform steam or gog, ';' between entries. A refused launch's reason
 # gives the entry to add. Listing a build quen already knows under another label is refused.

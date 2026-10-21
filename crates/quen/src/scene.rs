@@ -634,6 +634,10 @@ fn frame(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         return Err(Done::RefusedWith(why, fields));
     }
     call.lap("check");
+    // Its captures: quen's status line down once for all the sides (status.rs).
+    if tag.is_some() {
+        crate::status::hide(&cx, call, false).map_err(Done::Refused)?;
+    }
     let noclip = send(&cx, Verb::CamNoclip { on: true }, &fields)?;
     fields.insert("noclip".into(), json!(noclip.text));
     let mut done = Vec::new();

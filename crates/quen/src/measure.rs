@@ -25,7 +25,7 @@ use crate::game::{self, Action, Ctx, Cvar, Fields, ctx, flag};
 use crate::hands::Hands;
 use crate::session::{self, Call, Done, Session, last_line, utc_ms};
 use crate::win::Job;
-use crate::{channel, doctor, input, notice};
+use crate::{channel, doctor, input, status};
 
 /// Images that skew a CPU-bound measurement: builds, and RE analysis (Ghidra's analyzeHeadless
 /// runs as java.exe).
@@ -47,8 +47,9 @@ const FRONT_POLL: Duration = Duration::from_millis(250);
 /// frame time added, judged against its measured cost. The trace's cost is unmeasured until the overhead boot.
 const BUDGET_MEAN_MS: f64 = 0.05;
 const BUDGET_P99_MS: f64 = 0.5;
-/// What a measure_ab run takes besides its settles and windows, for its estimate (run_plan's, and the notice's): quen's
-/// own time per window with the drift guard's reads (0.3 s measured without them, the runner design §3.2), a typed
+/// What a measure_ab run takes besides its settles and windows, for its estimate (run_plan's, and the status line's):
+/// quen's own time per window with the drift guard's reads (0.3 s measured without them, the runner design §3.2) and
+/// the status line's hide wait (status::HIDE_WAIT), a typed
 /// console line (boot 176's median, client-side) and a key toggle (a 200 ms hold and a 400 ms gap).
 const WINDOW_S: f64 = 0.5;
 pub(crate) const CONSOLE_S: f64 = 5.3;
@@ -340,7 +341,6 @@ impl PresentMon {
         secs: u32,
         front: Option<HWND>,
     ) -> Result<(Stats, Fields), Done> {
-        notice::clear(cx.live, call).map_err(Done::Refused)?;
         let pid = cx.game_pid()?;
         let exe = self.exe.to_string_lossy();
         let argv = stats::presentmon_args(&exe, pid, secs, &dest.to_string_lossy(), &self.flags)?;
@@ -711,13 +711,15 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let quiet = quiet(flag(args, "strict")?, skewed(&cx))?;
     let back = game_back(&cx, call)?;
     call.lap("check");
-    let notice = notice::measuring(&cx, call, secs.into(), &mut None);
+    let line = status::measuring(&cx, call, secs.into(), &mut None);
     let front = match cx.hands {
         Some(Hands::User) => Some(in_front(&cx, call)?),
         _ => None,
     };
     let from = crate::win::tick();
-    let (stats, utc) = pm.window(&cx, call, &dest, secs, front)?;
+    let (measured, _) =
+        measure(&cx, call, Some((&pm, &dest)), None, secs, front).map_err(Done::Refused)?;
+    let (stats, utc) = measured.expect("PresentMon ran")?;
     call.lap("presentmon");
     if menu_since(&cx, from) {
         let fields = Fields::from_iter(back.map(|b| ("game_back".to_string(), json!(b))));
@@ -738,8 +740,8 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let mut fields = Map::new();
     fields.insert("presentmon".into(), json!(pm.exe));
     fields.insert("window".into(), shown(1, &window));
-    if let Some(notice) = notice {
-        fields.insert("notice".into(), json!(notice));
+    if let Some(line) = line {
+        fields.insert("status".into(), json!(line));
     }
     ledger(
         call,
@@ -863,7 +865,8 @@ fn sample(
 type Measured = (Option<Result<(Stats, Fields), Done>>, Option<Sampled>);
 
 /// One window of `secs`: PresentMon on `pm_csv` with `pm`, and `trace`'s sampler beside it on a thread of its own, or
-/// either alone. A failed PresentMon stops the trace; so does a cancel, looked at every 0.1 s.
+/// either alone. A failed PresentMon stops the trace; so does a cancel, looked at every 0.1 s. quen's status line is
+/// taken down first, the sound cue at its start and end (status.rs); Err: it wasn't, nothing measured.
 fn measure(
     cx: &Ctx,
     call: &mut Call,
@@ -871,10 +874,11 @@ fn measure(
     trace: Option<(&Sampler, u32)>,
     secs: u32,
     front: Option<HWND>,
-) -> Measured {
+) -> Result<Measured, String> {
+    status::hide(cx, call, true)?;
     let stop = AtomicBool::new(false);
     let channel = &cx.live.channel;
-    std::thread::scope(|s| {
+    let measured = std::thread::scope(|s| {
         let tracer = trace.map(|(sampler, server)| {
             let stop = &stop;
             s.spawn(move || {
@@ -901,7 +905,9 @@ fn measure(
             })
         });
         (measured, sampled)
-    })
+    });
+    status::cue(cx, call);
+    Ok(measured)
 }
 
 /// A finished sampler run: its metrics, its CSV `<name>-trace.csv` in the session's capture folder and the CSV's
@@ -1018,11 +1024,16 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
     let server = trace_ready(&cx, sampler.needs_ids(), "measure_trace")?;
     let back = game_back(&cx, call)?;
     call.lap("check");
+    let line = status::measuring(&cx, call, secs.into(), &mut None);
     let from = crate::win::tick();
-    let (_, sampled) = measure(&cx, call, None, Some((&sampler, server)), secs, None);
+    let (_, sampled) =
+        measure(&cx, call, None, Some((&sampler, server)), secs, None).map_err(Done::Refused)?;
     let sampled = sampled.expect("a trace ran");
     call.lap("trace");
     let mut fields = Map::new();
+    if let Some(line) = line {
+        fields.insert("status".into(), json!(line));
+    }
     fields.insert("utc".into(), json!(sampled.utc));
     fields.insert("samples".into(), json!(sampled.samples.len()));
     if let Some(back) = &back {
@@ -1207,7 +1218,10 @@ impl Run {
             };
             self.states[s].1.iter().map(each).sum()
         };
-        let window = self.settle.as_secs_f64() + f64::from(self.secs) + WINDOW_S;
+        let window = self.settle.as_secs_f64()
+            + f64::from(self.secs)
+            + WINDOW_S
+            + status::HIDE_WAIT.as_secs_f64();
         let switches: f64 = self
             .order
             .windows(2)
@@ -1363,7 +1377,7 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     }
     let back = game_back(&cx, call)?;
     call.lap("check");
-    let notice = notice::measuring(&cx, call, run.secs(exec).ceil() as u64, &mut None);
+    let line = status::measuring(&cx, call, run.secs(exec).ceil() as u64, &mut None);
     // From the first action on, every exit path restores (step 4).
     let mut windows = Vec::new();
     let mut entered = run.order[0];
@@ -1387,8 +1401,8 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     if let Some(pm) = &pm {
         fields.insert("presentmon".into(), json!(pm.exe));
     }
-    if let Some(notice) = notice {
-        fields.insert("notice".into(), json!(notice));
+    if let Some(line) = line {
+        fields.insert("status".into(), json!(line));
     }
     if let Some(back) = back {
         fields.insert("game_back".into(), json!(back));
@@ -1553,6 +1567,10 @@ fn windows_of(
                 "stopped before {at} (a cancel, or quen shutting down)"
             ));
         }
+        // The status line, taken down for the window before, is back for this one's apply and settle.
+        if i > 0 {
+            status::tick(cx);
+        }
         // Toggles run only on a switch; the first window measures the game as it is.
         let switch = i > 0 && *entered != s;
         let apply = SystemTime::now();
@@ -1590,7 +1608,8 @@ fn windows_of(
         let pm_csv = pm.map(|pm| (pm, csv.as_path()));
         let before = guard.read(cx);
         let from = crate::win::tick();
-        let (measured, sampled) = measure(cx, call, pm_csv, trace, run.secs, None);
+        let (measured, sampled) = measure(cx, call, pm_csv, trace, run.secs, None)
+            .map_err(|why| format!("{at}: {why}"))?;
         let menu = menu_since(cx, from);
         let after = guard.read(cx);
         call.lap(&format!("{}{label}_measure", i + 1));
@@ -2442,13 +2461,55 @@ fn main() {
         assert_eq!(again["refused"], true, "{again}");
     }
 
+    /// The status line is down before every window: the game gets the hide before PresentMon starts, PresentMon starts
+    /// HIDE_WAIT or more after the game's reply, and the result carries the budget line and the measuring state's reply.
+    #[test]
+    fn the_status_line_is_down_half_a_second_before_a_window() {
+        let fx = served("pm-status");
+        fake_presentmon(&fx);
+        fx.shared.set_hands(Some(Hands::Agent));
+        let calls = fx.dir.join("harness/calls.txt");
+        let hidden = Arc::new(std::sync::Mutex::new(None));
+        let (seen, started) = (hidden.clone(), calls.clone());
+        let answer = Box::new(move |r: &Request| {
+            if r.verb == (Verb::NoticeHide {}) {
+                assert!(!started.exists(), "a window started before the hide");
+                *seen.lock().unwrap() = Some(SystemTime::now());
+            }
+            vec![reply(r.id, true, "notice shown", None)]
+        });
+        let server = fake_game(&token(&fx), 2, answer);
+        let args = json!({"token": "tok", "tag": "st", "secs": 1});
+        let out = fx.run("measure_presentmon", args);
+        assert_eq!(out["ok"], true, "{out}");
+        let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert!(
+            matches!(sent[..], [Verb::Notice { .. }, Verb::NoticeHide {}]),
+            "{sent:?}"
+        );
+        let hid = hidden.lock().unwrap().expect("hidden");
+        let window = fs::metadata(&calls).unwrap().modified().unwrap();
+        let after = window.duration_since(hid).unwrap();
+        assert!(
+            after >= status::HIDE_WAIT,
+            "PresentMon started {after:?} after the hide"
+        );
+        assert_eq!(out["status"], "notice shown", "{out}");
+        assert_eq!(out["indicator"]["shown_before"], "measuring", "{out}");
+        assert!(
+            out["timing_s"]["status_hide"].as_f64().unwrap() >= 0.5,
+            "{out}"
+        );
+    }
+
     /// The runner design's Q2 and Q4: the same trace beside PresentMon in every window, its sampler named on the frame
     /// rows and in the verdict, per metric a behaviour verdict; or the trace alone, without PresentMon at all.
     /// Finding 79: job_cancel's flag (a cancel of a `wait: false` call: it sets the flag the session thread's call
-    /// checks) during the gap after the measuring notice starts no window, and one during the window kills PresentMon;
-    /// both fail and say when. The live check saw the window start 3 s after the notice and run on to a plain ok.
+    /// checks) during the wait after the status line's hide starts no window, and one during the window kills
+    /// PresentMon; both fail and say when. The live check saw the window start 3 s after the notice and run on to a
+    /// plain ok.
     #[test]
-    fn a_cancel_in_the_notice_gap_or_the_window_measures_nothing() {
+    fn a_cancel_in_the_hide_wait_or_the_window_measures_nothing() {
         let cancel_after = |fx: &Fake, ms, tool, args: Value| {
             std::thread::scope(|s| {
                 s.spawn(|| {
@@ -2463,14 +2524,20 @@ fn main() {
         fake_presentmon(&fx);
         fx.shared.set_hands(Some(Hands::Agent));
         let notice = Box::new(|r: &Request| vec![reply(r.id, true, "notice shown", None)]);
-        let server = fake_game(&token(&fx), 1, notice);
+        let server = fake_game(&token(&fx), 2, notice);
         let args = json!({"token": "tok", "tag": "gap", "secs": 30});
-        let (out, took) = cancel_after(&fx, 500, "measure_presentmon", args);
-        assert_eq!(server.join().unwrap().len(), 1, "the notice went out");
+        let (out, took) = cancel_after(&fx, 300, "measure_presentmon", args);
+        let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert!(
+            matches!(sent[..], [Verb::Notice { .. }, Verb::NoticeHide {}]),
+            "the line, then its hide: {sent:?}"
+        );
         let reason = out["reason"].as_str().unwrap_or_default();
         assert!(
             out["ok"] == false
-                && reason.starts_with("the call was cancelled during the 9 s after quen's notice"),
+                && reason.starts_with(
+                    "the call was cancelled during the 0.5 s wait for quen's line in the game to be gone"
+                ),
             "{out}"
         );
         assert!(fx.calls().is_empty(), "a window started: {:?}", fx.calls());

@@ -1914,9 +1914,9 @@ if os.path.exists(act): exec(open(act).read())
                 paused: Default::default(),
                 path: Default::default(),
                 client: Err("a test session has no client".into()),
-                notice_at: Default::default(),
                 away: Default::default(),
                 idled: Default::default(),
+                status: Default::default(),
                 in_plan: Default::default(),
                 _awake: crate::win::Awake::hold(),
             });
