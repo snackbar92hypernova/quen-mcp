@@ -515,7 +515,7 @@ pub(crate) fn window_frame(pids: &[u32]) -> Result<(usize, usize, Vec<u8>), Stri
 }
 
 /// Whether the foreground window belongs to a process in the job.
-fn in_front(pids: &[u32]) -> bool {
+pub(crate) fn in_front(pids: &[u32]) -> bool {
     let mut pid = 0;
     // SAFETY: plain queries; a null foreground window gives pid 0.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use quen_core::bridge_log::MENU;
 use quen_core::build::Build;
 use quen_core::journal::{Fs, Journal, replay, sha256_file, sha256_hex};
 use quen_core::ledger::{BootEnd, BootStart, Ledger, Outcome, Save};
@@ -767,6 +768,17 @@ fn state(shared: &Shared) -> Value {
     // The job's game exited by itself (feature tests 2: ngfx closes it after its trace): when.
     if let Some(t) = locked(&shared.game).as_ref().and_then(Child::exited) {
         game["exited"] = json!(utc(t));
+    }
+    // While it runs: whether it is in front, and quen's state log's view (menu, photo, how fresh), with no channel
+    // call. Behind the chat it sits in its pause menu (boot 190 measured such a world).
+    if !pids.is_empty() {
+        let started = locked(&shared.game).as_ref().and_then(Child::started_at);
+        let view = w3::state(config, started);
+        game["in_front"] = json!(crate::capture::in_front(&pids));
+        game["menu"] = json!(view["flags"].as_i64().map(|f| f & MENU != 0));
+        for key in ["photo", "age_s", "stale"] {
+            game[key] = view[key].clone();
+        }
     }
     let journal = journal_path(config);
     let mut state = json!({
@@ -2535,6 +2547,37 @@ impl Fs for JournalFs {
 mod tests {
     use super::*;
     use quen_core::park::Entry;
+
+    /// Every envelope's `state.game`, while a game runs in the job: whether it is in front (the stand-in game has no
+    /// window, so never), and quen's state log's menu and photo bits and how fresh the log is; none of these without a
+    /// game.
+    #[test]
+    fn the_state_says_whether_the_game_is_in_front_and_in_a_menu() {
+        let fx = crate::game::tests::Fake::new("state-front");
+        assert!(state(&fx.shared)["game"].get("in_front").is_none());
+        *locked(&fx.shared.job) = Some(fx.job.clone());
+        let log = fx.dir.join("game/bin/x64_dx12").join(w3::STATE_LOG);
+        fs::write(&log, "1 push=1 flags=1\n2 push=2 flags=2049\n").unwrap();
+        let game = &state(&fx.shared)["game"];
+        assert_eq!(
+            (
+                &game["running"],
+                &game["in_front"],
+                &game["menu"],
+                &game["photo"]
+            ),
+            (&json!(true), &json!(false), &json!(true), &json!(false)),
+            "{game}"
+        );
+        assert!(game["age_s"].is_u64() && game["stale"] == true, "{game}");
+        fs::write(&log, "1 push=1 flags=129\n").unwrap();
+        let game = &state(&fx.shared)["game"];
+        assert_eq!(
+            (&game["menu"], &game["photo"]),
+            (&json!(false), &json!(true))
+        );
+        *locked(&fx.shared.job) = None;
+    }
 
     /// Finding 91: `again` replays what still matters at the end: moot photo visits go, a load drops the world calls
     /// before it, a later time, weather, position or cvar write drops the earlier one, unless a console or exec line
