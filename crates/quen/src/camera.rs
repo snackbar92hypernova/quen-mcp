@@ -586,12 +586,16 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     let p = Play::parse(&cx, args, &ledger)?;
     let path = p.sweep.path().map_err(|e| e.to_string())?;
     let mut first = Some(ready(&cx, "sweep_play", true)?);
+    let back = crate::measure::game_back(&cx, call)?;
     call.lap("check");
 
     // Acting from here: what is done goes into the fields, and the path and the pause are undone at the end.
     let mut fields = Map::new();
     fields.insert("sweep_id".into(), json!(p.sweep_id));
     fields.insert("mode".into(), json!(p.mode.as_str()));
+    if let Some(back) = back {
+        fields.insert("game_back".into(), json!(back));
+    }
     // Step mode took about 0.5 s a frame (feature tests 2).
     let secs = match p.mode {
         Mode::Realtime => path.duration(),
@@ -628,10 +632,9 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
             paused = true;
             fields.insert("pause".into(), json!(reply.text));
         }
-        // A real-time path plays from its load; step mode's frames wait in game_screenshot.
-        if p.mode == Mode::Realtime {
-            notice::clear(cx.live, call)?;
-        }
+        // A real-time path plays from its load, and step mode's frames are captured after it: the notice is gone first,
+        // its wait a lap of its own (finding 86: it hid inside frames).
+        notice::clear(cx.live, call)?;
         let verb = Verb::CamPath {
             mode: p.mode,
             fps: p.fps,

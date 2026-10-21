@@ -91,15 +91,15 @@ pub(crate) fn clear(live: &Live, call: &mut Call) -> Result<(), String> {
 }
 
 /// The measuring notice, before a call's first window, when the agent has the controls and the call takes `secs` or
-/// more: the game's reply, or why it wasn't shown. None: no notice for it. It goes on `held` when the caller holds the
-/// connection (taking it), else on a connection of its own.
+/// more: the game's reply, or why it wasn't shown. None: no notice for it (or a run_plan's step: the plan showed one).
+/// It goes on `held` when the caller holds the connection (taking it), else on a connection of its own.
 pub(crate) fn measuring(
     cx: &Ctx,
     call: &mut Call,
     secs: u64,
     held: &mut Option<Channel>,
 ) -> Option<String> {
-    if cx.hands != Some(Hands::Agent) || secs < MEASURING_MIN {
+    if cx.hands != Some(Hands::Agent) || secs < MEASURING_MIN || cx.live.in_plan.get() {
         return None;
     }
     let text = format!(
@@ -163,10 +163,14 @@ pub(crate) fn idle(session: &Session) {
 }
 
 /// Whether `tool` needs the game in front: it sends input, captures or measures frames, or waits for the world to move.
-fn needs_front(tool: &str) -> bool {
+pub(crate) fn needs_front(tool: &str) -> bool {
     match tool {
         "game_scriptlog" | "game_listsaves" | "game_cvar" => false,
-        tool => tool.starts_with("game_") || tool.starts_with("measure_") || tool == "sweep_play",
+        tool => {
+            tool.starts_with("game_")
+                || tool.starts_with("measure_")
+                || matches!(tool, "sweep_play" | "run_plan")
+        }
     }
 }
 

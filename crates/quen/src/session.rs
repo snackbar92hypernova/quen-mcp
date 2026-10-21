@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use quen_core::bridge_log::MENU;
 use quen_core::build::Build;
 use quen_core::journal::{Fs, Journal, replay, sha256_file, sha256_hex};
 use quen_core::ledger::{BootEnd, BootStart, Ledger, Outcome, Save};
@@ -279,6 +280,28 @@ impl Call<'_> {
         sha
     }
 
+    /// A nested call's artifacts and ledger rows, from its `envelope`, listed in this call's too (run_plan's steps).
+    pub(crate) fn merge(&mut self, envelope: &Value) {
+        if let Some(artifacts) = envelope["artifacts"].as_array() {
+            self.artifacts.extend(artifacts.iter().cloned());
+        }
+        for (table, ids) in envelope["ledger"].as_object().into_iter().flatten() {
+            for id in ids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+            {
+                self.row(table, id);
+            }
+        }
+    }
+
+    /// Its client got `{job, state}` already: it runs as a job (`wait: false`, or past the client's budget).
+    pub(crate) fn detached(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.detached())
+    }
+
     /// Notes the call's progress for job_status, and sends a progress notification if the client asked for them, still
     /// waits for this call and didn't cancel it. Its progress is the call's whole seconds so far, sent only when it
     /// grew: MCP wants it to increase with every notification.
@@ -365,6 +388,8 @@ pub(crate) struct Live {
     pub(crate) notice_at: Cell<Option<Instant>>,
     pub(crate) away: Cell<bool>,
     pub(crate) idled: Cell<Option<Instant>>,
+    /// A run_plan is running: it showed its own measuring notice, so its steps show none (notice.rs).
+    pub(crate) in_plan: Cell<bool>,
     /// Keeps the PC and its display awake for exactly as long as the session lives.
     pub(crate) _awake: crate::win::Awake,
 }
@@ -410,6 +435,88 @@ const SETUP: [&str; 11] = [
     "game_photo",
     "game_camera",
 ];
+
+/// What `session_launch again` replays of the noted `setup` calls, in order (finding 91: boot 191 replayed 33): each but
+/// those a later one makes moot, so the end state stays the same.
+/// - A photo-mode visit (an `enter` to the next `exit`) holding only camera poses and photo settings other than `env`:
+///   photo mode's time and weather didn't outlast it (finding 33), nor does its camera.
+/// - Before a `game_load`: the loads, teleports, places, times, weathers, items, photo and camera calls (the save brings
+///   its own). cvars and console and exec lines stay: what they change may outlast a load.
+/// - A time, a weather, a position (`game_teleport` or `game_place`) or a cvar of one name that a later call sets again,
+///   with no console or exec line between (such a line may depend on it, e.g. a spawn where the player stands).
+// ponytail: a closed list of what a load or a later call undoes, from finding 33 and the tools' own words; a console or
+// exec line is never dropped, since what it changes is unknown.
+fn replayed(setup: &[Value]) -> Vec<Value> {
+    let tool = |s: &Value| s["tool"].as_str().unwrap_or_default().to_string();
+    let action = |s: &Value| s["args"]["action"].as_str().map(str::to_string);
+    let mut keep = vec![true; setup.len()];
+    // Photo-mode visits that leave nothing behind.
+    let mut entered = None;
+    for (i, step) in setup.iter().enumerate() {
+        match (tool(step).as_str(), action(step).as_deref()) {
+            ("game_photo", Some("enter")) => entered = Some(i),
+            ("game_photo", Some("exit")) => {
+                if let Some(from) = entered.take() {
+                    let inside = &setup[from + 1..i];
+                    let moot = inside.iter().all(|s| match tool(s).as_str() {
+                        "game_camera" => true,
+                        "game_photo" => action(s).as_deref() != Some("env"),
+                        _ => false,
+                    });
+                    if moot {
+                        keep[from..=i].iter_mut().for_each(|k| *k = false);
+                    }
+                }
+            }
+            ("game_photo" | "game_camera", _) => {}
+            _ => entered = None,
+        }
+    }
+    // What a later call of the same kind (or a load) sets again.
+    let kind = |s: &Value| -> Option<String> {
+        match tool(s).as_str() {
+            "game_teleport" | "game_place" => Some("position".into()),
+            t @ ("game_settime" | "game_weather") => Some(t.into()),
+            "game_cvar" => Some(format!("cvar {}", s["args"]["name"].as_str()?)),
+            _ => None,
+        }
+    };
+    let loaded = [
+        "game_load",
+        "game_teleport",
+        "game_place",
+        "game_settime",
+        "game_weather",
+        "game_items",
+        "game_photo",
+        "game_camera",
+    ];
+    for i in 0..setup.len() {
+        let later = &setup[i + 1..];
+        let t = tool(&setup[i]);
+        if loaded.contains(&t.as_str()) && later.iter().any(|s| tool(s) == "game_load") {
+            keep[i] = false;
+            continue;
+        }
+        let Some(k) = kind(&setup[i]) else { continue };
+        let until = later
+            .iter()
+            .position(|s| matches!(tool(s).as_str(), "game_console" | "game_exec"))
+            .unwrap_or(later.len());
+        if later[..until]
+            .iter()
+            .any(|s| kind(s).as_deref() == Some(&k))
+        {
+            keep[i] = false;
+        }
+    }
+    setup
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(s, _)| s.clone())
+        .collect()
+}
 
 /// This quen serve's last test launch, for `session_launch again`: the connection that made it, its arguments (the save
 /// pinned to the file it loaded, no user_ok) and the [`SETUP`] calls since, in order, each `{tool, args}`.
@@ -662,6 +769,17 @@ fn state(shared: &Shared) -> Value {
     if let Some(t) = locked(&shared.game).as_ref().and_then(Child::exited) {
         game["exited"] = json!(utc(t));
     }
+    // While it runs: whether it is in front, and quen's state log's view (menu, photo, how fresh), with no channel
+    // call. Behind the chat it sits in its pause menu (boot 190 measured such a world).
+    if !pids.is_empty() {
+        let started = locked(&shared.game).as_ref().and_then(Child::started_at);
+        let view = w3::state(config, started);
+        game["in_front"] = json!(crate::capture::in_front(&pids));
+        game["menu"] = json!(view["flags"].as_i64().map(|f| f & MENU != 0));
+        for key in ["photo", "age_s", "stale"] {
+            game[key] = view[key].clone();
+        }
+    }
     let journal = journal_path(config);
     let mut state = json!({
         "lock": lock,
@@ -881,9 +999,43 @@ impl<'a> Session<'a> {
         )
     }
 
-    /// Runs session-thread tool `name`, once it isn't refused.
+    /// Runs session-thread tool `name`, once it isn't refused; a call that succeeds is noted for `again`.
     fn run(&mut self, call: &mut Call, name: &str, args: &Value) -> Done {
-        let done = match name {
+        let done = self.dispatch(call, name, args);
+        if matches!(done, Done::Ok(_)) {
+            self.note_setup(name, args);
+        }
+        done
+    }
+
+    /// `tool` inside another call (`session_launch again`'s setup, run_plan's steps), on a call of its own (its laps its
+    /// own) that reports progress through the outer call's job. `noted`: a success is noted for `again`, as a call of
+    /// its own would be. `cancellable` false: the outer call's cancel doesn't stop it (run_plan's teardown); a shutdown
+    /// or the connection closing still do.
+    pub(crate) fn nested(
+        &mut self,
+        outer: &Call,
+        tool: &str,
+        args: &Value,
+        noted: bool,
+        cancellable: bool,
+    ) -> (Done, Call<'a>) {
+        let id = if cancellable {
+            outer.id.clone()
+        } else {
+            Value::Null
+        };
+        let mut each = self.call(outer.conn.clone(), id, None);
+        each.job = outer.job.clone();
+        let done = match noted {
+            true => self.run(&mut each, tool, args),
+            false => self.dispatch(&mut each, tool, args),
+        };
+        (done, each)
+    }
+
+    fn dispatch(&mut self, call: &mut Call, name: &str, args: &Value) -> Done {
+        match name {
             "session_launch" => self.launch(call, args, false),
             "session_plan" => self.launch(call, args, true),
             "session_end" => self.end(call, args),
@@ -909,12 +1061,9 @@ impl<'a> Session<'a> {
             n @ ("data_read" | "data_scan" | "script_compile" | "quen_setup") => {
                 data::call(self, call, n, args)
             }
+            "run_plan" => crate::plan::call(self, call, args),
             _ => self.recover(call, true),
-        };
-        if matches!(done, Done::Ok(_)) {
-            self.note_setup(name, args);
         }
-        done
     }
 
     /// Notes a successful call of `tool` that the next `session_launch again` replays ([`SETUP`]): where run_plan's
@@ -928,6 +1077,15 @@ impl<'a> Session<'a> {
             }
             again.setup.push(json!({"tool": tool, "args": args}));
         }
+    }
+
+    /// The calls noted for `again` (a launch's own in tests), as if a test launch had been made.
+    #[cfg(test)]
+    pub(crate) fn noted(&mut self) -> &mut Vec<Value> {
+        let again = self
+            .again
+            .get_or_insert_with(|| Again::new(0, &json!({}), None));
+        &mut again.setup
     }
 
     /// A play session ends by itself once its game has exited (the user quit it, or it crashed), its files given
@@ -1330,6 +1488,7 @@ impl<'a> Session<'a> {
             notice_at: Cell::new(None),
             away: Cell::new(false),
             idled: Cell::new(None),
+            in_plan: Cell::new(false),
             _awake: crate::win::Awake::hold(),
         });
         fields.insert("session".into(), json!(id));
@@ -1473,8 +1632,8 @@ impl<'a> Session<'a> {
     /// `session_launch` (with `plan` `session_plan`) with `again: true` (finding 61): this connection's last test launch
     /// again, its staged files and mods copied anew from their paths, so a rebuilt one is taken. Its session, if live (its
     /// token), ends first, once its save and staged paths are checked to be still there; then the launch, then the setup:
-    /// the [`SETUP`] calls that succeeded after the last launch, in order. A setup call that doesn't succeed stops the
-    /// rest. The plan plans that launch and lists the setup.
+    /// the [`SETUP`] calls that succeeded after the last launch, in order, as [`replayed`] keeps them. A setup call that
+    /// doesn't succeed stops the rest. The plan plans that launch and lists the setup.
     // ponytail: no way to skip or edit the setup; add `replay: false` (or a list) when asked: session_launch's schema is
     // at the portable 5000-byte cap.
     fn relaunch(&mut self, call: &mut Call, args: &Value, plan: bool) -> Done {
@@ -1505,11 +1664,13 @@ impl<'a> Session<'a> {
                 .to_string()
                 .into();
         };
-        let (setup, mut repeat) = (last.setup.clone(), last.args.clone());
+        let (setup, mut repeat) = (replayed(&last.setup), last.args.clone());
+        let skipped = last.setup.len() - setup.len();
         if plan {
             let mut done = self.launch(call, &repeat, true);
             if let Done::Ok(fields) = &mut done {
                 fields.insert("setup".into(), json!(setup));
+                fields.insert("setup_skipped".into(), json!(skipped));
             }
             return done;
         }
@@ -1565,17 +1726,19 @@ impl<'a> Session<'a> {
             }
         };
         launched.extend(fields);
+        launched.insert("setup_skipped".into(), json!(skipped));
         // Each setup call on a call of its own, so its laps are its own; the new session records it again.
         let mut ran = Vec::new();
         for (n, step) in setup.iter().enumerate() {
             let tool = step["tool"].as_str().unwrap_or_default();
             let mut step_args = step["args"].clone();
             step_args["token"] = launched["token"].clone();
-            let mut each = self.call(call.conn.clone(), call.id.clone(), None);
-            each.job = call.job.clone();
-            let done = match call.stopped() {
-                true => Done::Refused(format!("{} before it", call.stop_cause())),
-                false => self.run(&mut each, tool, &step_args),
+            let (done, each) = match call.stopped() {
+                true => (
+                    Done::Refused(format!("{} before it", call.stop_cause())),
+                    self.call(call.conn.clone(), Value::Null, None),
+                ),
+                false => self.nested(call, tool, &step_args, true, true),
             };
             let mut row = step.clone();
             row["ok"] = json!(matches!(done, Done::Ok(_)));
@@ -2384,6 +2547,79 @@ impl Fs for JournalFs {
 mod tests {
     use super::*;
     use quen_core::park::Entry;
+
+    /// Every envelope's `state.game`, while a game runs in the job: whether it is in front (the stand-in game has no
+    /// window, so never), and quen's state log's menu and photo bits and how fresh the log is; none of these without a
+    /// game.
+    #[test]
+    fn the_state_says_whether_the_game_is_in_front_and_in_a_menu() {
+        let fx = crate::game::tests::Fake::new("state-front");
+        assert!(state(&fx.shared)["game"].get("in_front").is_none());
+        *locked(&fx.shared.job) = Some(fx.job.clone());
+        let log = fx.dir.join("game/bin/x64_dx12").join(w3::STATE_LOG);
+        fs::write(&log, "1 push=1 flags=1\n2 push=2 flags=2049\n").unwrap();
+        let game = &state(&fx.shared)["game"];
+        assert_eq!(
+            (
+                &game["running"],
+                &game["in_front"],
+                &game["menu"],
+                &game["photo"]
+            ),
+            (&json!(true), &json!(false), &json!(true), &json!(false)),
+            "{game}"
+        );
+        assert!(game["age_s"].is_u64() && game["stale"] == true, "{game}");
+        fs::write(&log, "1 push=1 flags=129\n").unwrap();
+        let game = &state(&fx.shared)["game"];
+        assert_eq!(
+            (&game["menu"], &game["photo"]),
+            (&json!(false), &json!(true))
+        );
+        *locked(&fx.shared.job) = None;
+    }
+
+    /// Finding 91: `again` replays what still matters at the end: moot photo visits go, a load drops the world calls
+    /// before it, a later time, weather, position or cvar write drops the earlier one, unless a console or exec line
+    /// lies between; console and exec lines always stay.
+    #[test]
+    fn the_relaunch_skips_calls_a_later_one_makes_moot() {
+        let s = |tool: &str, args: Value| json!({"tool": tool, "args": args});
+        let photo = |action: &str| s("game_photo", json!({"action": action}));
+        let mut setup = [
+            s("game_settime", json!({"day": 1, "hour": 8})), // 0: a load follows
+            s("game_cvar", json!({"name": "X", "set": "1"})), // 1: kept (outlasts a load)
+            s("game_exec", json!({"line": "qwspawn(1)"})),   // 2: kept
+            s("game_load", json!({"save": "a"})),            // 3: a later load
+            s("game_load", json!({"save": "b"})),            // 4: kept
+            photo("enter"),                                  // 5..8: a moot visit
+            s("game_camera", json!({"pos": [0, 0, 0]})),
+            photo("time"),
+            photo("exit"),
+            photo("enter"), // 9..11: env may outlast it
+            photo("env"),
+            photo("exit"),
+            s("game_teleport", json!({"pos": [1, 2, 3]})), // 12: a place follows, no line between
+            s("game_place", json!({"pos": [4, 5]})), // 13: kept (an exec follows before the next)
+            s("game_exec", json!({"line": "qwgo(0)"})), // 14
+            s("game_teleport", json!({"pos": [6, 7, 8]})), // 15: kept
+            s("game_weather", json!({"name": "WT_Clear"})), // 16: set again
+            s("game_cvar", json!({"name": "X", "set": "2"})), // 17: written again
+            s("game_cvar", json!({"name": "Y", "set": "1"})), // 18: another name
+            s("game_weather", json!({"name": "WT_Rain"})), // 19
+            s("game_cvar", json!({"name": "X", "restore": true})), // 20
+            photo("enter"),                          // 21: left open
+        ];
+        // Each one told apart by its place.
+        for (n, step) in setup.iter_mut().enumerate() {
+            step["n"] = json!(n);
+        }
+        let kept: Vec<u64> = replayed(&setup)
+            .iter()
+            .map(|k| k["n"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kept, [1, 2, 4, 9, 10, 11, 13, 14, 15, 18, 19, 20, 21]);
+    }
 
     /// Feature tests 2b: a boot quen recovered kept the end's "close it, then session_recover". Once replayed, the
     /// failure says why the session ended, what made its end leave the journal, and when quen replayed it; an older

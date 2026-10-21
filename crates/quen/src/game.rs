@@ -181,7 +181,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
     let out = match name {
         "game_load" => load(session, call, args),
         "game_console" => console(session, call, args),
-        "game_exec" => exec(session, args),
+        "game_exec" => exec(session, call, args),
         n @ ("world_frame" | "world_ground" | "world_ray" | "world_nav" | "game_frame"
         | "game_place") => crate::scene::call(session, call, n, args),
         "game_scriptlog" => scriptlog(session, args),
@@ -924,7 +924,7 @@ pub(crate) fn in_game(flags: i64) -> bool {
 }
 
 /// A menu that bringing the game back closes ([`Ctx::close_menu`]): the menu bit outside photo mode.
-fn menu_to_close(flags: i64) -> bool {
+pub(crate) fn menu_to_close(flags: i64) -> bool {
     flags & MENU != 0 && !bridge_log::in_photo(flags)
 }
 
@@ -1157,9 +1157,11 @@ fn confirm(
     }
 }
 
-fn exec(session: &Session, args: &Value) -> Result<Fields, Done> {
+fn exec(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &["line"])?;
-    cx.exec(text(args, "line")?)
+    let done = cx.exec(text(args, "line")?);
+    call.lap("exec");
+    done
 }
 
 fn console(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -1891,6 +1893,7 @@ if os.path.exists(act): exec(open(act).read())
                 notice_at: Default::default(),
                 away: Default::default(),
                 idled: Default::default(),
+                in_plan: Default::default(),
                 _awake: crate::win::Awake::hold(),
             });
             session

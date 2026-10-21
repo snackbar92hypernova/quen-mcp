@@ -47,6 +47,12 @@ const FRONT_POLL: Duration = Duration::from_millis(250);
 /// frame time added, judged against its measured cost. The trace's cost is unmeasured until the overhead boot.
 const BUDGET_MEAN_MS: f64 = 0.05;
 const BUDGET_P99_MS: f64 = 0.5;
+/// What a measure_ab run takes besides its settles and windows, for its estimate (run_plan's, and the notice's): quen's
+/// own time per window with the drift guard's reads (0.3 s measured without them, the runner design §3.2), a typed
+/// console line (boot 176's median, client-side) and a key toggle (a 200 ms hold and a 400 ms gap).
+const WINDOW_S: f64 = 0.5;
+pub(crate) const CONSOLE_S: f64 = 5.3;
+const KEYS_S: f64 = 0.6;
 
 pub fn tools() -> Vec<Value> {
     let token = json!({"type": "string", "description": "the token session_launch returned"});
@@ -287,7 +293,7 @@ fn quiet(strict: bool, skewed: Vec<String>) -> Result<Value, String> {
 }
 
 /// Where this session's CSVs go, beside its screenshots.
-fn captures(cx: &Ctx) -> PathBuf {
+pub(crate) fn captures(cx: &Ctx) -> PathBuf {
     cx.config.capture_root().join(&cx.live.id)
 }
 
@@ -452,14 +458,56 @@ fn in_front(cx: &Ctx, call: &Call) -> Result<HWND, Done> {
     Ok(window)
 }
 
-/// One window: its label, PresentMon's stats and CSV (none without PresentMon), its UTC times, its trace, and
-/// measure_ab's world fingerprint before and after it.
+/// Finding 88: no window measures a paused world. While quen's state shows the game's menu outside photo mode (the
+/// pause menu the game opens when it loses the front, or one the user opened), the game is brought back as `focus` to
+/// game does, which closes it: what that did, for the result's `game_back`. Refused, nothing measured, while the user
+/// has the controls, or when it can't be.
+pub(crate) fn game_back(cx: &Ctx, call: &Call) -> Result<Option<Fields>, Done> {
+    let last = cx.last_flags();
+    if !last.is_some_and(game::menu_to_close) {
+        return Ok(None);
+    }
+    let shows = format!(
+        "quen's state shows the game's menu ({}), where the world is paused",
+        game::shown(last)
+    );
+    if cx.hands == Some(Hands::User) {
+        return Err(format!("{shows}, and the user has the controls: nothing measured").into());
+    }
+    crate::focus::to_game(cx, call).map(Some).map_err(|done| {
+        Done::Refused(format!(
+            "{shows}, and bringing the game back failed ({}): nothing measured",
+            why(done)
+        ))
+    })
+}
+
+/// Whether quen's state showed the game's menu (outside photo mode) from system tick `from` on: its last push before
+/// `from`, or any after it. A window it is true for measured a paused world, at least in part.
+fn menu_since(cx: &Ctx, from: u64) -> bool {
+    let pushes = quen_core::bridge_log::pushes(&game::state_text(cx.config, cx.live.launched));
+    let before = pushes.iter().rev().find(|(t, _)| *t <= from);
+    before
+        .into_iter()
+        .chain(pushes.iter().filter(|(t, _)| *t > from))
+        .any(|(_, f)| game::menu_to_close(*f))
+}
+
+/// Why a single window that [`menu_since`] flags failed.
+const MENU_DURING: &str = "quen's state showed the game's menu during the window (the world paused, e.g. the game \
+                           lost the front): no ledger rows";
+
+/// One window: its label, PresentMon's stats and CSV (none without PresentMon), its UTC times, its trace,
+/// measure_ab's world fingerprint before and after it, whether quen's state showed the game's menu during it, and what
+/// bringing the game back before it did.
 struct Window {
     label: String,
     pm: Option<(Stats, PathBuf)>,
     utc: Fields,
     trace: Option<Traced>,
     world: [Option<Fingerprint>; 2],
+    menu: bool,
+    back: Option<Fields>,
 }
 
 /// A window's trace: its metrics, its CSV and the CSV's captures row.
@@ -486,11 +534,17 @@ fn shown(n: usize, w: &Window) -> Value {
     if w.world.iter().any(Option::is_some) {
         out["world"] = json!({"before": w.world[0], "after": w.world[1]});
     }
+    if w.menu {
+        out["menu_during"] = json!(true);
+    }
+    if let Some(back) = &w.back {
+        out["game_back"] = json!(back);
+    }
     out
 }
 
 /// A path under the capture root as captures.path has it.
-fn relative(cx: &Ctx, path: &Path) -> String {
+pub(crate) fn relative(cx: &Ctx, path: &Path) -> String {
     let root = cx.config.capture_root();
     let rel = path.strip_prefix(&root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
@@ -534,28 +588,36 @@ fn record(
         Some(None) => "a quiet machine".into(),
         Some(Some(w)) => format!("warned: {w}"),
     };
-    let world = world(cx);
     let mut ids = Vec::new();
-    let mut add =
-        |metric: String, value, unit: &str, label: &str, family: &str, capture_id, note| {
-            let row = Measurement {
-                boot_id: Some(cx.live.boot),
-                capture_id,
-                metric,
-                value: Some(value),
-                unit: Some(unit.into()),
-                state_label: Some(label.into()),
-                method_family: family.into(),
-                tag: Tag::M,
-                run_id: Some(run.into()),
-                note: Some(note),
-                extraction_id: None,
-                world: Some(world.into()),
-            };
-            ids.push(ledger.add_measurement(&row).map_err(|e| e.to_string())?);
-            Ok::<_, String>(())
+    let base = world(cx);
+    let mut add = |metric: String,
+                   value,
+                   unit: &str,
+                   label: &str,
+                   family: &str,
+                   capture_id,
+                   note,
+                   world: &str| {
+        let row = Measurement {
+            boot_id: Some(cx.live.boot),
+            capture_id,
+            metric,
+            value: Some(value),
+            unit: Some(unit.into()),
+            state_label: Some(label.into()),
+            method_family: family.into(),
+            tag: Tag::M,
+            run_id: Some(run.into()),
+            note: Some(note),
+            extraction_id: None,
+            world: Some(world.into()),
         };
+        ids.push(ledger.add_measurement(&row).map_err(|e| e.to_string())?);
+        Ok::<_, String>(())
+    };
     for w in windows {
+        // Finding 88: a window during which quen's state showed the game's menu measured a paused world.
+        let world = if w.menu { "paused" } else { base };
         if let Some((stats, csv)) = &w.pm {
             let metrics = [
                 ("frame_ms", Some(&stats.frame_ms)),
@@ -577,6 +639,7 @@ fn record(
                         "presentmon",
                         None,
                         note.clone(),
+                        world,
                     )?;
                 }
             }
@@ -615,6 +678,7 @@ fn record(
                 "game_state",
                 t.capture_id,
                 note,
+                world,
             )?;
         }
     }
@@ -643,20 +707,31 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     }
     let pm = PresentMon::new(&cx, args)?;
     let quiet = quiet(flag(args, "strict")?, skewed(&cx))?;
+    let back = game_back(&cx, call)?;
     call.lap("check");
     let notice = notice::measuring(&cx, call, secs.into(), &mut None);
     let front = match cx.hands {
         Some(Hands::User) => Some(in_front(&cx, call)?),
         _ => None,
     };
+    let from = crate::win::tick();
     let (stats, utc) = pm.window(&cx, call, &dest, secs, front)?;
     call.lap("presentmon");
+    if menu_since(&cx, from) {
+        let fields = Fields::from_iter(back.map(|b| ("game_back".to_string(), json!(b))));
+        return Err(Done::Failed(
+            format!("{MENU_DURING}; the CSV stays"),
+            fields,
+        ));
+    }
     let window = Window {
         label: tag.into(),
         pm: Some((stats, dest)),
         utc,
         trace: None,
         world: [None, None],
+        menu: false,
+        back,
     };
     let mut fields = Map::new();
     fields.insert("presentmon".into(), json!(pm.exe));
@@ -938,13 +1013,21 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
         return Err(format!("{} exists: pick a tag new in this session", csv.display()).into());
     }
     let server = trace_ready(&cx, sampler.needs_ids(), "measure_trace")?;
+    let back = game_back(&cx, call)?;
     call.lap("check");
+    let from = crate::win::tick();
     let (_, sampled) = measure(&cx, call, None, Some((&sampler, server)), secs, None);
     let sampled = sampled.expect("a trace ran");
     call.lap("trace");
     let mut fields = Map::new();
     fields.insert("utc".into(), json!(sampled.utc));
     fields.insert("samples".into(), json!(sampled.samples.len()));
+    if let Some(back) = &back {
+        fields.insert("game_back".into(), json!(back));
+    }
+    if menu_since(&cx, from) {
+        return Err(Done::Failed(format!("{MENU_DURING}, no CSV"), fields));
+    }
     let traced = traced(&cx, call, &sampled, &sampler, tag)
         .map_err(|why| Done::Failed(why, fields.clone()))?;
     let window = Window {
@@ -953,6 +1036,8 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
         utc: sampled.utc,
         trace: Some(traced),
         world: [None, None],
+        menu: false,
+        back: None,
     };
     fields.insert("sampler".into(), json!(sampler.to_string()));
     fields.insert("window".into(), shown(1, &window));
@@ -1107,6 +1192,31 @@ impl Run {
         })
     }
 
+    /// About how long the run takes, in seconds: its settles and windows, [`WINDOW_S`] a window, and the toggles of each
+    /// switch of state and of the switch back at the end (a console line typed unless `exec`).
+    fn secs(&self, exec: bool) -> f64 {
+        let toggles = |s: usize| -> f64 {
+            let each = |a: &Action| match a {
+                Action::Console { .. } if !exec => CONSOLE_S,
+                Action::Keys(_) => KEYS_S,
+                _ => 0.0,
+            };
+            self.states[s].1.iter().map(each).sum()
+        };
+        let window = self.settle.as_secs_f64() + f64::from(self.secs) + WINDOW_S;
+        let switches: f64 = self
+            .order
+            .windows(2)
+            .filter(|w| w[0] != w[1])
+            .map(|w| toggles(w[1]))
+            .sum();
+        let back = match self.order.last() != self.order.first() {
+            true => toggles(self.order[0]),
+            false => 0.0,
+        };
+        self.order.len() as f64 * window + switches + back
+    }
+
     /// The sampler window `i` (0-based) runs, if any.
     fn traced(&self, i: usize) -> Option<&Sampler> {
         let only = self.trace_only.is_none_or(|s| s == self.order[i]);
@@ -1132,6 +1242,12 @@ impl Run {
             .filter_map(|(on, f)| on.then_some(f))
             .collect()
     }
+}
+
+/// measure_ab's checks of `args` that need no game (states, order, settle, secs, trace), and about how long it runs
+/// ([`Run::secs`]; `exec`: its console lines go as exec verbs): run_plan's check and estimate of a measure_ab step.
+pub(crate) fn ab_secs(args: &Value, exec: bool) -> Result<f64, String> {
+    Run::parse(args).map(|run| run.secs(exec))
 }
 
 /// A result field as plain text.
@@ -1241,10 +1357,9 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
             }
         }
     }
+    let back = game_back(&cx, call)?;
     call.lap("check");
-    // About as long as the tool's description says a run takes.
-    let secs = run.order.len() as u64 * (run.settle.as_secs() + u64::from(run.secs) + 5);
-    let notice = notice::measuring(&cx, call, secs, &mut None);
+    let notice = notice::measuring(&cx, call, run.secs(exec).ceil() as u64, &mut None);
     // From the first action on, every exit path restores (step 4).
     let mut windows = Vec::new();
     let mut entered = run.order[0];
@@ -1270,6 +1385,9 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     }
     if let Some(notice) = notice {
         fields.insert("notice".into(), json!(notice));
+    }
+    if let Some(back) = back {
+        fields.insert("game_back".into(), json!(back));
     }
     let shown: Vec<Value> = windows
         .iter()
@@ -1330,10 +1448,25 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
                 .filter_map(move |(when, fp)| Some((w.label.as_str(), at(when), fp.as_ref()?)))
         })
         .collect();
+    // Finding 88: a window during which quen's state showed the game's menu measured a paused (frozen) world.
+    let paused = windows.iter().enumerate().filter(|(_, w)| w.menu).map(|(i, w)| {
+        let same = w.world[0].is_some() && w.world[0] == w.world[1];
+        let same = if same {
+            " (the reads before and after it were identical)"
+        } else {
+            ""
+        };
+        format!(
+            "window {} ({}): quen's state showed the game's menu during it, a paused world{same}",
+            i + 1,
+            w.label
+        )
+    });
     let guarded: Vec<String> = guard
         .server
         .err()
         .into_iter()
+        .chain(paused)
         .chain(drift::first_window(&means))
         .chain(drift::world_changes(&reads))
         .collect();
@@ -1432,6 +1565,11 @@ fn windows_of(
             return Err(format!("stopped in {at} (a cancel, or quen shutting down)"));
         }
         call.lap(&format!("{}{label}_settle", i + 1));
+        // Finding 88: a menu that opened since (the game lost the front) is closed, and the world settles again.
+        let back = game_back(cx, call).map_err(|d| format!("{at}: {}", why(d)))?;
+        if back.is_some() && !settle(call, run.settle, &at) {
+            return Err(format!("stopped in {at} (a cancel, or quen shutting down)"));
+        }
         let mut utc = Fields::from_iter([
             ("apply".into(), json!(utc_ms(apply))),
             ("settled".into(), json!(utc_ms(SystemTime::now()))),
@@ -1446,7 +1584,9 @@ fn windows_of(
         let trace = run.traced(i).zip(server);
         let pm_csv = pm.map(|pm| (pm, csv.as_path()));
         let before = guard.read(cx);
+        let from = crate::win::tick();
         let (measured, sampled) = measure(cx, call, pm_csv, trace, run.secs, None);
+        let menu = menu_since(cx, from);
         let after = guard.read(cx);
         call.lap(&format!("{}{label}_measure", i + 1));
         let pm = measured
@@ -1476,7 +1616,15 @@ fn windows_of(
             utc,
             trace: traced,
             world: [before, after],
+            menu,
+            back,
         });
+        if menu {
+            return Err(format!(
+                "{at}: quen's state showed the game's menu during it (the world paused, e.g. the game lost the \
+                 front): the run stopped; its rows say world paused"
+            ));
+        }
         let first = windows[0].pm.as_ref().map(|(s, _)| &s.present_mode);
         if let (Some((mode, mixed)), Some(first)) = (mode, first)
             && (mode.is_none() || mixed || *first != mode)
@@ -1551,8 +1699,9 @@ mod tests {
     /// The fake PresentMon, compiled by the tests: appends `presentmon <CSV file name> <secs>` to calls.txt beside it and
     /// writes its argv to argv.txt. Then it exits with the code in exit.txt, writing nothing, or writes the CSV: 5 warm-up
     /// rows and frames whose time is the dummy game's cvar as the journal's last write left it (20 ms, its default, before
-    /// any), in the PresentMode of mode.txt (default Independent Flip). A mode_after.txt becomes mode.txt for the next window.
-    /// With sleep.txt it first sleeps that many ms.
+    /// any), in the PresentMode of mode.txt (default Independent Flip). A mode_after.txt becomes mode.txt for the next window,
+    /// and a menu.txt (`<CSV file name> <push line>`) appends that line to quen's state log in the game's folder during that
+    /// CSV's window. With sleep.txt it first sleeps that many ms.
     const FAKE_PRESENTMON: &str = r#"
 use std::{env, fs, io::Write, path::Path, process};
 fn main() {
@@ -1583,6 +1732,12 @@ fn main() {
     fs::write(out, text).unwrap();
     if let Some(next) = read("mode_after.txt") {
         fs::write(here.join("mode.txt"), next).unwrap();
+    }
+    if let Some(menu) = read("menu.txt") {
+        if let Some(push) = menu.strip_prefix(&format!("{csv} ")) {
+            let log = here.join("../game/bin/x64_dx12/W3QuenState.log");
+            fs::OpenOptions::new().append(true).open(log).unwrap().write_all(push.as_bytes()).unwrap();
+        }
     }
 }
 "#;
@@ -2019,6 +2174,82 @@ fn main() {
         assert!(
             last.starts_with("cvar QuenTest/FrameMs back to its value before quen's first write"),
             "{last}"
+        );
+    }
+
+    /// Finding 88: no window measures a paused world. quen's state showing the game's menu before a window refuses the
+    /// call when the game can't be brought back (the stand-in has no window), nothing measured; the menu during a window
+    /// stops measure_ab there, its rows' world paused and the drift guard saying so; the run still restores.
+    #[test]
+    fn a_menu_refuses_or_stops_the_measuring() {
+        let fx = Fake::new("abmenu");
+        fake_presentmon(&fx);
+        let log = fx.dir.join("game/bin/x64_dx12/W3QuenState.log");
+        fs::write(
+            &log,
+            "100 push=1 flags=2049
+",
+        )
+        .unwrap();
+        let pm = fx.run("measure_presentmon", json!({"token": "tok", "tag": "m"}));
+        let mut ab = ab_args(json!(["A", "B", "A", "B"]));
+        ab["states"][0]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 20}]);
+        ab["states"][1]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 23}]);
+        let refused = fx.run("measure_ab", ab.clone());
+        for out in [&pm, &refused] {
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(
+                out["refused"] == true
+                    && reason.contains("shows the game's menu")
+                    && reason.ends_with("nothing measured"),
+                "{out}"
+            );
+        }
+        assert!(fx.calls().is_empty(), "{:?}", fx.calls());
+        assert!(cvar_writes(&fx).is_empty());
+        // Photo mode's own menu bit doesn't count.
+        fs::write(
+            &log,
+            "100 push=1 flags=2177
+",
+        )
+        .unwrap();
+        let out = fx.run("measure_ab", ab.clone());
+        assert_eq!(out["ok"], true, "{out}");
+        // Gameplay, then the menu during window 2 (a push at the furthest tick: after the window began).
+        fs::write(
+            &log,
+            "100 push=1 flags=1
+",
+        )
+        .unwrap();
+        let push = format!(
+            "menu_2B.csv {} push=2 flags=2049
+",
+            u64::MAX
+        );
+        fs::write(fx.dir.join("harness/menu.txt"), push).unwrap();
+        ab["tag"] = json!("menu");
+        let out = fx.run("measure_ab", ab);
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["ok"] == false
+                && reason.starts_with("window 2 (B): quen's state showed the game's menu"),
+            "{out}"
+        );
+        assert_eq!(out["states"][1]["menu_during"], true, "{out}");
+        assert_eq!(out["restored"][0]["ok"], true, "{out}");
+        let guard = out["drift_guard"].to_string();
+        assert!(
+            guard.contains(
+                "window 2 (B): quen's state showed the game's menu during it, a paused world"
+            ),
+            "{out}"
+        );
+        let sql = "SELECT DISTINCT state_label, world FROM measurements WHERE run_id = 's1-menu' ORDER BY 1";
+        assert_eq!(
+            rows(&fx, sql),
+            [[json!("A"), json!("live")], [json!("B"), json!("paused")]]
         );
     }
 
