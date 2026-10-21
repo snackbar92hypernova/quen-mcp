@@ -2510,10 +2510,15 @@ fn main() {
     /// plain ok.
     #[test]
     fn a_cancel_in_the_hide_wait_or_the_window_measures_nothing() {
-        let cancel_after = |fx: &Fake, ms, tool, args: Value| {
+        // The cancel waits for an event, not a fixed delay: a slow runner (CI's Windows, busy building) reached the
+        // hide wait after a 300 ms cancel had already been dropped, and the window then measured.
+        let cancel_when = |fx: &Fake, ready: &(dyn Fn() -> bool + Sync), tool, args: Value| {
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    sleep(Duration::from_millis(ms));
+                    let t = Instant::now();
+                    while !ready() && t.elapsed() < Duration::from_secs(10) {
+                        sleep(Duration::from_millis(10));
+                    }
                     fx.shared.cancel(0, &Value::Null);
                 });
                 let t = Instant::now();
@@ -2523,10 +2528,18 @@ fn main() {
         let fx = served("pmcancel-gap");
         fake_presentmon(&fx);
         fx.shared.set_hands(Some(Hands::Agent));
-        let notice = Box::new(|r: &Request| vec![reply(r.id, true, "notice shown", None)]);
+        let hid = Arc::new(AtomicBool::new(false));
+        let seen = hid.clone();
+        let notice = Box::new(move |r: &Request| {
+            if matches!(r.verb, Verb::NoticeHide {}) {
+                seen.store(true, Ordering::SeqCst);
+            }
+            vec![reply(r.id, true, "notice shown", None)]
+        });
         let server = fake_game(&token(&fx), 2, notice);
         let args = json!({"token": "tok", "tag": "gap", "secs": 30});
-        let (out, took) = cancel_after(&fx, 300, "measure_presentmon", args);
+        let in_hide_wait = || hid.load(Ordering::SeqCst);
+        let (out, took) = cancel_when(&fx, &in_hide_wait, "measure_presentmon", args);
         let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
         assert!(
             matches!(sent[..], [Verb::Notice { .. }, Verb::NoticeHide {}]),
@@ -2547,7 +2560,8 @@ fn main() {
         fake_presentmon(&fx);
         fs::write(fx.dir.join("harness/sleep.txt"), "20000").unwrap();
         let args = json!({"token": "tok", "tag": "mid", "secs": 10});
-        let (out, took) = cancel_after(&fx, 700, "measure_presentmon", args);
+        let in_window = || !fx.calls().is_empty();
+        let (out, took) = cancel_when(&fx, &in_window, "measure_presentmon", args);
         let reason = out["reason"].as_str().unwrap_or_default();
         assert!(
             out["ok"] == false
