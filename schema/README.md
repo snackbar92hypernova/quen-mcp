@@ -122,7 +122,8 @@ the build has one.
 ### mod_versions (table)
 
 Labels for builds. `content_hash` (key); `kind`, `name`: the mod; `version`; `provenance` (`git_commit` for our own
-reproducible builds, `nexus_file` for downloads); `source`: the commit or the Nexus file name.
+reproducible builds, `nexus_file` for downloads); `source`: the commit or the Nexus file name. A launch labels each
+entry one Vortex mod deployed: its version, `nexus_file`, and as `source` its Vortex folder (the download's name).
 
 ### boots (table)
 

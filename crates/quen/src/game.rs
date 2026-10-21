@@ -1918,6 +1918,7 @@ if os.path.exists(act): exec(open(act).read())
                 idled: Default::default(),
                 status: Default::default(),
                 in_plan: Default::default(),
+                vortex: None,
                 _awake: crate::win::Awake::hold(),
             });
             session

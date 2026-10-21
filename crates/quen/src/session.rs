@@ -30,7 +30,7 @@ use crate::hands::{self, Hands};
 use crate::mcp::{self, Conn, Msg};
 use crate::w3;
 use crate::win::{self, Child, Job, try_lock};
-use crate::{camera, data, disk, doctor, focus, game, measure, mem, profile, save, status};
+use crate::{camera, data, disk, doctor, focus, game, measure, mem, profile, save, status, vortex};
 
 /// What an unfinished harness session leaves, relative to the harness folder (ini_session.py's own `recover` list).
 const HARNESS_LEFTOVERS: &[&str] = &[
@@ -393,6 +393,8 @@ pub(crate) struct Live {
     pub(crate) status: status::Status,
     /// A run_plan is running: it set its own measuring state, so its steps set none (status.rs).
     pub(crate) in_plan: Cell<bool>,
+    /// With Vortex, the deployed files that weren't its links at the plan: the end's report lists them apart.
+    pub(crate) vortex: Option<Vec<String>>,
     /// Keeps the PC and its display awake for exactly as long as the session lives.
     pub(crate) _awake: crate::win::Awake,
 }
@@ -1519,6 +1521,7 @@ impl<'a> Session<'a> {
             idled: Cell::new(None),
             status: Default::default(),
             in_plan: Cell::new(false),
+            vortex: spec.vortex.as_ref().map(|inv| inv.broken()),
             _awake: crate::win::Awake::hold(),
         });
         fields.insert("session".into(), json!(id));
@@ -1526,6 +1529,9 @@ impl<'a> Session<'a> {
         // The first change. Each is journaled before it is made; from here on, failures unwind through the journal.
         let out = config.capture_root().join(boot.to_string());
         fields.insert("changes".into(), json!(spec.change_lines(&out)));
+        if let Some(inv) = &spec.vortex {
+            fields.insert("vortex".into(), vortex::fields(inv, &spec.changes));
+        }
         let applied = w3::make_parking(&spec.changes).and_then(|()| {
             quen_core::boot::apply(&JournalFs, &mut journal, &spec.changes, &|| call.stopped())
         });
@@ -1622,7 +1628,12 @@ impl<'a> Session<'a> {
             // The mods that loaded, now that the boot has parked its set.
             let set = w3::mod_set(game_dir, &mut self.cache)
                 .map_err(|e| format!("mod set: {e}"))
-                .and_then(|entries| ledger.add_mod_set(&entries).map_err(ledger_error))
+                .and_then(|entries| {
+                    if let Some(inv) = &spec.vortex {
+                        vortex::label(&mut ledger, inv, game_dir, &entries);
+                    }
+                    ledger.add_mod_set(&entries).map_err(ledger_error)
+                })
                 .and_then(|set| {
                     let mark = ledger.set_boot_mod_set(boot, set);
                     mark.map(|()| set).map_err(ledger_error)
@@ -1997,6 +2008,13 @@ impl<'a> Session<'a> {
             fields.insert("game_logs".into(), kept);
         }
         let done = self.unwind(call, &live.logs.join("journal.jsonl"));
+        // With Vortex, after the replay: the files that aren't Vortex's links any more, as its next deploy would list
+        // them.
+        if let (Some(before), Ok(config)) = (&live.vortex, self.config())
+            && let Some(links) = vortex::report(config, before)
+        {
+            fields.insert("vortex".into(), links);
+        }
         let failure = match (&done, failed) {
             (Ok(_), false) => None,
             (Ok(_), true) => Some(why.to_owned()),

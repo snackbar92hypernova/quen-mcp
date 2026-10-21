@@ -32,6 +32,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod development, tes
 - It removes captures and its other leftovers (session logs, its ledger's backups) only through `capture_clean`, which your client asks you about on every call, as for a launch.
 - Its own data (the ledger, logs, captures, the journal) stays under its data root, `%USERPROFILE%\.quen\` by default.
 - The data tools (`data_find`, `data_read`, `data_scan`) read the game's bundles and REDkit's depot, and write nothing there.
+- `mods`, `quen_doctor` and a launch read the Vortex mod manager's records: its deployment manifests, `mods.settings`, its staging folder's names and the ids of the files it deployed. quen writes none of them, and never starts or drives Vortex.
 - `script_compile` runs wcc_lite on a copy of the scripts under the data root. wcc_lite writes its `wcc.log` in REDkit's `bin` folder, and rewrites `editoruser.settings` and `profile.settings` (and their `.bak`) in the game's documents folder: quen backs up every `*.settings` and `*.settings.bak` there first and puts them back after, journaled like a session's changes.
 
 **The game's memory**

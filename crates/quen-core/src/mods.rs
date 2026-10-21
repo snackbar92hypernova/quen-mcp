@@ -17,9 +17,16 @@ use crate::journal::sha256_hex;
 use crate::ledger::glob;
 
 /// File-name patterns never hashed in a mod folder, whatever its kind: what mods write while the game runs, and
-/// backups. The adapter extends it per kind through [`ModSpec::ignore`]. W3's `*.cache` files in Mods and dlc folders
-/// are content (texture.cache, collision.cache), so they are hashed.
-pub const IGNORED: &[&str] = &["*.log", "*.bak", "*.userbak"];
+/// backups, and Vortex's marker and manifests, so a mod hashes the same installed by hand or by Vortex. The adapter
+/// extends it per kind through [`ModSpec::ignore`]. W3's `*.cache` files in Mods and dlc folders are content
+/// (texture.cache, collision.cache), so they are hashed.
+pub const IGNORED: &[&str] = &[
+    "*.log",
+    "*.bak",
+    "*.userbak",
+    crate::vortex::FOLDER_MARKER,
+    crate::vortex::MANIFESTS,
+];
 
 /// What a mod is, by how it is installed. Its name is the prefix of an identity, as in `asi:W3ElementMap`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -682,6 +689,13 @@ mod tests {
             "[Alpha]\nEnabled=false\n",
         );
         src.put("GAME/Mods/modAlpha/ShaderCache/0001.bin", "compiled");
+        // Vortex's marker in every folder it made, and a manifest: the same mod installed by Vortex hashes the same.
+        src.put("GAME/Mods/modAlpha/__folder_managed_by_vortex", "Vortex");
+        src.put(
+            "GAME/Mods/modAlpha/content/__folder_managed_by_vortex",
+            "Vortex",
+        );
+        src.put("GAME/Mods/modAlpha/vortex.deployment.witcher3tl.json", "{}");
         src.put(format!("{BIN}/W3ElementMap.log"), "boot 2\n");
         src.put(
             format!("{BIN}/ReShade.ini"),

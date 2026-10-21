@@ -1670,6 +1670,8 @@ pub fn call(shared: &Shared, args: &Value) -> Value {
             fields.insert("captures".into(), crate::disk::summary(&disk.config));
             fields.insert("quen_saves".into(), quen_saves(&disk.config));
             fields.insert("unknown_families".into(), unknown_families(&disk.config));
+            let docs = disk.config.documents.as_deref();
+            fields.insert("vortex".into(), crate::vortex::summary(game_dir, docs));
             // AppData redirected into an app package, or an older quen's folders in AppData (relocate.rs); always
             // there, empty when there are none.
             let places = crate::relocate::Places::here();
