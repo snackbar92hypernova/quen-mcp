@@ -18,7 +18,11 @@
 //! known_builds = 'steam <sha256> <label>; gog <sha256> <label>'   # optional: game builds verified here, beside the
 //!                                                                # adapter's own (quen_core::build::KnownBuilds)
 //! idle_focus = 'false'                                           # optional, default 'true': quen brings the agent's
-//!                                                                # client forward when it waits (notice.rs)
+//!                                                                # client forward when it waits (status.rs)
+//! indicator = 'off'                                              # optional, default 'on': in a test session the
+//!                                                                # game shows quen's status line (status.rs)
+//! window_sound = 'gui_global_panel_open'                         # optional, default none: a game sound event at each
+//!                                                                # measuring window's start and end
 //! # Optional features, each off unless set:
 //! renodx_addon = 'renodx-thewitcher3remastered.addon64'          # RenoDX in bin: ReShade.ini and ReShadePreset.ini
 //!                                                                # patched, preset values, ReShade.log readiness
@@ -91,9 +95,13 @@ pub struct Config {
     pub presentmon: Option<PathBuf>,
     /// The game builds a launch accepts: the adapter's own ([`crate::w3::KNOWN_BUILDS`]), then `known_builds`.
     pub known_builds: KnownBuilds,
-    /// Whether quen brings the agent's client forward when the agent waits with the game in front (notice.rs); unset:
+    /// Whether quen brings the agent's client forward when the agent waits with the game in front (status.rs); unset:
     /// true.
     pub idle_focus: Option<bool>,
+    /// Whether a test session's game shows quen's lasting status line (status.rs); unset: on.
+    pub indicator: Option<bool>,
+    /// A game sound event played at each measuring window's start and end (status.rs); unset: none.
+    pub window_sound: Option<String>,
 }
 
 impl Config {
@@ -114,6 +122,10 @@ impl Config {
 
     pub fn idle_focus(&self) -> bool {
         self.idle_focus.unwrap_or(true)
+    }
+
+    pub fn indicator(&self) -> bool {
+        self.indicator.unwrap_or(true)
     }
 
     /// The game's binaries: the exe, the ASIs, ReShade and its add-ons.
@@ -234,6 +246,23 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
                     "idle_focus" => config.idle_focus = Some(on),
                     _ => config.force_duplication = on,
                 }
+            }
+            "indicator" => {
+                config.indicator = Some(match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("{}: indicator is 'on' or 'off'", at())),
+                });
+            }
+            "window_sound" if quen_core::trace::plain_name(value) => {
+                config.window_sound = Some(value.into());
+            }
+            "window_sound" => {
+                let why = format!(
+                    "{}: window_sound is a sound event: 1 to 64 letters, digits and _",
+                    at()
+                );
+                return Err(why);
             }
             "kb" => config.kb = Some(value.into()),
             "redkit" => config.redkit = Some(value.into()),
@@ -442,6 +471,18 @@ mod tests {
         assert!(parse("force_duplication = 'yes'", path).is_err());
         let relative = parse("streamline_dev_interposer = 'sl.interposer.dll'", path);
         assert!(relative.unwrap_err().contains("not an absolute path"));
+    }
+
+    #[test]
+    fn the_status_line_is_on_and_silent_unless_set() {
+        let path = Path::new("test.toml");
+        let config = parse("", path).unwrap();
+        assert!(config.indicator() && config.window_sound.is_none());
+        assert!(!parse("indicator = 'off'", path).unwrap().indicator());
+        assert!(parse("indicator = 'false'", path).is_err());
+        let sound = parse("window_sound = 'gui_global_panel_open'", path).unwrap();
+        assert_eq!(sound.window_sound.as_deref(), Some("gui_global_panel_open"));
+        assert!(parse("window_sound = 'a b'", path).is_err());
     }
 
     #[test]

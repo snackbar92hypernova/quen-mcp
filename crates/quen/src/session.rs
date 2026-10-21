@@ -30,7 +30,7 @@ use crate::hands::{self, Hands};
 use crate::mcp::{self, Conn, Msg};
 use crate::w3;
 use crate::win::{self, Child, Job, try_lock};
-use crate::{camera, data, disk, doctor, focus, game, measure, mem, notice, profile, save};
+use crate::{camera, data, disk, doctor, focus, game, measure, mem, profile, save, status};
 
 /// What an unfinished harness session leaves, relative to the harness folder (ini_session.py's own `recover` list).
 const HARNESS_LEFTOVERS: &[&str] = &[
@@ -74,7 +74,7 @@ pub struct Shared {
     /// Who has the controls of the live session's game (hands.rs); None without one.
     hands: Mutex<Option<Hands>>,
     /// When the connection that launched the live session last called a tool, or a call of its ended: how long the
-    /// agent has been waiting (notice.rs).
+    /// agent has been waiting (status.rs).
     last_call: Mutex<Option<Instant>>,
     /// What the replay at start did ("running" until it is done), if there was one: status reports it.
     startup: Mutex<Option<Value>>,
@@ -235,6 +235,8 @@ pub(crate) struct Call<'a> {
     artifacts: Vec<Value>,
     /// The ledger rows it wrote, ids by table.
     ledger: Map<String, Value>,
+    /// Its budget line once it took the status line down for a capture or window (status.rs): `indicator` in its result.
+    pub(crate) indicator: Option<Value>,
 }
 
 impl Call<'_> {
@@ -382,13 +384,14 @@ pub(crate) struct Live {
     pub(crate) paused: Cell<bool>,
     pub(crate) path: Cell<bool>,
     /// The launching connection's client with a window (`Conn::client`), which quen brings forward when the agent
-    /// waits; when quen last showed a notice in the game; whether it brought the client forward itself, so the next
-    /// game call brings the game back; the stretch without calls it last acted on (notice.rs).
+    /// waits; whether it brought the client forward itself, so the next game call brings the game back; the stretch
+    /// without calls it last acted on (status.rs).
     pub(crate) client: Result<(u32, String), String>,
-    pub(crate) notice_at: Cell<Option<Instant>>,
     pub(crate) away: Cell<bool>,
     pub(crate) idled: Cell<Option<Instant>>,
-    /// A run_plan is running: it showed its own measuring notice, so its steps show none (notice.rs).
+    /// The status line in the game (status.rs).
+    pub(crate) status: status::Status,
+    /// A run_plan is running: it set its own measuring state, so its steps set none (status.rs).
     pub(crate) in_plan: Cell<bool>,
     /// Keeps the PC and its display awake for exactly as long as the session lives.
     pub(crate) _awake: crate::win::Awake,
@@ -597,7 +600,7 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
     loop {
         let msg = rx.recv_timeout(EXIT_POLL);
         session.end_if_gone();
-        notice::idle(&session);
+        status::poll(&session);
         let msg = match msg {
             Ok(msg) => msg,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -621,10 +624,12 @@ pub fn work(shared: &Shared, rx: Receiver<Msg>, text: String) {
                 });
                 let done = match refused {
                     Some(why) => Done::Refused(why),
-                    None => match notice::back(&session, &call, &name, &args) {
+                    None => match status::back(&session, &call, &name, &args) {
                         Ok(back) => {
+                            let shown = status::start(&session, &mut call, &name);
                             let done = session.run(&mut call, &name, &args);
-                            notice::with_back(done, back)
+                            let done = status::with(done, "game_back", back.map(|b| json!(b)));
+                            status::with(done, "status", shown.map(Value::from))
                         }
                         Err(done) => done,
                     },
@@ -1008,10 +1013,12 @@ impl<'a> Session<'a> {
             timing: Map::new(),
             artifacts: Vec::new(),
             ledger: Map::new(),
+            indicator: None,
         }
     }
 
     pub(crate) fn envelope(&self, tool: &str, call: Call, done: Done) -> Value {
+        let done = status::with(done, "indicator", call.indicator);
         envelope(
             self.shared,
             tool,
@@ -1508,9 +1515,9 @@ impl<'a> Session<'a> {
             paused: Cell::new(false),
             path: Cell::new(false),
             client: call.conn.client.clone(),
-            notice_at: Cell::new(None),
             away: Cell::new(false),
             idled: Cell::new(None),
+            status: Default::default(),
             in_plan: Cell::new(false),
             _awake: crate::win::Awake::hold(),
         });

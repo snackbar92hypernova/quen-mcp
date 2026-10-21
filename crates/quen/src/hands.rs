@@ -21,11 +21,8 @@ use serde_json::{Map, Value, json};
 use crate::channel::{self, REPLY_MAX};
 use crate::game::{self, Ctx, Fields, flag, hex_bytes, schema};
 use crate::session::{Call, Done, Live, Session};
-use crate::{focus, input, notice};
-
-/// What the game shows on screen when the user gets the controls (quen-w3 0.1.8's notice verb).
-const NOTICE: &str =
-    "quen: you have the controls. To hand them back, tell the agent in the chat (Alt+Tab).";
+use crate::status::{self, State};
+use crate::{focus, input};
 
 /// Who has the controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,10 +94,10 @@ pub(crate) fn tools() -> Vec<Value> {
                 for the user to do something in the game. No prompt. applied: memory patches and cvar writes still \
                 applied (in a play session, this hand-over's). A play session refuses while there is one, unless \
                 keep_writes with the user's OK; a test session gives the controls with them applied. Then quen's pause \
-                goes off and a camera path stops (pause, path: the game's replies), the game shows for 8 s that the \
-                user has the controls and hands them back in the chat (notice: its reply, or why not; quen-w3 \
-                0.1.8+), and the controls go to the user. kept: this hand-over's teleports, settime, weather and \
-                items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
+                goes off and a camera path stops (pause, path: the game's replies), the game shows that the user has \
+                the controls (status: its reply, or why not): until hands_take in a test session with quen-w3 \
+                0.1.15+, else 8 s. Then the controls go to the user. kept: this hand-over's teleports, settime, \
+                weather and items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
                 front at the end (game, client or other). Refused: the user has them already, a wrong token, \
                 to_client with no client window found at connect. Failed: the pause or the path wasn't undone \
                 (left); the controls went to the user.",
@@ -179,10 +176,14 @@ fn taken(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     h.since.set(cx.live.patches.borrow().len());
     session.shared.set_hands(Some(Hands::Agent));
     call.lap("take");
-    Ok(Map::from_iter([
+    let mut fields = Map::from_iter([
         ("hand_over".into(), json!(h.takes.get())),
         ("user_saves".into(), json!(user_saves)),
-    ]))
+    ]);
+    if let Some(shown) = status::set(&cx, Some(call), State::Working) {
+        fields.insert("status".into(), json!(shown));
+    }
+    Ok(fields)
 }
 
 /// `hands_give`.
@@ -245,9 +246,9 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         call.lap(what);
     }
     // The user may be in the game when the controls go to them: it says so, and where to hand them back.
-    let notice = notice::show(&cx, NOTICE).unwrap_or_else(|why| why);
-    fields.insert("notice".into(), json!(notice));
-    call.lap("notice");
+    if let Some(shown) = status::set(&cx, Some(call), State::Yours) {
+        fields.insert("status".into(), json!(shown));
+    }
     fields.insert("unexpected_saves".into(), json!(sort(cx.live, false)));
     session.shared.set_hands(Some(Hands::User));
     // Finding 43: the user missed a question twice behind the game. to_client fronts the chat; in_front says which.
@@ -550,9 +551,9 @@ mod tests {
             "{out}"
         );
         assert_eq!(out["state"]["hands"], "user", "{out}");
-        // The Fake's game serves no channel: the notice says why it isn't shown, and the controls went anyway.
+        // The Fake's game serves no channel: the status says why it isn't shown, and the controls went anyway.
         assert!(
-            out["notice"].as_str().unwrap().contains("isn't up"),
+            out["status"].as_str().unwrap().contains("isn't up"),
             "{out}"
         );
         let again = run(&session, "hands_give", tok.clone());

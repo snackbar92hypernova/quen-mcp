@@ -15,9 +15,8 @@ use quen_core::ledger::Capture;
 use serde_json::{Map, Value, json};
 
 use crate::game::{self, Ctx, Fields, ctx, flag};
-use crate::hands::Hands;
 use crate::session::{self, Call, Done, Session};
-use crate::{doctor, measure, notice};
+use crate::{doctor, measure, status};
 
 /// The tools a step may call: what a test session's agent calls without the client's prompt (the owner's Q7), sweeps
 /// aside. Never a launch, a save, a hand-over, a cleanup, a memory patch, a focus move or a ledger write.
@@ -311,9 +310,11 @@ fn valid(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
 }
 
 /// About how long `tool` takes with `args`, in seconds ([`READ_S`] and the other constants; measure_ab's own estimate;
-/// a window its secs plus 0.3 s, the design's §3.2; game_keys its holds, gaps and waits).
+/// a window its secs plus 0.3 s, the design's §3.2; game_keys its holds, gaps and waits; a capture or window the status
+/// line's hide wait too).
 fn estimate(tool: &str, args: &Value, exec: bool) -> Result<f64, String> {
     let num = |key: &str, default: f64| args.get(key).and_then(Value::as_f64).unwrap_or(default);
+    let hide = status::HIDE_WAIT.as_secs_f64();
     Ok(match tool {
         "game_console" => measure::CONSOLE_S,
         "game_keys" => {
@@ -336,13 +337,14 @@ fn estimate(tool: &str, args: &Value, exec: bool) -> Result<f64, String> {
         }
         "game_weather" => VERB_S + num("settle_s", 0.0),
         "game_load" => LOAD_S,
-        "game_screenshot" => SCREENSHOT_S,
+        "game_screenshot" => SCREENSHOT_S + hide,
         "game_frame" => {
             let sides = args["sides"].as_array().map_or(1, Vec::len) as f64;
-            VERB_S + sides * (SIDE_S + num("settle_ms", 250.0) / 1000.0)
+            let captured = if args.get("tag").is_some() { hide } else { 0.0 };
+            VERB_S + sides * (SIDE_S + num("settle_ms", 250.0) / 1000.0) + captured
         }
-        "measure_trace" => num("secs", 30.0) + 0.3,
-        "measure_presentmon" => num("secs", 10.0) + 1.0,
+        "measure_trace" => num("secs", 30.0) + 0.3 + hide,
+        "measure_presentmon" => num("secs", 10.0) + 1.0 + hide,
         "measure_ab" => measure::ab_secs(args, exec).map_err(|e| format!("measure_ab: {e}"))?,
         "measure_image" => IMAGE_S * args["metrics"].as_array().map_or(1, Vec::len) as f64,
         t if t.starts_with("world_") || matches!(t, "game_scriptlog" | "game_listsaves") => READ_S,
@@ -447,7 +449,12 @@ fn before(
             game::READY_MAX.as_secs()
         ));
     }
-    if tool == "wait" || !notice::needs_front(tool) {
+    // The status line back after a step's capture, or sent again when due; not just before a capture, which takes it
+    // down again.
+    if !status::captures(tool) {
+        status::tick(cx);
+    }
+    if tool == "wait" || !status::needs_front(tool) {
         return Ok(None);
     }
     measure::game_back(cx, call).map_err(|done| crate::boot::reason(&done))
@@ -468,15 +475,7 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             measure::captures(&cx),
         )
     };
-    let agent = session.shared.hands() == Some(Hands::Agent);
-    let shows_notice = agent && plan.estimate() >= notice::MEASURING_MIN as f64;
-    // The notice keeps the plan's first capture or window waiting until it is gone.
-    let clear = if shows_notice {
-        notice::CLEAR.as_secs_f64()
-    } else {
-        0.0
-    };
-    let estimate = ((plan.estimate() + clear) * 10.0).round() / 10.0;
+    let estimate = (plan.estimate() * 10.0).round() / 10.0;
     // A fade can't be foreseen: only a long move fades (7.5 s after a 215 m game_place, the 0.1.12 live check).
     let excludes = format!(
         "fade waits: up to {} s before a step (before_s in its row)",
@@ -543,23 +542,13 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             session::utc_ms(SystemTime::now()),
             plan.tag
         );
-        if shows_notice
-            && let Some(notice) = notice::measuring(&cx, call, estimate.ceil() as u64, &mut None)
-        {
-            fields.insert("notice".into(), json!(notice));
-            // Its 9 s are the plan's own, not its first capture's (the 0.1.12 live check: in game_frame's s).
-            let t = Instant::now();
-            if let Err(why) = notice::clear(cx.live, call) {
-                aborted = Some(why);
-            }
-            let secs = (t.elapsed().as_secs_f64() * 100.0).round() / 100.0;
-            fields.insert("notice_clear_s".into(), json!(secs));
+        if let Some(shown) = status::measuring(&cx, call, estimate.ceil() as u64, &mut None) {
+            fields.insert("status".into(), json!(shown));
         }
         cx.live.in_plan.set(true);
     }
     let (mut table, mut envelopes, mut ran) = (Vec::new(), Vec::new(), false);
-    let cleared = aborted.is_none();
-    'run: for (phase, steps) in plan.phases[..2].iter().filter(|_| cleared) {
+    'run: for (phase, steps) in plan.phases[..2].iter() {
         for (i, step) in steps.iter().enumerate() {
             let at = format!("{phase} step {} ({})", i + 1, step.tool);
             let ready = Instant::now();
@@ -740,7 +729,7 @@ mod tests {
                     true,
                     Some(json!({"camera": "photomode", "pos": pos, "rot": rot, "fov": fov})),
                 ),
-                Verb::CamNoclip { .. } => (true, None),
+                Verb::CamNoclip { .. } | Verb::Notice { .. } | Verb::NoticeHide {} => (true, None),
                 Verb::WorldActors { .. } => (
                     true,
                     Some(
@@ -873,7 +862,9 @@ mod tests {
         // A tag taken refuses the next plan before anything.
         let again = run(&mut session, args(plan));
         assert_eq!(again["refused"], true, "{again}");
-        // The estimate against the run: a wait, a window and verbs.
+        // The estimate against the run: a wait, a window and verbs, with the agent's controls (the status line up, so
+        // the window waits for its hide).
+        fx.shared.set_hands(Some(crate::hands::Hands::Agent));
         let timed = json!({"tag": "p2", "setup": [{"game_settime": {"day": 4, "hour": 9}}],
             "steps": [{"measure_trace": {"tag": "t2", "secs": 3}}, {"wait": 2}, {"game_exec": {"line": "x()"}},
                       {"world_get": {}}]});
@@ -1078,9 +1069,9 @@ mod tests {
         check["check"] = json!(true);
         let out = run(&mut session, check);
         assert_eq!(out["ok"], true, "{out}");
-        // settime 0.2, 4 windows of 2 + 3 + 0.5, the wait 1.
-        assert_eq!(out["estimate_s"], 23.2, "{out}");
-        assert_eq!(out["steps"][1]["est_s"], 22.0, "{out}");
+        // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, the wait 1.
+        assert_eq!(out["estimate_s"], 25.2, "{out}");
+        assert_eq!(out["steps"][1]["est_s"], 24.0, "{out}");
         assert!(!fx.dir.join("data/captures/s1").exists(), "nothing written");
     }
 }

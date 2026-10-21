@@ -62,13 +62,13 @@ fn to(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
         Some("game") => to_game(&cx, call)?,
         _ => return Err("to must be \"client\" or \"game\"".to_string().into()),
     };
-    // The agent moved the focus itself: the next game call leaves it where it is (notice.rs).
+    // The agent moved the focus itself: the next game call leaves it where it is (status.rs).
     cx.live.away.set(false);
     call.lap("focus");
     Ok(fields)
 }
 
-/// `to: game`, and the game call after quen brought the client forward (notice.rs): brings the game back and closes
+/// `to: game`, and the game call after quen brought the client forward (status.rs): brings the game back and closes
 /// its menu. Bringing it back waits for quen's state, which also shows the menu to close (feature tests 4: the user may
 /// have clicked into the game already, and its pause menu stays open then too).
 pub(crate) fn to_game(cx: &Ctx, call: &Call) -> Result<Fields, Done> {

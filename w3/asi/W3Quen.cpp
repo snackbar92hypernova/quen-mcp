@@ -34,14 +34,15 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.14";
+constexpr char kVersion[] = "0.1.15";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
 constexpr size_t kMaxReply = 64 * 1024;
 constexpr size_t kMaxQueued = 16;
-// protocol.rs's MAX_NOTICE_BYTES: notice's text, from quen-w3 0.1.8.
+// protocol.rs's MAX_NOTICE_BYTES: notice's text, from quen-w3 0.1.8; MAX_NOTICE_MS, its duration, from quen-w3 0.1.15.
 constexpr size_t kMaxNotice = 160;
+constexpr uint64_t kMaxNoticeMs = 3600000;
 // protocol.rs's MAX_FILTER_BYTES and MAX_TICK_S: photo.list's filter and photo.tick's seconds, from quen-w3 0.1.9.
 constexpr size_t kMaxFilter = 200;
 constexpr float kMaxTick = 10;
@@ -811,9 +812,17 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   if (v == "load" || v == "weather") {
     ok = name(v == "load" ? "save" : "name");
   } else if (v == "notice") {
-    ok = name("text") && cmd.args.size() <= kMaxNotice + 1;
+    // "<duration_ms> <text>": 8000 when quen sends none (before quen-w3 0.1.15).
+    uint64_t ms = 8000;
+    ok = (!fields.contains("duration_ms") || (whole("duration_ms", kMaxNoticeMs, ms) && ms > 0)) && name("text") &&
+         cmd.args.size() <= kMaxNotice + 1;
+    cmd.args = ' ' + std::to_string(ms) + cmd.args;
+  } else if (v == "sound") {
+    Value event;
+    ok = take("event", Value::kString, event) && PlainName(event.text);
+    cmd.args = ' ' + event.text;
   } else if (v == "loadlast" || v == "listsaves" || v == "cam.get" || v == "cam.stop" || v == "save" ||
-             v == "world.get" || v == "photo.get") {
+             v == "world.get" || v == "photo.get" || v == "notice.hide") {
     ok = true;
   } else if (v == "photo.weather" || v == "photo.env") {
     ok = name(v == "photo.env" ? "path" : "name");
@@ -940,7 +949,8 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
   }
   if (!ok) {
     error = "invalid " + v + ": a field is missing, of the wrong type or out of range (non-finite, empty, a control "
-            "character, fov not above 0, hour past 23, a notice over 160 bytes, a photo.time minute outside 0 to 1440, a "
+            "character, fov not above 0, hour past 23, a notice over 160 bytes or outside 1 to 3600000 ms, a sound event "
+            "other than 1 to 64 letters, digits and _, a photo.time minute outside 0 to 1440, a "
             "photo.grade or photo.tick without a value, a photo.tick time outside 0 to 10 s, a filter over 200 bytes, an "
             "items.add name over 200 bytes or count outside 1 to 1000, a world.actors radius outside 0 (excluded) to 100, "
             "max outside 1 to 50, a tag or class other than 1 to 64 letters, digits and _, a scene.frame radius outside 0 "

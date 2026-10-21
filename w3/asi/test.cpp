@@ -574,8 +574,16 @@ static void Channel() {
   RoundTrip(h, R"({"id":52,"ttl_ms":5000,"verb":"world.get"})", L"world.get", false, "no player (not in a game session)",
             "", R"x({"id":52,"ok":false,"text":"no player (not in a game session)"})x");
   RoundTrip(h, R"x({"id":53,"ttl_ms":5000,"verb":"notice","text":"quen: you have the controls (Alt+Tab)"})x",
-            L"notice quen: you have the controls (Alt+Tab)", true, "notice shown", "",
+            L"notice 8000 quen: you have the controls (Alt+Tab)", true, "notice shown", "",
             R"({"id":53,"ok":true,"text":"notice shown"})");
+  // 0.1.15: the duration before the text, notice.hide, sound.
+  RoundTrip(h, R"({"id":60,"ttl_ms":5000,"verb":"notice","text":"quen: agent at work.","duration_ms":3600000})",
+            L"notice 3600000 quen: agent at work.", true, "notice already shown", "",
+            R"({"id":60,"ok":true,"text":"notice already shown"})");
+  RoundTrip(h, R"({"id":61,"ttl_ms":5000,"verb":"notice.hide"})", L"notice.hide", true, "notice hidden", "",
+            R"({"id":61,"ok":true,"text":"notice hidden"})");
+  RoundTrip(h, R"({"id":62,"ttl_ms":5000,"verb":"sound","event":"gui_global_panel_open"})",
+            L"sound gui_global_panel_open", true, "sound played", "", R"({"id":62,"ok":true,"text":"sound played"})");
   // items.add (0.1.10): the name last, spaces kept; the read-back on success and on nothing added.
   RoundTrip(h, R"({"id":54,"ttl_ms":5000,"verb":"items.add","name":"Red Wolf Armor 2","count":1,"equip":true})",
             L"items.add 1 1 Red Wolf Armor 2", true, "added 1 of Red Wolf Armor 2", "0 1 1",
@@ -657,6 +665,13 @@ static void Channel() {
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"a\nb"})", refused1, "invalid notice");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":")" + std::string(161, 'x') + "\"}", refused1, "invalid notice");
   Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice","text":"x","ms":1})", refused1, "unknown field");
+  for (const char* ms : {"0", "3600001", "1.5", "-1", "\"8\""})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"notice","text":"x","duration_ms":)") + ms + "}", refused1,
+            "invalid notice");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"notice.hide","all":true})", refused1, "unknown field");
+  for (const char* event : {R"("")", R"("a b")", R"("gui-x")", R"(1)"})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"sound","event":)") + event + "}", refused1, "invalid sound");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"sound"})", refused1, "invalid sound");
   const std::vector<std::string> bad_items = {
       R"("name":"x","count":0,"equip":false)",  R"("name":"x","count":1001,"equip":false)",
       R"("name":"","count":1,"equip":false)",   R"("name":"a\tb","count":1,"equip":false)",
