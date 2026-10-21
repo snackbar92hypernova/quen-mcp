@@ -175,7 +175,8 @@ every tool. Exceptions, from before this was the rule: the history import names 
 (`boot_log`, `presentmon_csv`, `camera_ref`, `camera_cal`, `boots_jsonl`), and quen's own screenshot rows written before
 `quen_guide` existed say `screenshot`. So tell what took a file by `method`, not `kind`. `method` (how it was taken,
 e.g. `printwindow`, `wgc_fp16`, `presentmon`; a mem tool's name, e.g. `mem_walk`, for its result too big to answer
-inline, kind `json`); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
+inline, kind `json`; `world_map` for its map's JSON and its PNG, a drawing without `encoding`, `frame_state` holding
+the map's mode, at, size, cell, source capture ids and world); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
 `pq_codes_f16`, `scrgb_f16`; any other buffer, e.g. scene-linear data or a G-buffer target, leaves it NULL and gives its
 format in `frame_state`); `includes_overlay`, `includes_desktop`; `display_state` and `frame_state` (JSON objects: the
 display and the frame when it was taken; quen's `display_state` names the monitor by `monitor_sha`, a short hash of its model name,

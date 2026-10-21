@@ -187,8 +187,8 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "game_load" => load(session, call, args),
         "game_console" => console(session, call, args),
         "game_exec" => exec(session, call, args),
-        n @ ("world_frame" | "world_ground" | "world_ray" | "world_nav" | "game_frame"
-        | "game_place") => crate::scene::call(session, call, n, args),
+        n @ ("world_frame" | "world_ground" | "world_ray" | "world_nav" | "world_map"
+        | "game_frame" | "game_place") => crate::scene::call(session, call, n, args),
         "game_scriptlog" => scriptlog(session, args),
         "game_cvar" => cvar(session, call, args),
         "game_keys" => keys(session, call, args),

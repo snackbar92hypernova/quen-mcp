@@ -20,7 +20,7 @@ use crate::{doctor, measure, status};
 
 /// The tools a step may call: what a test session's agent calls without the client's prompt (the owner's Q7), sweeps
 /// aside. Never a launch, a save, a hand-over, a cleanup, a memory patch, a focus move or a ledger write.
-const TOOLS: [&str; 27] = [
+const TOOLS: [&str; 28] = [
     "game_console",
     "game_exec",
     "game_cvar",
@@ -44,6 +44,7 @@ const TOOLS: [&str; 27] = [
     "world_ground",
     "world_ray",
     "world_nav",
+    "world_map",
     "measure_trace",
     "measure_presentmon",
     "measure_ab",
@@ -65,6 +66,10 @@ const SIDE_S: f64 = 0.55;
 const LOAD_S: f64 = 34.0;
 const SCREENSHOT_S: f64 = 1.0;
 const VERB_S: f64 = 0.2;
+/// A world_map step: per verb, and once (its files and maths).
+// ponytail: the design's guesses until a live map is timed; replace with the tool's median once plans have run it.
+const MAP_VERB_S: f64 = 0.03;
+const MAP_S: f64 = 0.3;
 /// A measure_image metric: 0.03-1.35 s each on a synthetic 4K frame, a file's decode 0.05-0.11 s (release build).
 // ponytail: one timing of synthetic frames; replace with the tool's median once plans have run it.
 const IMAGE_S: f64 = 1.5;
@@ -347,6 +352,7 @@ fn estimate(tool: &str, args: &Value, exec: bool) -> Result<f64, String> {
         "measure_presentmon" => num("secs", 10.0) + 1.0 + hide,
         "measure_ab" => measure::ab_secs(args, exec).map_err(|e| format!("measure_ab: {e}"))?,
         "measure_image" => IMAGE_S * args["metrics"].as_array().map_or(1, Vec::len) as f64,
+        "world_map" => crate::scene::map_calls(args) as f64 * MAP_VERB_S + MAP_S,
         t if t.starts_with("world_") || matches!(t, "game_scriptlog" | "game_listsaves") => READ_S,
         _ => VERB_S,
     })

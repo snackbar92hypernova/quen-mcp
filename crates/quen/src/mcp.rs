@@ -63,9 +63,10 @@ const LONG: [&str; 18] = [
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
 /// every unannotated call). Their own files there count as nothing changed: ledger_query's and mem_diff's spill files,
 /// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors,
-/// world_frame, world_ground, world_ray, world_nav and game_listsaves read through the game's channel; game_scriptlog
-/// reads the game's script log; measure_image reads quen's screenshots and writes its measurement rows.
-const READ_ONLY: [&str; 27] = [
+/// world_frame, world_ground, world_ray, world_nav, world_map and game_listsaves read through the game's channel
+/// (world_map's map files and their captures rows are its own); game_scriptlog reads the game's script log;
+/// measure_image reads quen's screenshots and writes its measurement rows.
+const READ_ONLY: [&str; 28] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -80,6 +81,7 @@ const READ_ONLY: [&str; 27] = [
     "world_ground",
     "world_ray",
     "world_nav",
+    "world_map",
     "game_listsaves",
     "game_scriptlog",
     "mem_read",

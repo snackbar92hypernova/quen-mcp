@@ -14,6 +14,7 @@ pub mod image; // measure_image: quen's screenshots decoded (srgb8, PQ PNG, scRG
 pub mod input; // w3ctl key tokens and input plans, console_type lines and its prompt check
 pub mod journal; // append-only session journal and replay
 pub mod ledger; // SQLite schema, migrations, ingest, doc-reference scanner, harness history import
+pub mod map; // world_map: the grid's classes, clearance, chokepoints, regions and edges, trace heat layers, profiles, walkers, the picture
 pub mod mem; // live-memory reads, scans, pointer chains, struct walks and patch plans (the Windows layer reads and writes)
 pub mod mods; // mod fingerprints (content and config hashes), the mod-set hash and diff
 pub mod park; // park planner and never-park list

@@ -227,7 +227,7 @@ impl Body {
         })
     }
 
-    fn speed(&self) -> Option<f64> {
+    pub(crate) fn speed(&self) -> Option<f64> {
         self.velocity.map(|v| v[0].hypot(v[1]))
     }
 
@@ -414,8 +414,78 @@ fn p10(v: Vec<f64>) -> Option<f64> {
     quantile(v, 0.1)
 }
 
-fn median(v: Vec<f64>) -> Option<f64> {
+pub(crate) fn median(v: Vec<f64>) -> Option<f64> {
     quantile(v, 0.5)
+}
+
+/// What a subject counted for in the metrics, in one sample: a contact begun, moving, gliding, and its share of a
+/// blocked stretch (seconds: the time to the stretch's next sample). Where they happened is what world_map's heat layers
+/// bin; summed, they are the metrics.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Marks {
+    pub contact: bool,
+    pub moving: bool,
+    pub gliding: bool,
+    pub blocked_s: f64,
+}
+
+/// Per sample, per subject: its [`Marks`], by the metrics' rules (contacts within `contact` m), its tracks `of` as
+/// [`tracks`] gives them.
+pub fn marks(samples: &[Sample], of: &[Vec<usize>], contact: f64) -> Vec<Vec<Marks>> {
+    let n_tracks = of.iter().flatten().max().map_or(0, |m| m + 1);
+    let mut out: Vec<Vec<Marks>> = samples
+        .iter()
+        .map(|s| vec![Marks::default(); s.subjects.len()])
+        .collect();
+    // Per track: in contact, has moved, its still stretch so far as (sample, subject).
+    let mut touching = vec![false; n_tracks];
+    let mut moved = vec![false; n_tracks];
+    let mut still: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_tracks];
+    let still_end = |stretch: &mut Vec<(usize, usize)>, out: &mut Vec<Vec<Marks>>| {
+        let stretch = std::mem::take(stretch);
+        if let (Some(&(a, _)), Some(&(b, _))) = (stretch.first(), stretch.last())
+            && samples[b].t - samples[a].t >= STILL_S
+        {
+            for w in stretch.windows(2) {
+                out[w[0].0][w[0].1].blocked_s += samples[w[1].0].t - samples[w[0].0].t;
+            }
+        }
+    };
+    for (i, (s, tracks)) in samples.iter().zip(of).enumerate() {
+        for (j, b) in s.subjects.iter().enumerate() {
+            if let Some(v) = b.speed().filter(|v| *v > MOVING_MPS) {
+                out[i][j].moving = true;
+                out[i][j].gliding = b.across().is_some_and(|a| a > GLIDE_MPS) && v > MOVING_MPS;
+            }
+        }
+        let Some(r) = &s.reference else { continue };
+        for (j, (b, &k)) in s.subjects.iter().zip(tracks).enumerate() {
+            let d = flat(b.pos, r.pos);
+            if !touching[k] && d < contact {
+                (touching[k], out[i][j].contact) = (true, true);
+            } else if touching[k] && d > contact + CONTACT_LEAVE_M {
+                touching[k] = false;
+            }
+            let speed = b.speed();
+            if speed.is_some_and(|v| v < STILL_MPS)
+                && d <= BLOCKED_M
+                && (moved[k] || !still[k].is_empty())
+            {
+                still[k].push((i, j));
+            } else {
+                still_end(&mut still[k], &mut out);
+            }
+            moved[k] |= speed.is_some_and(|v| v > MOVING_MPS);
+        }
+        // A track not in this sample ends its still stretch.
+        for k in (0..n_tracks).filter(|k| !tracks.contains(k)) {
+            still_end(&mut still[k], &mut out);
+        }
+    }
+    for s in &mut still {
+        still_end(s, &mut out);
+    }
+    out
 }
 
 /// The window's metrics, contacts within `contact` m. Errs with fewer than two samples.
@@ -433,65 +503,34 @@ pub fn metrics(samples: &[Sample], contact: f64) -> Result<Metrics, String> {
     let per_min = |x: f64| x * 60.0 / seconds;
     let of = tracks(samples);
     let n_tracks = of.iter().flatten().max().map_or(0, |m| m + 1);
-    // Per track: in contact, in a pass (its minimum so far), has moved, a still stretch's start and last time.
-    let mut touching = vec![false; n_tracks];
+    let marks = marks(samples, &of, contact);
+    let marked = || marks.iter().flatten();
+    let contacts = marked().filter(|m| m.contact).count() as u32;
+    let moving = marked().filter(|m| m.moving).count() as u32;
+    let gliding = marked().filter(|m| m.gliding).count() as u32;
+    let blocked: f64 = marked().map(|m| m.blocked_s).sum();
+    // Per track: in a pass, its minimum so far.
     let mut pass: Vec<Option<f64>> = vec![None; n_tracks];
-    let mut moved = vec![false; n_tracks];
-    let mut still: Vec<Option<(f64, f64)>> = vec![None; n_tracks];
-    let (mut contacts, mut minima, mut blocked) = (0u32, Vec::new(), 0.0);
-    let (mut moving, mut gliding) = (0u32, 0u32);
-    let still_end = |still: &mut Option<(f64, f64)>, blocked: &mut f64| {
-        if let Some((a, b)) = still.take()
-            && b - a >= STILL_S
-        {
-            *blocked += b - a;
-        }
-    };
+    let mut minima = Vec::new();
     for (s, tracks) in samples.iter().zip(&of) {
-        for b in &s.subjects {
-            if let Some(v) = b.speed().filter(|v| *v > MOVING_MPS) {
-                moving += 1;
-                gliding += u32::from(b.across().is_some_and(|a| a > GLIDE_MPS) && v > MOVING_MPS);
-            }
-        }
         let Some(r) = &s.reference else { continue };
-        let seen: Vec<usize> = tracks.clone();
         for (b, &k) in s.subjects.iter().zip(tracks) {
             let d = flat(b.pos, r.pos);
-            if !touching[k] && d < contact {
-                (touching[k], contacts) = (true, contacts + 1);
-            } else if touching[k] && d > contact + CONTACT_LEAVE_M {
-                touching[k] = false;
-            }
             match (pass[k], d <= PASS_M) {
                 (Some(m), true) => pass[k] = Some(m.min(d)),
                 (None, true) => pass[k] = Some(d),
                 (Some(m), false) => (minima.push(m), pass[k] = None).1,
                 (None, false) => {}
             }
-            let speed = b.speed();
-            if speed.is_some_and(|v| v < STILL_MPS)
-                && d <= BLOCKED_M
-                && (moved[k] || still[k].is_some())
-            {
-                still[k] = Some((still[k].map_or(s.t, |(a, _)| a), s.t));
-            } else {
-                still_end(&mut still[k], &mut blocked);
-            }
-            moved[k] |= speed.is_some_and(|v| v > MOVING_MPS);
         }
-        // A track not in this sample ends its pass and its still stretch.
-        for k in (0..n_tracks).filter(|k| !seen.contains(k)) {
+        // A track not in this sample ends its pass.
+        for k in (0..n_tracks).filter(|k| !tracks.contains(k)) {
             if let Some(m) = pass[k].take() {
                 minima.push(m);
             }
-            still_end(&mut still[k], &mut blocked);
         }
     }
     minima.extend(pass.into_iter().flatten());
-    for s in &mut still {
-        still_end(s, &mut blocked);
-    }
     // The reference's steps, exposed (a subject within PASS_M at either end) or not.
     let near = |s: &Sample| {
         s.reference
@@ -640,11 +679,13 @@ pub fn verdicts(windows: &[(&str, &Metrics)]) -> Vec<MetricVerdict> {
         .collect()
 }
 
+/// The trace CSV's header line.
+const CSV_HEADER: &str = "t_s,sample,who,track,id,x,y,z,heading,vx,vy,vz,distance_m,flags,entity";
+
 /// A window's trace as CSV: one row per body per sample, the reference first (`who` reference, no track), then the
 /// subjects with their track; `distance_m` from the reference in that sample, empty without one.
 pub fn csv(samples: &[Sample]) -> String {
-    let mut out =
-        String::from("t_s,sample,who,track,id,x,y,z,heading,vx,vy,vz,distance_m,flags,entity\n");
+    let mut out = format!("{CSV_HEADER}\n");
     let num = |x: Option<f64>| x.map_or(String::new(), |x| format!("{x}"));
     for (i, (s, tracks)) in samples.iter().zip(tracks(samples)).enumerate() {
         let rows = s.reference.iter().map(|b| ("reference", None, b)).chain(
@@ -680,6 +721,68 @@ pub fn csv(samples: &[Sample]) -> String {
         }
     }
     out
+}
+
+/// A trace CSV ([`csv`]) read back into its samples; `found` is the subjects it holds (world.actors' count isn't in
+/// it), and [`tracks`] gives the same tracks again.
+pub fn parse_csv(text: &str) -> Result<Vec<Sample>, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(CSV_HEADER) {
+        return Err("not an actor trace CSV: its header differs".into());
+    }
+    let mut out: Vec<Sample> = Vec::new();
+    let mut at = None;
+    for (n, line) in lines.enumerate() {
+        let bad = |what: &str| format!("line {}: {what}", n + 2);
+        let f: Vec<&str> = line.splitn(15, ',').collect();
+        if f.len() != 15 {
+            return Err(bad("fewer than 15 fields"));
+        }
+        let opt = |i: usize| match f[i] {
+            "" => Ok(None),
+            x => x.parse::<f64>().map(Some).map_err(|_| bad(x)),
+        };
+        let num = |i: usize| opt(i)?.ok_or_else(|| bad("an empty number"));
+        let velocity = match (opt(9)?, opt(10)?, opt(11)?) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => None,
+        };
+        let entity = f[14]
+            .strip_prefix('"')
+            .and_then(|e| e.strip_suffix('"'))
+            .ok_or_else(|| bad("an entity not in quotes"))?;
+        let body = Body {
+            id: match f[4] {
+                "" => None,
+                id => Some(id.parse().map_err(|_| bad(id))?),
+            },
+            pos: [num(5)?, num(6)?, num(7)?],
+            heading: num(8)?,
+            velocity,
+            flags: f[13].parse().map_err(|_| bad(f[13]))?,
+            entity: entity.replace("\"\"", "\""),
+        };
+        let sample: usize = f[1].parse().map_err(|_| bad(f[1]))?;
+        if at != Some(sample) {
+            at = Some(sample);
+            out.push(Sample {
+                t: num(0)?,
+                reference: None,
+                subjects: Vec::new(),
+                found: 0,
+            });
+        }
+        let s = out.last_mut().expect("pushed above");
+        match f[2] {
+            "reference" => s.reference = Some(body),
+            "subject" => {
+                s.subjects.push(body);
+                s.found += 1;
+            }
+            who => return Err(bad(who)),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -923,6 +1026,28 @@ mod tests {
             text.contains(",0.5,0,0,2.23606797749979,66,\"a \"\"b\"\"\""),
             "{text}"
         );
+    }
+
+    /// world_map reads a trace back from its CSV: the same samples, so the same tracks and metrics.
+    #[test]
+    fn a_csv_reads_back_into_its_samples() {
+        let near = walker(Some(4), 0.5);
+        let mut samples = trace(6.0, |t| {
+            let mut b = body(None, 1.0, -2.0, 33.5, None);
+            b.entity = "a, \"cart\"".into();
+            vec![near(t), b]
+        });
+        samples[3].reference = None;
+        let back = parse_csv(&csv(&samples)).unwrap();
+        assert_eq!(back, samples);
+        assert_eq!(
+            metrics_(&back).unwrap(),
+            metrics_(&samples).unwrap(),
+            "the same metrics"
+        );
+        assert!(parse_csv("t_s,x\n1,2\n").is_err());
+        let cut = csv(&samples).replace(",\"npc\"", "");
+        assert!(parse_csv(&cut).is_err());
     }
 
     #[test]

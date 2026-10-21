@@ -346,7 +346,7 @@ pub(crate) const BEFORE_ENTITIES: &[&str] = &[
 ];
 
 /// The package releases from before the scene verbs, cam.noclip and exec (quen-w3 0.1.13): world_frame, world_ground,
-/// world_ray, world_nav, game_frame, game_place and game_exec refuse them with needs.
+/// world_ray, world_nav, world_map, game_frame, game_place and game_exec refuse them with needs.
 pub(crate) const BEFORE_SCENE: &[&str] = &[
     "quen-w3 0.1.1",
     "quen-w3 0.1.2",
@@ -491,7 +491,7 @@ pub(crate) const PACKAGE: Dep = Dep {
         quen-w3 0.1.8, hands_give's notice in the game; from quen-w3 0.1.9, game_photo; from quen-w3 0.1.10, \
         game_items and world_actors; from quen-w3 0.1.11, world_actors' entity up to 255 characters; from quen-w3 \
         0.1.12, world_actors' tag, class and ids (and measure_trace and measure_ab traces with them); from quen-w3 \
-        0.1.13, world_frame, world_ground, world_ray, world_nav, game_frame, game_place and game_exec (and \
+        0.1.13, world_frame, world_ground, world_ray, world_nav, world_map, game_frame, game_place and game_exec (and \
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
         x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
         its 0.5 s hide before captures and windows",

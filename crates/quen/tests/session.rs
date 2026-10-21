@@ -2592,6 +2592,7 @@ fn game_and_measure_tools_need_a_live_session() {
         "world_ground",
         "world_ray",
         "world_nav",
+        "world_map",
         "game_frame",
         "game_place",
         "game_exec",
