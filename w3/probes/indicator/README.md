@@ -101,7 +101,7 @@ Through quen's `script_compile` (`stubs: true`), with wcc_lite's `-agreetoterms`
 | control | a scratch copy with `QuenNoSuchCall();` planted after `AddEntry`'s call in `QuenIndEntry`, plus the wrap | exit 1: `local\quenProbeIndicator.ws[235]: Could not find function 'QuenNoSuchCall'`, the planted line |
 
 The compiled files' sha256:
-- `quenProbeIndicator.ws` `10504415cad8b40d6069028536c8fe607da1f137758a0060b075f7382cad1582`
+- `quenProbeIndicator.ws` `8c8a63f4cef662dd639433a92d472d9c99bd8bdff938e229abfe4d4b19bbb112`
 - `quenProbeIndicatorWrap.ws` `6f7b5075deea210889fce8eeccd6f51ca4bca517f4a40c927a207c9723c69f7f`
 
 What the compiler taught on the way:
