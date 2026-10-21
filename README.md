@@ -57,6 +57,7 @@ quen makes that the agent's job, with guard rails:
   - The actors near the player: positions, headings, velocities and flags, filtered by tag or class.
   - The scene: what's in frame, ground height, line of sight and navmesh lines.
   - Framing sets: the photo-mode camera placed around a subject from several sides in one call, each checked for a clear view first.
+  - Top-down maps (`world_map`): the space around a point read into a grid without the camera (walkable ground, obstacles, water, clearance and chokepoints, who stands where), a street's width along an axis, what blocks each walker, actor-trace heat layers on the same map, and a picture of it.
 - **Captures.**
   - SDR and HDR screenshots of the game window (Windows Graphics Capture, with Desktop Duplication as the fallback).
   - Disk use tracked against a budget. Captures are cleaned up only when you approve, to the Recycle Bin, never as a hard delete.
