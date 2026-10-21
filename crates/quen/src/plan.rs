@@ -21,7 +21,7 @@ use crate::{doctor, measure, notice};
 
 /// The tools a step may call: what a test session's agent calls without the client's prompt (the owner's Q7), sweeps
 /// aside. Never a launch, a save, a hand-over, a cleanup, a memory patch, a focus move or a ledger write.
-const TOOLS: [&str; 26] = [
+const TOOLS: [&str; 27] = [
     "game_console",
     "game_exec",
     "game_cvar",
@@ -48,6 +48,7 @@ const TOOLS: [&str; 26] = [
     "measure_trace",
     "measure_presentmon",
     "measure_ab",
+    "measure_image",
 ];
 /// A plan's estimate cap by default and at most, and the estimate over which it runs only as a job (the owner's Q8).
 const MAX_S: f64 = 600.0;
@@ -65,6 +66,9 @@ const SIDE_S: f64 = 0.55;
 const LOAD_S: f64 = 34.0;
 const SCREENSHOT_S: f64 = 1.0;
 const VERB_S: f64 = 0.2;
+/// A measure_image metric: 0.03-1.35 s each on a synthetic 4K frame, a file's decode 0.05-0.11 s (release build).
+// ponytail: one timing of synthetic frames; replace with the tool's median once plans have run it.
+const IMAGE_S: f64 = 1.5;
 /// What a step result's table row keeps of a text field (the whole is in the result file).
 const TEXT_MAX: usize = 200;
 
@@ -77,8 +81,8 @@ pub fn tool() -> Value {
             the client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Every step is checked \
             against its tool's schema before any runs. Setup steps that succeed are replayed by session_launch again. \
             A step that doesn't succeed ends the run (aborted); teardown then runs, also after a cancel. estimate_s: \
-            from measured costs; refused over max_s (default 600, at most 3600), and over 300 unless wait: false. \
-            check: the checks and estimate, nothing run. Files: <tag>-plan.json and <tag>-result.json (every step's \
+            from measured costs, fade waits left out; refused over max_s (default 600, at most 3600), and over 300 \
+            unless wait: false. check: the checks and estimate, nothing run. Files: <tag>-plan.json and <tag>-result.json (every step's \
             envelope), each with a captures row. Refused, nothing run: a bad plan or step, a tag taken, the user's \
             controls, a play session.",
         "inputSchema": game::schema(json!({
@@ -340,6 +344,7 @@ fn estimate(tool: &str, args: &Value, exec: bool) -> Result<f64, String> {
         "measure_trace" => num("secs", 30.0) + 0.3,
         "measure_presentmon" => num("secs", 10.0) + 1.0,
         "measure_ab" => measure::ab_secs(args, exec).map_err(|e| format!("measure_ab: {e}"))?,
+        "measure_image" => IMAGE_S * args["metrics"].as_array().map_or(1, Vec::len) as f64,
         t if t.starts_with("world_") || matches!(t, "game_scriptlog" | "game_listsaves") => READ_S,
         _ => VERB_S,
     })
@@ -472,9 +477,15 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
         0.0
     };
     let estimate = ((plan.estimate() + clear) * 10.0).round() / 10.0;
+    // A fade can't be foreseen: only a long move fades (7.5 s after a 215 m game_place, the 0.1.12 live check).
+    let excludes = format!(
+        "fade waits: up to {} s before a step (before_s in its row)",
+        game::READY_MAX.as_secs()
+    );
     let mut fields = Map::from_iter([
         ("tag".to_string(), json!(plan.tag)),
         ("estimate_s".into(), json!(estimate)),
+        ("estimate_excludes".into(), json!(excludes)),
         ("max_s".into(), json!(plan.max_s)),
     ]);
     let listed: Vec<Value> = plan
@@ -551,8 +562,10 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
     'run: for (phase, steps) in plan.phases[..2].iter().filter(|_| cleared) {
         for (i, step) in steps.iter().enumerate() {
             let at = format!("{phase} step {} ({})", i + 1, step.tool);
+            let ready = Instant::now();
             let checked = ctx(session, &token, &[])
                 .and_then(|cx| before(&cx, call, &step.tool, start, plan.max_s));
+            let waited = ready.elapsed().as_secs_f64();
             let back = match checked {
                 Ok(back) => back,
                 Err(why) => {
@@ -582,7 +595,11 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             if let Some(back) = back {
                 envelope["game_back"] = json!(back);
             }
-            let row = row(phase, i + 1, step, &envelope, t.elapsed().as_secs_f64());
+            let mut row = row(phase, i + 1, step, &envelope, t.elapsed().as_secs_f64());
+            // The checks before it: a fade waited out, the game brought back (not in its s).
+            if waited >= 0.1 {
+                row["before_s"] = json!((waited * 100.0).round() / 100.0);
+            }
             envelope["phase"] = json!(phase);
             envelope["n"] = json!(i + 1);
             envelopes.push(envelope);
@@ -761,16 +778,24 @@ mod tests {
         json!({"token": "tok", "plan": text})
     }
 
-    /// The design's accept: setup, a framed set (game_frame) and a trace as one call. The setup is noted for `again`,
-    /// the steps and the teardown aren't; the plan and the result are files with captures rows. The estimate stays
-    /// within 20 % of the run for a plan of a wait, a trace window and verbs (here game_frame's sides take no
-    /// screenshot, which its estimate counts).
+    /// The design's accept: setup, a framed set (game_frame), a trace and an image metric as one call. The setup is
+    /// noted for `again`, the steps and the teardown aren't; the plan and the result are files with captures rows, and
+    /// the envelope lists every step's rows. The estimate stays within 20 % of the run for a plan of a wait, a trace
+    /// window and verbs (here game_frame's sides take no screenshot, which its estimate counts).
     #[test]
     fn a_plan_runs_setup_a_framing_and_a_trace_as_one_call() {
         let fx = photo("plan-run");
         let (server, stop) = game(&fx);
         let mut session = fx.session();
         session.noted().clear();
+        let shot = crate::image::tests::srgb8(1, 1, &[[255, 255, 255]]);
+        let shot = crate::image::tests::stored(
+            &fx,
+            "A1.png",
+            &shot,
+            "printwindow",
+            Some(quen_core::hdr::Encoding::Srgb8),
+        );
         let plan = json!({
             "tag": "p1",
             "setup": [{"game_settime": {"day": 3, "hour": 12}}, {"game_exec": {"line": "preset(2)"}}],
@@ -778,16 +803,30 @@ mod tests {
                 {"game_frame": {"sides": ["front", "left"], "distance": 3}},
                 {"measure_trace": {"tag": "walk", "secs": 1}},
                 {"world_get": {}},
+                {"measure_image": {"capture": "s1/A1.png", "metrics": ["luminance"]}},
             ],
             "teardown": [{"game_exec": {"line": "preset(0)"}}],
         });
         let out = run(&mut session, args(plan.clone()));
         assert_eq!(out["ok"], true, "{out}");
         let rows = out["steps"].as_array().unwrap();
-        assert_eq!(rows.len(), 5, "{out}");
+        assert_eq!(rows.len(), 6, "{out}");
         assert!(rows.iter().all(|r| r["ok"] == true), "{out}");
         assert_eq!(rows[3]["tool"], "measure_trace");
         assert!(rows[3]["ledger"]["measurements"].is_array(), "{out}");
+        assert_eq!(
+            rows[5]["ledger"]["measurements"].as_array().unwrap().len(),
+            4,
+            "{out}"
+        );
+        assert_eq!(rows[5]["est_s"], 1.5, "{out}");
+        assert!(
+            out["estimate_excludes"]
+                .as_str()
+                .unwrap()
+                .starts_with("fade waits"),
+            "{out}"
+        );
         assert_eq!(out["teardown"][0]["ok"], true, "{out}");
         // Only the setup is noted for again, in order, without the token.
         let noted: Vec<Value> = session.noted().clone();
@@ -807,20 +846,30 @@ mod tests {
         let result = fs::read_to_string(dir.join("p1-result.json")).unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
         let steps = result["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 6, "every envelope, the teardown's too");
+        assert_eq!(steps.len(), 7, "every envelope, the teardown's too");
         assert_eq!(steps[2]["sides"][1]["side"], "left");
         let db =
             quen_core::ledger::Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
-        let sql = "SELECT path, method FROM captures ORDER BY id";
-        let captures = db.query(sql, &[], Duration::from_secs(5)).unwrap().rows;
+        let sql = "SELECT path, method, id FROM captures WHERE id > ?1 ORDER BY id";
+        let captures = db
+            .query(sql, &[json!(shot)], Duration::from_secs(5))
+            .unwrap()
+            .rows;
+        let named: Vec<&[Value]> = captures.iter().map(|r| &r[..2]).collect();
         assert_eq!(
-            captures,
+            named,
             [
                 [json!("s1/p1-plan.json"), json!("run_plan")],
                 [json!("s1/walk-trace.csv"), json!("actor_trace")],
                 [json!("s1/p1-result.json"), json!("run_plan")],
             ]
         );
+        // The envelope lists them all, the trace step's CSV too.
+        let ids: Vec<Value> = captures.iter().map(|r| r[2].clone()).collect();
+        assert_eq!(out["ledger"]["captures"], json!(ids), "{out}");
+        let sql = "SELECT DISTINCT capture_id, method_family FROM measurements WHERE metric LIKE 'luminance%'";
+        let image = db.query(sql, &[], Duration::from_secs(5)).unwrap().rows;
+        assert_eq!(image, [[json!(shot), json!("screenshot")]]);
         // A tag taken refuses the next plan before anything.
         let again = run(&mut session, args(plan));
         assert_eq!(again["refused"], true, "{again}");
@@ -889,6 +938,9 @@ mod tests {
         );
         assert_eq!(out["teardown"][0]["ok"], true, "{out}");
         assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+        // The wait before the step, outside its own s.
+        let before = out["steps"][1]["before_s"].as_f64().unwrap_or_default();
+        assert!(before >= 0.5, "{out}");
     }
 
     /// A step that doesn't succeed ends the run there; the teardown still runs, every step of it; the steps after it

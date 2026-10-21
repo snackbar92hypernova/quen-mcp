@@ -198,7 +198,8 @@ quen's state showed the game's menu (its pause menu) during a `measure_ab` windo
 `photo`, photo mode; NULL: not recorded, every row before schema 0011); `note`. quen's presentmon rows' note
 is `<csv>; <PresentMode>; <run>`: the CSV's path relative to the capture root (it has no captures row), and for
 measure_ab each state's actions and `verdict {...}` (the run's verdict, diff_ms and drift_ms), then `a quiet machine` or
-`warned: ...` (what the quiet-machine check said). Older rows hold the CSV's absolute path and the PresentMode only.
+`warned: ...` (what the quiet-machine check said). Older rows hold the CSV's absolute path and the PresentMode only. quen's `measure_image` rows (family `screenshot`) carry
+the screenshot's `capture_id` and boot, and their note starts `measure_image <encoding> <w>x<h> crop <x>,<y> <w>x<h> px`.
 `extraction_id` → extractions: the REA record (or decompile) a static_re row was read from, NULL otherwise.
 
 ### claims (table)
