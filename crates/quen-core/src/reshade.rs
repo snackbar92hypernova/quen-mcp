@@ -1,6 +1,7 @@
 //! Checked edits of a ReShade-style ini (ReShade.ini, its RenoDX add-on sections), byte-identical to the harness's
 //! `ini_writer.set_values`: only the named keys' lines of one `[section]` change, each keeping its own line ending, and a
-//! missing key is appended at the end of the section when allowed. Values are written as RenoDX and ReShade write them.
+//! missing key (or section) is refused, skipped or appended, as asked. Values are written as RenoDX and ReShade write
+//! them.
 
 /// A value to write: a number (formatted like `std::to_chars(float)`) or a one-line string.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,13 +112,26 @@ fn split_lines(text: &str) -> Vec<&str> {
     out
 }
 
-/// Sets `values` (in order) in the one `[section]` of `data`. A key must start at most one line there; a missing key is
-/// refused, or with `add` appended after the section's last non-blank line. A UTF-8 BOM and every other byte stay.
+/// What [`set_values`] does with a key its `[section]` doesn't have.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Missing {
+    /// Refuses, as it does a missing section.
+    Refuse,
+    /// Appends the key after the section's last non-blank line.
+    Add,
+    /// The same, a missing section first appended at the end of the file.
+    AddSection,
+    /// Leaves the key out; a missing section leaves the file as it is.
+    Skip,
+}
+
+/// Sets `values` (in order) in the one `[section]` of `data`. A section appearing twice, or a key starting two lines
+/// there, is refused; a missing one is handled as `missing` says. A UTF-8 BOM and every other byte stay.
 pub fn set_values(
     data: &[u8],
     section: &str,
     values: &[(&str, Value)],
-    add: bool,
+    missing: Missing,
 ) -> Result<Vec<u8>, String> {
     if values.is_empty() {
         return Err("no values".into());
@@ -133,8 +147,19 @@ pub fn set_values(
     let heads: Vec<usize> = (0..lines.len())
         .filter(|&i| kind(lines[i]) == Some(Kind::Section(section)))
         .collect();
-    let [head] = heads[..] else {
-        return Err(format!("[{section}] found {} times", heads.len()));
+    let head = match heads[..] {
+        [head] => head,
+        [] if missing == Missing::Skip => return Ok(data.to_vec()),
+        [] if missing == Missing::AddSection => {
+            let mut out = data.to_vec();
+            if !text.is_empty() && !text.ends_with(['\n', '\r']) {
+                out.extend(nl.as_bytes());
+            }
+            out.extend(format!("[{section}]{nl}").bytes());
+            // A name that doesn't read back as `[section]` is refused here: found 0 times.
+            return set_values(&out, section, values, Missing::Add);
+        }
+        _ => return Err(format!("[{section}] found {} times", heads.len())),
     };
     let start = head + 1;
     let end = (start..lines.len())
@@ -158,8 +183,11 @@ pub fn set_values(
                 let body = lines[i].trim_end_matches(['\r', '\n']);
                 new[i] = format!("{key}={value}{}", &lines[i][body.len()..]);
             }
-            [] if add => inserts.push(format!("{key}={value}")),
-            [] => return Err(format!("{key} not in [{section}]")),
+            [] => match missing {
+                Missing::Refuse => return Err(format!("{key} not in [{section}]")),
+                Missing::Add | Missing::AddSection => inserts.push(format!("{key}={value}")),
+                Missing::Skip => {}
+            },
             _ => return Err(format!("{key} appears {} times in [{section}]", hits.len())),
         }
     }
@@ -216,8 +244,8 @@ mod tests {
     const INI: &str = "\u{feff}[ADDON]\r\nLoadFromDllMain=\r\n\r\n[renodx]\r\n ; note\r\nSettingsMode=1\r\n\r\n\
                        [renodx-preset1]\r\nToneMapGameNits=203\r\n  Black = 0 \r\n\r\n[OTHER]\r\nToneMapGameNits=1\r\n";
 
-    fn set(section: &str, values: &[(&str, Value)], add: bool) -> Result<String, String> {
-        set_values(INI.as_bytes(), section, values, add).map(|b| String::from_utf8(b).unwrap())
+    fn set(section: &str, values: &[(&str, Value)], missing: Missing) -> Result<String, String> {
+        set_values(INI.as_bytes(), section, values, missing).map(|b| String::from_utf8(b).unwrap())
     }
 
     #[test]
@@ -225,7 +253,7 @@ mod tests {
         let out = set(
             "renodx-preset1",
             &[("ToneMapGameNits", Value::Number(250.0))],
-            false,
+            Missing::Refuse,
         )
         .unwrap();
         assert_eq!(
@@ -233,10 +261,20 @@ mod tests {
             INI.replace("ToneMapGameNits=203", "ToneMapGameNits=250")
         );
         // A key line with spaces around `=` is rewritten as Key=value, its line ending kept.
-        let out = set("renodx-preset1", &[("Black", Value::Number(0.5))], false).unwrap();
+        let out = set(
+            "renodx-preset1",
+            &[("Black", Value::Number(0.5))],
+            Missing::Refuse,
+        )
+        .unwrap();
         assert_eq!(out, INI.replace("  Black = 0 \r\n", "Black=0.5\r\n"));
         let path = r"devkit\renodx-devkit.addon64";
-        let out = set("ADDON", &[("LoadFromDllMain", Value::Text(path))], false).unwrap();
+        let out = set(
+            "ADDON",
+            &[("LoadFromDllMain", Value::Text(path))],
+            Missing::Refuse,
+        )
+        .unwrap();
         assert_eq!(
             out,
             INI.replace(
@@ -248,7 +286,12 @@ mod tests {
 
     #[test]
     fn a_missing_key_is_appended_after_the_last_non_blank_line() {
-        let out = set("renodx", &[("DevAutoReload", Value::Number(1.0))], true).unwrap();
+        let out = set(
+            "renodx",
+            &[("DevAutoReload", Value::Number(1.0))],
+            Missing::Add,
+        )
+        .unwrap();
         assert_eq!(
             out,
             INI.replace(
@@ -258,22 +301,91 @@ mod tests {
         );
         // At the end of a file without a final line break, the break is added first.
         let data = "[A]\nX=1";
-        let out = set_values(data.as_bytes(), "A", &[("Y", Value::Number(2.0))], true).unwrap();
+        let out = set_values(
+            data.as_bytes(),
+            "A",
+            &[("Y", Value::Number(2.0))],
+            Missing::Add,
+        )
+        .unwrap();
         assert_eq!(out, b"[A]\nX=1\nY=2\n");
-        let out = set_values(b"[A]\n", "A", &[("Y", Value::Number(2.0))], true).unwrap();
+        let out = set_values(b"[A]\n", "A", &[("Y", Value::Number(2.0))], Missing::Add).unwrap();
         assert_eq!(out, b"[A]\nY=2\n");
     }
 
     #[test]
     fn refuses_on_any_doubt() {
-        assert!(set("renodx", &[("DevAutoReload", Value::Number(1.0))], false).is_err());
-        assert!(set("nope", &[("X", Value::Number(1.0))], true).is_err());
-        assert!(set("renodx", &[("A=B", Value::Number(1.0))], true).is_err());
-        assert!(set("renodx", &[], true).is_err());
+        assert!(
+            set(
+                "renodx",
+                &[("DevAutoReload", Value::Number(1.0))],
+                Missing::Refuse
+            )
+            .is_err()
+        );
+        assert!(set("nope", &[("X", Value::Number(1.0))], Missing::Add).is_err());
+        assert!(set("renodx", &[("A=B", Value::Number(1.0))], Missing::Add).is_err());
+        assert!(set("renodx", &[], Missing::Add).is_err());
         let twice = "[A]\nX=1\nX=2\n";
-        assert!(set_values(twice.as_bytes(), "A", &[("X", Value::Number(3.0))], false).is_err());
+        assert!(
+            set_values(
+                twice.as_bytes(),
+                "A",
+                &[("X", Value::Number(3.0))],
+                Missing::Refuse
+            )
+            .is_err()
+        );
         let heads = "[A]\nX=1\n[A]\n";
-        assert!(set_values(heads.as_bytes(), "A", &[("X", Value::Number(3.0))], false).is_err());
+        for missing in [
+            Missing::Refuse,
+            Missing::Add,
+            Missing::AddSection,
+            Missing::Skip,
+        ] {
+            let err = set_values(heads.as_bytes(), "A", &[("X", Value::Number(3.0))], missing);
+            assert_eq!(err.unwrap_err(), "[A] found 2 times", "{missing:?}");
+        }
+    }
+
+    /// Live 2026-10-22: a ReShade.ini as ReShade writes it fresh has no [ADDON].
+    #[test]
+    fn a_missing_section_or_key_is_skipped_or_added() {
+        const FRESH: &str = "\u{feff}[GENERAL]\r\nPresetPath=.\\ReShadePreset.ini\r\n";
+        let key = [("LoadFromDllMain", Value::Text(r"devkit\x.addon64"))];
+        let empty = [("LoadFromDllMain", Value::Text(""))];
+        let set = |data: &str, values: &[(&str, Value)], missing| {
+            set_values(data.as_bytes(), "ADDON", values, missing)
+                .map(|b| String::from_utf8(b).unwrap())
+        };
+        let no_key = "\u{feff}[ADDON]\r\nOther=1\r\n\r\n[GENERAL]\r\n";
+        for data in [FRESH, no_key] {
+            assert_eq!(set(data, &empty, Missing::Skip).unwrap(), data);
+        }
+        // The BOM and CRLF kept; the section at the end, the key after the section's last non-blank line.
+        assert_eq!(
+            set(FRESH, &key, Missing::AddSection).unwrap(),
+            format!("{FRESH}[ADDON]\r\nLoadFromDllMain=devkit\\x.addon64\r\n")
+        );
+        assert_eq!(
+            set(no_key, &key, Missing::AddSection).unwrap(),
+            no_key.replace(
+                "Other=1\r\n",
+                "Other=1\r\nLoadFromDllMain=devkit\\x.addon64\r\n"
+            )
+        );
+        assert_eq!(
+            set("X=1", &key, Missing::AddSection).unwrap(),
+            "X=1\n[ADDON]\nLoadFromDllMain=devkit\\x.addon64\n"
+        );
+        assert_eq!(
+            set("", &key, Missing::AddSection).unwrap(),
+            "[ADDON]\nLoadFromDllMain=devkit\\x.addon64\n"
+        );
+        assert!(set(FRESH, &key, Missing::Add).is_err());
+        // A section name that doesn't read back as itself is refused.
+        let odd = set_values(FRESH.as_bytes(), "A]B", &key, Missing::AddSection);
+        assert_eq!(odd.unwrap_err(), "[A]B] found 0 times");
     }
 
     #[test]
