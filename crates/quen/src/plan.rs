@@ -112,8 +112,18 @@ struct Plan {
 }
 
 impl Plan {
+    /// The steps' estimates, and what is left of the plan's measuring line's [`status::MEASURING_SHOWN`] at its first
+    /// capture or window.
     fn estimate(&self) -> f64 {
-        self.phases.iter().flat_map(|(_, s)| s).map(|s| s.est).sum()
+        let steps = || self.phases.iter().flat_map(|(_, s)| s);
+        let hides = |s: &Step| {
+            status::captures(&s.tool) && (s.tool != "game_frame" || s.args.get("tag").is_some())
+        };
+        let shown = steps().position(hides).map_or(0.0, |first| {
+            let before: f64 = steps().take(first).map(|s| s.est).sum();
+            (status::MEASURING_SHOWN.as_secs_f64() - before).max(0.0)
+        });
+        steps().map(|s| s.est).sum::<f64>() + shown
     }
 }
 
@@ -1075,8 +1085,9 @@ mod tests {
         check["check"] = json!(true);
         let out = run(&mut session, check);
         assert_eq!(out["ok"], true, "{out}");
-        // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, the wait 1.
-        assert_eq!(out["estimate_s"], 25.2, "{out}");
+        // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, the wait 1; and the plan's measuring
+        // line up 3 s before its first window: 2.8 s more after the settime.
+        assert_eq!(out["estimate_s"], 28.0, "{out}");
         assert_eq!(out["steps"][1]["est_s"], 24.0, "{out}");
         assert!(!fx.dir.join("data/captures/s1").exists(), "nothing written");
     }

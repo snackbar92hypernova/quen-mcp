@@ -181,8 +181,8 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # game call. 'false' turns that off: the game then shows a notice that the agent waits for you in the chat. Default 'true'.
 # idle_focus = 'false'
 
-# Optional: in a test session, with quen-w3 0.1.15 or later, the game shows one lasting line of quen's: the agent at
-# work, measuring, your controls, or the agent waiting for you. quen takes it down 0.5 s before each of its screenshots
+# Optional: with quen-w3 0.1.15 or later, the game shows one lasting line of quen's: the agent at work, measuring,
+# your controls (in a play session from the launch), or the agent waiting for you. quen takes it down 0.5 s before each of its screenshots
 # and measurement windows. 'off' leaves the short notices at hand-overs, measurements and waits only. Default 'on'.
 # indicator = 'off'
 

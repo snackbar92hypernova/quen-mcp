@@ -3,23 +3,24 @@
 //! hands_give showed first): in the probe boot (finding 94) it showed in gameplay, in photo mode and over the pause menu.
 //! Every state is set at quen's own transitions ([`State`]), none read from the game.
 //!
-//! **Lasting** (a test session, quen-w3 0.1.15 or later, the config's `indicator` on): one line, up for an hour, sent
-//! at each transition and again [`RESEND`] after it was last sent while a state is set: the game's own notifications
-//! and its hub menu's key clear it without quen seeing it (the probe boot). modQuen keeps a line that is still up with
-//! the same text, so then a re-send changes nothing on screen.
-//! - **working:** a call of the connection that launched starts, with the agent's controls ([`start`]);
+//! **Lasting** (quen-w3 0.1.15 or later, the config's `indicator` on): one line, up for an hour, sent at each
+//! transition and again [`RESEND`] after it was last sent while a state is set: the game's own notifications and its
+//! hub menu's key clear it without quen seeing it (the probe boot). modQuen keeps a line that is still up with the same
+//! text, so then a re-send changes nothing on screen.
+//! - **working:** a call of the connection that launched starts, with the agent's controls ([`start`], hands_take);
 //! - **measuring:** a measure call, a sweep or a run_plan, from its checks to its end ([`measuring`], [`poll`]);
-//! - **yours:** hands_give .. hands_take;
+//! - **yours:** whenever the user has the controls: a play session from its launch, hands_give .. hands_take ([`poll`]);
 //! - **waiting:** no call from that connection for [`IDLE`] with the agent's controls, until its next call ([`poll`]).
 //!
-//! **Transitions only** (a play session, `indicator = 'off'`, or a package before 0.1.15): one notice for 8 s at three
-//! transitions: hands_give, a measuring call of [`MEASURING_MIN`] s or more, and the agent waiting when quen doesn't
-//! bring its client forward.
+//! **Transitions only** (`indicator = 'off'`, or a package before 0.1.15): one notice for 8 s at three transitions:
+//! hands_give, a measuring call of [`MEASURING_MIN`] s or more, and the agent waiting when quen doesn't bring its client
+//! forward.
 //!
 //! Either way the game draws the notice into its frames: before every capture and window quen takes it down and waits
 //! [`HIDE_WAIT`] ([`hide`]); the line comes back at quen's next send, which is never inside one: a transition, the
 //! session thread between calls ([`poll`]), a run_plan between steps, measure_ab between windows. With a package before
-//! 0.1.15 (no `notice.hide`) a capture waits until 9 s after the notice instead.
+//! 0.1.15 (no `notice.hide`) a capture waits until 9 s after the notice instead. A measuring call's line stays up
+//! [`MEASURING_SHOWN`] before the call's first hide.
 //!
 //! Idle focus: [`IDLE`] without a call, the agent's controls, the game in front in gameplay or photo mode: quen brings
 //! that connection's client forward as `focus` to client does, unless the config's `idle_focus` is off or it can't. The
@@ -49,6 +50,9 @@ pub(crate) const RESEND: Duration = Duration::from_secs(10);
 /// hide, a screenshot about 0.8 s after showed none, and windows started about 0.6 s after a hide were no slower than
 /// plain ones (the probe boot, checks 1 and 7; one run each).
 pub(crate) const HIDE_WAIT: Duration = Duration::from_millis(500);
+/// How long a measuring call's line is up, at least, before the call's first hide (the owner, after the 0.1.15 live
+/// check: up 79 ms before a trace, "a brief flash"). Once per call, not per window.
+pub(crate) const MEASURING_SHOWN: Duration = Duration::from_secs(3);
 /// A transition's notice: the package's own 8 s.
 const ONCE: Duration = Duration::from_secs(8);
 /// After a notice's time, its 0.3 s fade and a margin: until then it may be on screen (the 9 s quen waited before 0.1.15).
@@ -81,7 +85,8 @@ impl State {
                 format!("quen: measuring for about {secs} s. Hands off until it ends.")
             }
             State::Yours => {
-                "quen: you have the controls. Tell the agent in the chat (Alt+Tab) to take them back.".into()
+                "quen: you have the controls. Tell the agent in the chat (Alt+Tab) to take them."
+                    .into()
             }
             State::Waiting => "quen: the agent is waiting for you in the chat (Alt+Tab).".into(),
         }
@@ -97,6 +102,8 @@ pub(crate) struct Status {
     sent: Cell<Option<Instant>>,
     /// quen's last notice that may be on screen: its state, when it went out, its time there. None: taken down.
     up: Cell<Option<(State, Instant, Duration)>>,
+    /// When the running measuring call's line went up, until the call's first hide ([`MEASURING_SHOWN`]).
+    measuring_at: Cell<Option<Instant>>,
     /// quen's package in the game, read once ([`doctor::package_version`]).
     package: OnceCell<Option<&'static str>>,
 }
@@ -127,9 +134,9 @@ fn old(cx: &Ctx) -> bool {
     package(cx).is_some_and(|v| doctor::BEFORE_STATUS.contains(&v))
 }
 
-/// Whether the line lasts: a test session, the config's `indicator` on, and a package with the duration and the hide.
+/// Whether the line lasts: the config's `indicator` on, and a package with the duration and the hide.
 fn lasting(cx: &Ctx) -> bool {
-    !cx.live.play && cx.config.indicator() && !old(cx)
+    cx.config.indicator() && !old(cx)
 }
 
 /// Sends `state`'s line on `held` (a connection the caller holds: the ASI serves one at a time, finding 80) or a new
@@ -233,7 +240,12 @@ pub(crate) fn measuring(
     if cx.hands != Some(Hands::Agent) || cx.live.in_plan.get() {
         return None;
     }
-    send(cx, Some(call), State::Measuring(secs), held).map(|r| r.unwrap_or_else(|why| why))
+    let sent = send(cx, Some(call), State::Measuring(secs), held);
+    let st = &cx.live.status;
+    if let Some((State::Measuring(_), at, _)) = st.up.get() {
+        st.measuring_at.set(Some(at));
+    }
+    sent.map(|r| r.unwrap_or_else(|why| why))
 }
 
 /// Before `tool` runs on the session thread for the connection that launched, with the agent's controls: it is at
@@ -254,14 +266,40 @@ pub(crate) fn start(session: &Session, call: &mut Call, tool: &str) -> Option<St
 
 /// Before a capture or a window (`window`: a measuring window, which also gets the config's sound cue): takes quen's
 /// notice down when it may be on screen and waits [`HIDE_WAIT`] (with a package before 0.1.15, until 9 s after the
-/// notice); `status_hide` in `timing_s` and the budget line in the result (`indicator`, [`note`]). Err, nothing to
-/// capture or measure: the game didn't confirm the hide, or the call was stopped in the wait.
+/// notice); `status_hide` in `timing_s` and the budget line in the result (`indicator`, [`note`]). A measuring call's
+/// first hide first leaves its line up until [`MEASURING_SHOWN`] after it went up (`status_shown` in `timing_s`). Err,
+/// nothing to capture or measure: the game didn't confirm the hide, or the call was stopped in a wait.
 pub(crate) fn hide(cx: &Ctx, call: &mut Call, window: bool) -> Result<(), String> {
     let st = &cx.live.status;
-    let up = st
-        .up
-        .get()
-        .filter(|(_, at, time)| at.elapsed() < *time + FADE);
+    let up = || {
+        st.up
+            .get()
+            .filter(|(_, at, time)| at.elapsed() < *time + FADE)
+    };
+    let stopped = |call: &Call, wait: Duration, what: &str| {
+        format!(
+            "{} during the {:.1} s wait for {what}: nothing captured or measured",
+            call.stop_cause(),
+            wait.as_secs_f64()
+        )
+    };
+    if let Some(at) = st.measuring_at.take()
+        && matches!(up(), Some((State::Measuring(_), ..)))
+    {
+        let rest = MEASURING_SHOWN.saturating_sub(at.elapsed());
+        if !rest.is_zero() {
+            let waited = measure::settle(call, rest, "quen's measuring line in the game");
+            call.lap("status_shown");
+            if !waited {
+                return Err(stopped(
+                    call,
+                    rest,
+                    "quen's measuring line to have been up 3 s",
+                ));
+            }
+        }
+    }
+    let up = up();
     if window {
         cue(cx, call);
     }
@@ -295,11 +333,7 @@ pub(crate) fn hide(cx: &Ctx, call: &mut Call, window: bool) -> Result<(), String
     call.lap("status_hide");
     match waited {
         true => Ok(()),
-        false => Err(format!(
-            "{} during the {:.1} s wait for quen's line in the game to be gone: nothing captured or measured",
-            call.stop_cause(),
-            wait.as_secs_f64()
-        )),
+        false => Err(stopped(call, wait, "quen's line in the game to be gone")),
     }
 }
 
@@ -342,9 +376,10 @@ pub(crate) fn cue(cx: &Ctx, call: &mut Call) {
     line(call)["sound"] = json!(played);
 }
 
-/// The session thread, between messages: a measuring call has ended, or a call came since the agent was waiting
-/// (working); the agent waiting ([`idle`]); the lasting line sent again when due. A failed send goes to the daemon's
-/// log, with the time (UTC).
+/// The session thread, between messages: lasting, the user has the controls (yours: a play session from its launch,
+/// or controls given back when its launching connection closed or a save was found); a measuring call has ended, or a
+/// call came since the agent was waiting (working); the agent waiting ([`idle`]); the lasting line sent again when
+/// due. A failed send goes to the daemon's log, with the time (UTC).
 pub(crate) fn poll(session: &Session) {
     let (Some(live), Ok(config)) = (&session.live, session.config()) else {
         return;
@@ -354,10 +389,15 @@ pub(crate) fn poll(session: &Session) {
         live,
         hands: session.shared.hands(),
     };
+    live.status.measuring_at.set(None);
     let last = session.shared.last_call();
     let state = live.status.state.get();
     let measured = matches!(state, Some(State::Measuring(_)));
-    if measured || (state == Some(State::Waiting) && last != live.idled.get()) {
+    if cx.hands == Some(Hands::User) {
+        if lasting(&cx) && state != Some(State::Yours) {
+            log(send(&cx, None, State::Yours, &mut None));
+        }
+    } else if measured || (state == Some(State::Waiting) && last != live.idled.get()) {
         log(send(&cx, None, State::Working, &mut None));
     }
     idle(&cx, last);
@@ -728,6 +768,107 @@ mod tests {
         let t = Instant::now();
         assert_eq!(hide(&cx, &mut call, false), Ok(()));
         assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+    }
+
+    /// The 0.1.15 live check: the measuring line was up 79 ms before a trace. A measuring call's first hide leaves it up
+    /// until MEASURING_SHOWN after it went up (`status_shown`); the next window's hide doesn't wait for it again; a line
+    /// up long enough already adds nothing.
+    #[test]
+    fn a_measuring_line_stays_up_3_s_before_the_call_s_first_window() {
+        let fx = served("status-shown");
+        let server = game(&fx);
+        let session = fx.session();
+        let live = session.live.as_ref().unwrap();
+        let cx = Ctx {
+            config: session.config().unwrap(),
+            live,
+            hands: Some(Hands::Agent),
+        };
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        assert!(measuring(&cx, &mut call, 40, &mut None).is_some());
+        let shown = live.status.up.get().unwrap().1;
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        assert!(
+            shown.elapsed() >= MEASURING_SHOWN + HIDE_WAIT,
+            "{:?}",
+            shown.elapsed()
+        );
+        let out = session.envelope("measure_trace", call, Done::Ok(Fields::new()));
+        assert!(
+            out["timing_s"]["status_shown"].as_f64().unwrap() >= 2.9,
+            "{out}"
+        );
+        // The next window: the line back between them, hidden without the 3 s.
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        live.status.sent.set(None);
+        assert!(tick(&cx).is_some());
+        let t = Instant::now();
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        assert!(
+            t.elapsed() < HIDE_WAIT + Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+        // A new measuring call whose line went up 3 s ago: only the hide's own wait.
+        poll(&session);
+        assert!(measuring(&cx, &mut call, 50, &mut None).is_some());
+        live.status
+            .measuring_at
+            .set(Some(Instant::now() - MEASURING_SHOWN));
+        let t = Instant::now();
+        assert_eq!(hide(&cx, &mut call, false), Ok(()));
+        assert!(
+            t.elapsed() < HIDE_WAIT + Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+        verbs(server);
+    }
+
+    /// A play session, lasting: "yours" from its launch (the session thread's first look with the user's controls), sent
+    /// again every 10 s; "agent at work" from hands_take; "yours" again whenever the user has the controls, also when
+    /// they went back without hands_give (the launching connection closed). `indicator = 'off'`: transitions only.
+    #[test]
+    fn a_play_session_shows_whose_controls_from_its_launch() {
+        let fx = served("status-play");
+        let server = game(&fx);
+        let mut session = fx.session();
+        session.live.as_mut().unwrap().play = true;
+        fx.shared.set_hands(Some(Hands::User));
+        poll(&session);
+        let live = session.live.as_ref().unwrap();
+        assert_eq!(live.status.state.get(), Some(State::Yours));
+        poll(&session);
+        live.status.sent.set(Some(Instant::now() - RESEND));
+        poll(&session);
+        // hands_take: the agent at work, until the controls go back.
+        fx.shared.set_hands(Some(Hands::Agent));
+        let agent = Ctx {
+            config: session.config().unwrap(),
+            live,
+            hands: Some(Hands::Agent),
+        };
+        assert!(set(&agent, None, State::Working).is_some());
+        poll(&session);
+        fx.shared.set_hands(Some(Hands::User));
+        poll(&session);
+        assert_eq!(
+            verbs(server),
+            [
+                lasts(State::Yours),
+                lasts(State::Yours),
+                lasts(State::Working),
+                lasts(State::Yours)
+            ]
+        );
+        let mut off = session.config().unwrap().clone();
+        off.indicator = Some(false);
+        let cx = Ctx {
+            config: &off,
+            live,
+            hands: Some(Hands::User),
+        };
+        assert!(!lasting(&cx), "indicator off: 8 s notices only");
     }
 
     /// Finding 80: a caller holding the game's only connection (sweep_play's first pose) gets the line on it; a second
