@@ -603,7 +603,7 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         Mode::Step => f64::from(path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0)) / 2.0,
     };
     // On the connection the checks opened: a second one beside it finds the ASI's pipe busy (finding 80).
-    if let Some(shown) = status::measuring(&cx, call, secs.ceil() as u64, &mut first) {
+    if let Some(shown) = status::measuring(&cx, call, secs.ceil() as u64, None, &mut first) {
         fields.insert("status".into(), json!(shown));
     }
     let pause = p.mode == Mode::Step || p.sweep.world.paused;

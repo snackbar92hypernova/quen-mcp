@@ -22,6 +22,7 @@
 //! session thread between calls ([`poll`]), a run_plan between steps, measure_ab between windows. With a package before
 //! 0.1.15 (no `notice.hide`) a capture waits until 9 s after the notice instead. A measuring call's line stays up
 //! [`MEASURING_SHOWN`] before the call's first hide, counted from when the game answered that it is up ([`measuring`]).
+//! Lasting, measure_ab's line names the state of the window that comes next, [`NEXT_SHOWN`] at least ([`next`]).
 //!
 //! Idle focus: [`IDLE`] without a call, the agent's controls, the game in front in gameplay or photo mode: quen brings
 //! that connection's client forward as `focus` to client does, unless the config's `idle_focus` is off or it can't. The
@@ -57,6 +58,12 @@ pub(crate) const HIDE_WAIT: Duration = Duration::from_millis(500);
 /// gameplay and 3 s or more in photo mode; the swap's 0.3 s fades (OverlayPopupMenu.as) explain only part, so 2 s more.
 // ponytail: the owner's eye in one boot; a live check tunes it.
 pub(crate) const MEASURING_SHOWN: Duration = Duration::from_secs(5);
+/// How long measure_ab's line naming the next window's state is up, at least, before that window's hide, counted from
+/// when the game answered that it is up ([`next`]): the owner's 3 s (2026-10-22), so their eye can be credited to a
+/// state.
+pub(crate) const NEXT_SHOWN: Duration = Duration::from_secs(3);
+/// The longest state label the line names, in bytes: measure_ab's are 1 to 40 letters, digits, _ and -.
+const LABEL_MAX: usize = 40;
 /// How often [`measuring`] sends its line again until the game answers [`ALREADY`]: past the 0.3 s fade that takes a
 /// notification on screen down before the new one shows (OverlayPopupMenu.as showNotification), which a send restarts.
 pub(crate) const CONFIRM_EVERY: Duration = Duration::from_millis(500);
@@ -74,17 +81,55 @@ const FADE: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum State {
     Working,
-    /// For about this many seconds.
-    Measuring(u64),
+    /// For about this many seconds; measure_ab's first window, lasting.
+    Measuring(u64, Option<Next>),
+    /// measure_ab's next window, lasting: sent by [`next`], never the lasting line's state.
+    Next(Next),
     Yours,
     Waiting,
+}
+
+/// measure_ab's next window, as the line names it: its state's label, which window (from 1) and of how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Next {
+    label: [u8; LABEL_MAX],
+    len: usize,
+    window: usize,
+    of: usize,
+}
+
+impl Next {
+    /// The label's printable ASCII only, cut at [`LABEL_MAX`] bytes: a notice takes no control character, and the
+    /// longest line stays within its 160 bytes.
+    pub(crate) fn new(label: &str, window: usize, of: usize) -> Next {
+        let mut next = Next {
+            label: [0; LABEL_MAX],
+            len: 0,
+            window,
+            of,
+        };
+        let bytes = label.bytes().filter(u8::is_ascii_graphic);
+        for (slot, b) in next.label.iter_mut().zip(bytes) {
+            *slot = b;
+            next.len += 1;
+        }
+        next
+    }
+}
+
+impl std::fmt::Display for Next {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let label = std::str::from_utf8(&self.label[..self.len]).unwrap_or_default();
+        write!(f, "Next: {label} (window {} of {})", self.window, self.of)
+    }
 }
 
 impl State {
     fn name(self) -> &'static str {
         match self {
             State::Working => "working",
-            State::Measuring(_) => "measuring",
+            State::Measuring(..) => "measuring",
+            State::Next(_) => "next",
             State::Yours => "yours",
             State::Waiting => "waiting",
         }
@@ -93,9 +138,13 @@ impl State {
     fn text(self) -> String {
         match self {
             State::Working => "quen: agent at work. Please keep off the mouse and keys.".into(),
-            State::Measuring(secs) => {
+            State::Measuring(secs, None) => {
                 format!("quen: measuring for about {secs} s. Hands off until it ends.")
             }
+            State::Measuring(secs, Some(next)) => {
+                format!("quen: measuring for about {secs} s. {next}. Hands off.")
+            }
+            State::Next(next) => format!("quen: measuring. {next}. Hands off."),
             State::Yours => {
                 "quen: you have the controls. Tell the agent in the chat (Alt+Tab) to take them."
                     .into()
@@ -114,8 +163,9 @@ pub(crate) struct Status {
     sent: Cell<Option<Instant>>,
     /// quen's last notice that may be on screen: its state, when it went out, its time there. None: taken down.
     up: Cell<Option<(State, Instant, Duration)>>,
-    /// When the running measuring call's line went up, until the call's first hide ([`MEASURING_SHOWN`]).
-    measuring_at: Cell<Option<Instant>>,
+    /// When the running measuring call's line went up and how long it stays, until the call's first hide
+    /// ([`MEASURING_SHOWN`]); measure_ab's next-window line, until its window's ([`NEXT_SHOWN`]).
+    measuring_at: Cell<Option<(Instant, Duration)>>,
     /// quen's package in the game, read once ([`doctor::package_version`]).
     package: OnceCell<Option<&'static str>>,
 }
@@ -215,7 +265,8 @@ fn send(
         true => before != Some(state) || st.sent.get().is_none_or(|t| t.elapsed() >= RESEND),
         false => match state {
             State::Working => cx.live.play && before == Some(State::Yours),
-            State::Measuring(secs) => secs >= MEASURING_MIN,
+            State::Measuring(secs, _) => secs >= MEASURING_MIN,
+            State::Next(_) => false,
             State::Yours | State::Waiting => true,
         },
     };
@@ -245,34 +296,67 @@ pub(crate) fn tick(cx: &Ctx) -> Option<Result<String, String>> {
 /// A measure call's, a sweep's or a run_plan's transition to measuring for about `secs`, after its checks: only with
 /// the agent's controls, and none for a run_plan's step (the plan's covers it). On `held` when the caller holds the
 /// connection (taking it), else on a connection of its own. Once sent, the line's [`MEASURING_SHOWN`] counts from when
-/// the game answered that it is up ([`confirm`]).
+/// the game answered that it is up ([`confirm`]). Lasting, it names measure_ab's first window (`next`).
 pub(crate) fn measuring(
     cx: &Ctx,
     call: &mut Call,
     secs: u64,
+    next: Option<Next>,
     held: &mut Option<Channel>,
 ) -> Option<String> {
     if cx.hands != Some(Hands::Agent) || cx.live.in_plan.get() {
         return None;
     }
-    let sent = send(cx, Some(call), State::Measuring(secs), held);
+    let next = next.filter(|_| lasting(cx));
+    let sent = send(cx, Some(call), State::Measuring(secs, next), held);
     let st = &cx.live.status;
-    if let Some((state @ State::Measuring(_), at, _)) = st.up.get() {
+    if let Some((state @ State::Measuring(..), at, _)) = st.up.get() {
         let up = match &sent {
             Some(Ok(_)) => confirm(cx, call, state),
             _ => None,
         };
-        st.measuring_at.set(Some(up.unwrap_or(at)));
+        st.measuring_at
+            .set(Some((up.unwrap_or(at), MEASURING_SHOWN)));
     }
     sent.map(|r| r.unwrap_or_else(|why| why))
 }
 
+/// measure_ab, before each window, lasting with the agent's controls: the line names the state that comes next
+/// ([`State::Next`]), and stays up [`NEXT_SHOWN`] from the game's answer that it is up ([`confirm`]), the window's apply
+/// and settle counted, until its hide ([`held`]); a measuring line still short of its time stays up until then first.
+/// Not for a first window the call's measuring line names ([`measuring`]). The sends, the answer and the waits are
+/// `status_label` in `timing_s`, summed. Otherwise, the line back for every window after the first, as [`tick`]. Err:
+/// the call was stopped in a wait.
+pub(crate) fn next(cx: &Ctx, call: &mut Call, next: Next) -> Result<(), String> {
+    let st = &cx.live.status;
+    if !lasting(cx) || cx.hands != Some(Hands::Agent) {
+        if next.window > 1 {
+            tick(cx);
+        }
+        return Ok(());
+    }
+    if matches!(st.state.get(), Some(State::Measuring(_, Some(named))) if named == next) {
+        return Ok(());
+    }
+    held(cx, call)?;
+    let state = State::Next(next);
+    let shown = show(cx, &mut None, state, true);
+    if let Some((_, at, _)) = st.up.get().filter(|(up, ..)| *up == state) {
+        let up = match shown {
+            Ok(_) => confirm(cx, call, state),
+            Err(_) => None,
+        };
+        st.measuring_at.set(Some((up.unwrap_or(at), NEXT_SHOWN)));
+    }
+    Ok(())
+}
+
 /// After `state`'s line went out: sends it again every [`CONFIRM_EVERY`], at most [`CONFIRM_TRIES`] times, until the
 /// game answers that it is up ([`ALREADY`]); when it did (`status_confirm` in `timing_s`; `status_unconfirmed` when it
-/// didn't). A replaced notification fades out before the new one fades in (0.3 s each, OverlayPopupMenu.as), and the 1
-/// to 2 s the owner missed in the 0.1.16 live check may be partly the game's: counting from its answer leaves out the
-/// fades and any lag its own state shows. None with a package before 0.1.15, which shows a text again rather than
-/// answer so.
+/// didn't; `status_label`, summed, for [`next`]'s). A replaced notification fades out before the new one fades in (0.3 s
+/// each, OverlayPopupMenu.as), and the 1 to 2 s the owner missed in the 0.1.16 live check may be partly the game's:
+/// counting from its answer leaves out the fades and any lag its own state shows. None with a package before 0.1.15,
+/// which shows a text again rather than answer so.
 fn confirm(cx: &Ctx, call: &mut Call, state: State) -> Option<Instant> {
     if old(cx) {
         return None;
@@ -292,10 +376,11 @@ fn confirm(cx: &Ctx, call: &mut Call, state: State) -> Option<Instant> {
             Err(_) => break,
         }
     }
-    call.lap(match up {
-        Some(_) => "status_confirm",
-        None => "status_unconfirmed",
-    });
+    match (state, up) {
+        (State::Next(_), _) => call.lap_sum("status_label"),
+        (_, Some(_)) => call.lap("status_confirm"),
+        (_, None) => call.lap("status_unconfirmed"),
+    }
     up
 }
 
@@ -317,41 +402,12 @@ pub(crate) fn start(session: &Session, call: &mut Call, tool: &str) -> Option<St
 
 /// Before a capture or a window (`window`: a measuring window, which also gets the config's sound cue): takes quen's
 /// notice down when it may be on screen and waits [`HIDE_WAIT`] (with a package before 0.1.15, until 9 s after the
-/// notice); `status_hide` in `timing_s` and the budget line in the result (`indicator`, [`note`]). A measuring call's
-/// first hide first leaves its line up until [`MEASURING_SHOWN`] after it went up ([`measuring`]): that wait is
-/// `status_shown` in `timing_s`, shorter by what the call did since (measure_ab's first apply and settle). Err, nothing
-/// to capture or measure: the game didn't confirm the hide, or the call was stopped in a wait.
+/// notice); `status_hide` in `timing_s` and the budget line in the result (`indicator`, [`note`]). First, [`held`].
+/// Err, nothing to capture or measure: the game didn't confirm the hide, or the call was stopped in a wait.
 pub(crate) fn hide(cx: &Ctx, call: &mut Call, window: bool) -> Result<(), String> {
+    held(cx, call)?;
     let st = &cx.live.status;
-    let up = || {
-        st.up
-            .get()
-            .filter(|(_, at, time)| at.elapsed() < *time + FADE)
-    };
-    let stopped = |call: &Call, wait: Duration, what: &str| {
-        format!(
-            "{} during the {:.1} s wait for {what}: nothing captured or measured",
-            call.stop_cause(),
-            wait.as_secs_f64()
-        )
-    };
-    if let Some(at) = st.measuring_at.take()
-        && matches!(up(), Some((State::Measuring(_), ..)))
-    {
-        let rest = MEASURING_SHOWN.saturating_sub(at.elapsed());
-        if !rest.is_zero() {
-            let waited = measure::settle(call, rest, "quen's measuring line in the game");
-            call.lap("status_shown");
-            if !waited {
-                let what = format!(
-                    "quen's measuring line to have been up {} s",
-                    MEASURING_SHOWN.as_secs()
-                );
-                return Err(stopped(call, rest, &what));
-            }
-        }
-    }
-    let up = up();
+    let up = up(st);
     if window {
         cue(cx, call);
     }
@@ -387,6 +443,52 @@ pub(crate) fn hide(cx: &Ctx, call: &mut Call, window: bool) -> Result<(), String
         true => Ok(()),
         false => Err(stopped(call, wait, "quen's line in the game to be gone")),
     }
+}
+
+/// quen's notice that may be on screen.
+fn up(st: &Status) -> Option<(State, Instant, Duration)> {
+    st.up
+        .get()
+        .filter(|(_, at, time)| at.elapsed() < *time + FADE)
+}
+
+fn stopped(call: &Call, wait: Duration, what: &str) -> String {
+    format!(
+        "{} during the {:.1} s wait for {what}: nothing captured or measured",
+        call.stop_cause(),
+        wait.as_secs_f64()
+    )
+}
+
+/// A measuring call's line, at the call's first hide or measure_ab's first next-window line, stays up until
+/// [`MEASURING_SHOWN`] after it went up ([`measuring`]); a next-window line, at its window's hide, until [`NEXT_SHOWN`]
+/// ([`next`]). The wait is
+/// `status_shown` in `timing_s` (`status_label` for a next-window line, summed), shorter by what the call did since
+/// (measure_ab's apply and settle). Err: the call was stopped in it.
+fn held(cx: &Ctx, call: &mut Call) -> Result<(), String> {
+    let st = &cx.live.status;
+    let Some((at, shown)) = st.measuring_at.take() else {
+        return Ok(());
+    };
+    let key = match up(st) {
+        Some((State::Measuring(..), ..)) => "status_shown",
+        Some((State::Next(_), ..)) => "status_label",
+        _ => return Ok(()),
+    };
+    let rest = shown.saturating_sub(at.elapsed());
+    if rest.is_zero() {
+        return Ok(());
+    }
+    let waited = measure::settle(call, rest, "quen's measuring line in the game");
+    call.lap_sum(key);
+    if waited {
+        return Ok(());
+    }
+    let what = format!(
+        "quen's measuring line to have been up {} s",
+        shown.as_secs()
+    );
+    Err(stopped(call, rest, &what))
 }
 
 /// The call's budget line (the design's §7.4): the state shown before its first hide, when the game took it down, how
@@ -445,7 +547,7 @@ pub(crate) fn poll(session: &Session) {
     live.status.measuring_at.set(None);
     let last = session.shared.last_call();
     let state = live.status.state.get();
-    let measured = matches!(state, Some(State::Measuring(_)));
+    let measured = matches!(state, Some(State::Measuring(..)));
     if cx.hands == Some(Hands::User) {
         // Transitions only, once gameplay began: a play session launched without a save is at the main menu.
         let due = || lasting(&cx) || (live.play && cx.last_flags().is_some_and(game::in_game));
@@ -588,7 +690,7 @@ mod tests {
     use super::*;
     use crate::channel::tests::{fake_game, fake_game_until, reply, served, token};
     use crate::game::tests::Fake;
-    use quen_core::protocol::Request;
+    use quen_core::protocol::{MAX_NOTICE_BYTES, Request};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
@@ -657,15 +759,15 @@ mod tests {
         live.status.sent.set(ago(RESEND));
         assert!(tick(&agent).is_some(), "10 s after: sent again");
         let user = cx(Some(Hands::User));
-        assert_eq!(measuring(&user, &mut call, 60, &mut None), None);
+        assert_eq!(measuring(&user, &mut call, 60, None, &mut None), None);
         live.in_plan.set(true);
         assert_eq!(
-            measuring(&agent, &mut call, 60, &mut None),
+            measuring(&agent, &mut call, 60, None, &mut None),
             None,
             "a plan's step"
         );
         live.in_plan.set(false);
-        let short = measuring(&agent, &mut call, 5, &mut None);
+        let short = measuring(&agent, &mut call, 5, None, &mut None);
         assert!(short.is_some(), "lasting: no 30 s floor");
         // The session thread between calls: the measuring call has ended.
         poll(&session);
@@ -684,8 +786,8 @@ mod tests {
         let want = [
             lasts(State::Working),
             lasts(State::Working),
-            lasts(State::Measuring(5)),
-            lasts(State::Measuring(5)),
+            lasts(State::Measuring(5, None)),
+            lasts(State::Measuring(5, None)),
             lasts(State::Working),
             lasts(State::Yours),
             lasts(State::Working),
@@ -709,7 +811,7 @@ mod tests {
             live,
             hands: Some(Hands::Agent),
         };
-        set(&cx, None, State::Measuring(40));
+        set(&cx, None, State::Measuring(40, None));
         let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
         let t = Instant::now();
         assert_eq!(hide(&cx, &mut call, false), Ok(()));
@@ -756,9 +858,9 @@ mod tests {
             event: "gui_global_panel_open".into(),
         };
         let want = [
-            lasts(State::Measuring(40)),
+            lasts(State::Measuring(40, None)),
             Verb::NoticeHide {},
-            lasts(State::Measuring(40)),
+            lasts(State::Measuring(40, None)),
             sound.clone(),
             Verb::NoticeHide {},
             sound,
@@ -803,8 +905,8 @@ mod tests {
         };
         let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
         assert_eq!(set(&cx, None, State::Working), None);
-        assert_eq!(measuring(&cx, &mut call, 29, &mut None), None);
-        assert!(measuring(&cx, &mut call, 30, &mut None).is_some());
+        assert_eq!(measuring(&cx, &mut call, 29, None, &mut None), None);
+        assert!(measuring(&cx, &mut call, 30, None, &mut None).is_some());
         assert!(set(&cx, None, State::Yours).is_some());
         assert!(tick(&cx).is_none(), "nothing sent again");
         assert_eq!(
@@ -818,8 +920,8 @@ mod tests {
             duration_ms: None,
         };
         let want = [
-            once(State::Measuring(30)),
-            once(State::Measuring(30)),
+            once(State::Measuring(30, None)),
+            once(State::Measuring(30, None)),
             once(State::Yours),
             Verb::NoticeHide {},
         ];
@@ -868,7 +970,7 @@ mod tests {
         };
         let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
         assert_eq!(
-            measuring(&cx, &mut call, 40, &mut None).as_deref(),
+            measuring(&cx, &mut call, 40, None, &mut None).as_deref(),
             Some("done"),
             "the first send's reply"
         );
@@ -903,10 +1005,10 @@ mod tests {
         );
         // A new measuring call whose line went up MEASURING_SHOWN ago: only the hide's own wait.
         poll(&session);
-        assert!(measuring(&cx, &mut call, 50, &mut None).is_some());
+        assert!(measuring(&cx, &mut call, 50, None, &mut None).is_some());
         live.status
             .measuring_at
-            .set(Some(Instant::now() - MEASURING_SHOWN));
+            .set(Some((Instant::now() - MEASURING_SHOWN, MEASURING_SHOWN)));
         let t = Instant::now();
         assert_eq!(hide(&cx, &mut call, false), Ok(()));
         assert!(
@@ -915,6 +1017,153 @@ mod tests {
             t.elapsed()
         );
         verbs(server);
+    }
+
+    /// The owner, 2026-10-22: measure_ab's line names each window's state. The first window's in the measuring line,
+    /// each later one's in a line of its own; a label is cut to printable ASCII and LABEL_MAX bytes, and the longest line
+    /// fits a notice.
+    #[test]
+    fn measure_ab_s_line_names_each_window_s_state() {
+        let first = State::Measuring(87, Some(Next::new("m0", 1, 4)));
+        assert_eq!(
+            first.text(),
+            "quen: measuring for about 87 s. Next: m0 (window 1 of 4). Hands off."
+        );
+        assert_eq!(
+            State::Next(Next::new("m3", 2, 4)).text(),
+            "quen: measuring. Next: m3 (window 2 of 4). Hands off."
+        );
+        let cut = Next::new(&format!("a\u{7}b é{}", "x".repeat(50)), 3, 4);
+        let want = format!("Next: ab{} (window 3 of 4)", "x".repeat(LABEL_MAX - 2));
+        assert_eq!(cut.to_string(), want);
+        // measure_ab's longest: a 40-byte label, 12 windows.
+        let longest = State::Measuring(u64::MAX, Some(Next::new(&"x".repeat(40), 12, 12)));
+        assert!(
+            longest.text().len() <= MAX_NOTICE_BYTES,
+            "{}",
+            longest.text()
+        );
+        assert_eq!(State::Next(cut).name(), "next");
+    }
+
+    /// Lasting: no line before the first window, which the measuring line names; before each later one its own line,
+    /// sent again until the game says it is up, then up NEXT_SHOWN from that answer before the window's hide
+    /// (`status_label` in `timing_s`, summed); a settle as long adds no wait. In a run_plan's step (the plan's line names
+    /// no window) window 1 gets its line too, once the plan's measuring line has been up its MEASURING_SHOWN.
+    #[test]
+    fn each_later_window_s_state_is_up_3_s_from_the_game_s_answer() {
+        let fx = served("status-next");
+        let server = game(&fx);
+        let session = fx.session();
+        let live = session.live.as_ref().unwrap();
+        let cx = Ctx {
+            config: session.config().unwrap(),
+            live,
+            hands: Some(Hands::Agent),
+        };
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let (a1, b2, a3) = (
+            Next::new("A", 1, 3),
+            Next::new("B", 2, 3),
+            Next::new("A", 3, 3),
+        );
+        assert!(measuring(&cx, &mut call, 40, Some(a1), &mut None).is_some());
+        assert_eq!(
+            next(&cx, &mut call, a1),
+            Ok(()),
+            "named by the measuring line"
+        );
+        let past = |d: Duration| Some((Instant::now() - d, d));
+        live.status.measuring_at.set(past(MEASURING_SHOWN));
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        // Window 2: no settle, so the hide waits out the 3 s.
+        assert_eq!(next(&cx, &mut call, b2), Ok(()));
+        let answered = Instant::now();
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        let up = answered.elapsed();
+        assert!(up >= NEXT_SHOWN + HIDE_WAIT, "{up:?}");
+        // Window 3: its settle took the 3 s.
+        assert_eq!(next(&cx, &mut call, a3), Ok(()));
+        live.status.measuring_at.set(past(NEXT_SHOWN));
+        let t = Instant::now();
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        let took = t.elapsed();
+        assert!(took < HIDE_WAIT + Duration::from_millis(400), "{took:?}");
+        let out = session.envelope("measure_ab", call, Done::Ok(Fields::new()));
+        let label = out["timing_s"]["status_label"].as_f64().unwrap_or(-1.0);
+        assert!(
+            (2.0 * CONFIRM_EVERY.as_secs_f64() + NEXT_SHOWN.as_secs_f64() - 0.1..5.0)
+                .contains(&label),
+            "two answers and one wait: {out}"
+        );
+        // A run_plan's step: the plan's line, 0.5 s short of its time, stays up for it, then window 1's line goes.
+        poll(&session);
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        assert!(measuring(&cx, &mut call, 90, None, &mut None).is_some());
+        live.in_plan.set(true);
+        let ago = Instant::now() - (MEASURING_SHOWN - Duration::from_millis(500));
+        live.status.measuring_at.set(Some((ago, MEASURING_SHOWN)));
+        let t = Instant::now();
+        assert_eq!(next(&cx, &mut call, a1), Ok(()));
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_millis(500) + CONFIRM_EVERY,
+            "{took:?}"
+        );
+        live.status.measuring_at.set(past(NEXT_SHOWN));
+        assert_eq!(hide(&cx, &mut call, true), Ok(()));
+        live.in_plan.set(false);
+        let want = [
+            lasts(State::Measuring(40, Some(a1))),
+            lasts(State::Measuring(40, Some(a1))),
+            Verb::NoticeHide {},
+            lasts(State::Next(b2)),
+            lasts(State::Next(b2)),
+            Verb::NoticeHide {},
+            lasts(State::Next(a3)),
+            lasts(State::Next(a3)),
+            Verb::NoticeHide {},
+            lasts(State::Working),
+            lasts(State::Measuring(90, None)),
+            lasts(State::Measuring(90, None)),
+            lasts(State::Next(a1)),
+            lasts(State::Next(a1)),
+            Verb::NoticeHide {},
+        ];
+        assert_eq!(verbs(server), want);
+    }
+
+    /// `indicator = 'off'` (and a package before 0.1.15): transitions only, as before: the measuring notice names no
+    /// window, and no line goes between windows.
+    #[test]
+    fn with_the_line_off_measure_ab_names_no_window() {
+        let fx = served("status-next-off");
+        let server = game(&fx);
+        let session = fx.session();
+        let mut config = session.config().unwrap().clone();
+        config.indicator = Some(false);
+        let cx = Ctx {
+            config: &config,
+            live: session.live.as_ref().unwrap(),
+            hands: Some(Hands::Agent),
+        };
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let shown = measuring(&cx, &mut call, 30, Some(Next::new("A", 1, 4)), &mut None);
+        assert!(shown.is_some());
+        let t = Instant::now();
+        assert_eq!(next(&cx, &mut call, Next::new("B", 2, 4)), Ok(()));
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+        let out = session.envelope("measure_ab", call, Done::Ok(Fields::new()));
+        assert!(out["timing_s"].get("status_label").is_none(), "{out}");
+        let once = Verb::Notice {
+            text: State::Measuring(30, None).text(),
+            duration_ms: None,
+        };
+        assert_eq!(verbs(server), [once.clone(), once]);
     }
 
     /// A game that never answers "notice already shown": the line goes CONFIRM_TRIES times more
@@ -935,7 +1184,7 @@ mod tests {
         };
         let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
         let t = Instant::now();
-        assert!(measuring(&cx, &mut call, 40, &mut None).is_some());
+        assert!(measuring(&cx, &mut call, 40, None, &mut None).is_some());
         assert_eq!(hide(&cx, &mut call, false), Ok(()));
         let took = t.elapsed();
         assert!(
@@ -1072,7 +1321,7 @@ mod tests {
             hands: Some(Hands::Agent),
         };
         let mut held = Some(cx.channel().unwrap());
-        let shown = measuring(&cx, &mut call, 30, &mut held);
+        let shown = measuring(&cx, &mut call, 30, None, &mut held);
         assert_eq!(shown.as_deref(), Some("notice shown"));
         assert!(held.is_none(), "the held connection carried it");
         assert_eq!(server.join().unwrap().len(), 1);

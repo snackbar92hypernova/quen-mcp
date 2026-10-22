@@ -730,7 +730,7 @@ fn presentmon(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
     let quiet = quiet(flag(args, "strict")?, skewed(&cx))?;
     let back = game_back(&cx, call)?;
     call.lap("check");
-    let line = status::measuring(&cx, call, secs.into(), &mut None);
+    let line = status::measuring(&cx, call, secs.into(), None, &mut None);
     let front = match cx.hands {
         Some(Hands::User) => Some(in_front(&cx, call)?),
         _ => None,
@@ -1043,7 +1043,7 @@ fn trace_window(session: &Session, call: &mut Call, args: &Value) -> Result<Fiel
     let server = trace_ready(&cx, sampler.needs_ids(), "measure_trace")?;
     let back = game_back(&cx, call)?;
     call.lap("check");
-    let line = status::measuring(&cx, call, secs.into(), &mut None);
+    let line = status::measuring(&cx, call, secs.into(), None, &mut None);
     let from = crate::win::tick();
     let (_, sampled) =
         measure(&cx, call, None, Some((&sampler, server)), secs, None).map_err(Done::Refused)?;
@@ -1226,9 +1226,13 @@ impl Run {
         })
     }
 
-    /// About how long the run takes, in seconds: its settles and windows, [`WINDOW_S`] a window, and the toggles of each
-    /// switch of state and of the switch back at the end (a console line typed unless `exec`).
-    fn secs(&self, exec: bool) -> f64 {
+    /// About how long the run takes, in seconds: its settles and windows, [`WINDOW_S`] a window, the line naming the next
+    /// window's state (status::next: the game's answer, one status::CONFIRM_EVERY, and what the settle leaves of
+    /// status::NEXT_SHOWN) before each window but the first, whose state the measuring line names, or before every one
+    /// in a `plan` (the plan's line names none), and the toggles of each switch of state and of the switch back at the
+    /// end (a console line typed unless `exec`).
+    // ponytail: those waits counted with the line off too (0.5 s or more a window over); pass that in if it matters.
+    fn secs(&self, exec: bool, plan: bool) -> f64 {
         let toggles = |s: usize| -> f64 {
             let each = |a: &Action| match a {
                 Action::Console { .. } if !exec => CONSOLE_S,
@@ -1251,7 +1255,10 @@ impl Run {
             true => toggles(self.order[0]),
             false => 0.0,
         };
-        self.order.len() as f64 * window + switches + back
+        let label = status::CONFIRM_EVERY.as_secs_f64()
+            + (status::NEXT_SHOWN.as_secs_f64() - self.settle.as_secs_f64()).max(0.0);
+        let labels = self.order.len() - usize::from(!plan);
+        self.order.len() as f64 * window + labels as f64 * label + switches + back
     }
 
     /// The sampler window `i` (0-based) runs, if any.
@@ -1284,7 +1291,7 @@ impl Run {
 /// measure_ab's checks of `args` that need no game (states, order, settle, secs, trace), and about how long it runs
 /// ([`Run::secs`]; `exec`: its console lines go as exec verbs): run_plan's check and estimate of a measure_ab step.
 pub(crate) fn ab_secs(args: &Value, exec: bool) -> Result<f64, String> {
-    Run::parse(args).map(|run| run.secs(exec))
+    Run::parse(args).map(|run| run.secs(exec, true))
 }
 
 /// A result field as plain text.
@@ -1396,7 +1403,9 @@ fn ab(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> 
     }
     let back = game_back(&cx, call)?;
     call.lap("check");
-    let line = status::measuring(&cx, call, run.secs(exec).ceil() as u64, &mut None);
+    let first = status::Next::new(&run.states[run.order[0]].0, 1, run.order.len());
+    let secs = run.secs(exec, false).ceil() as u64;
+    let line = status::measuring(&cx, call, secs, Some(first), &mut None);
     // From the first action on, every exit path restores (step 4).
     let mut windows = Vec::new();
     let mut entered = run.order[0];
@@ -1586,10 +1595,9 @@ fn windows_of(
                 "stopped before {at} (a cancel, or quen shutting down)"
             ));
         }
-        // The status line, taken down for the window before, is back for this one's apply and settle.
-        if i > 0 {
-            status::tick(cx);
-        }
+        // The status line, taken down for the window before, is back for this one's apply and settle, naming its state.
+        status::next(cx, call, status::Next::new(label, i + 1, run.order.len()))
+            .map_err(|why| format!("{at}: {why}"))?;
         // Toggles run only on a switch; the first window measures the game as it is.
         let switch = i > 0 && *entered != s;
         let apply = SystemTime::now();
@@ -2535,6 +2543,78 @@ fn main() {
         assert!(
             out["timing_s"]["status_hide"].as_f64().unwrap() >= 0.5,
             "{out}"
+        );
+    }
+
+    /// The owner, 2026-10-22: before each A/B window the line names its state, window 1's in the measuring line (whose
+    /// estimate counts the later lines' waits), each later one after the window before; every one is up NEXT_SHOWN or
+    /// more from the game's answer, and taken down before its window starts.
+    #[test]
+    fn each_ab_window_s_state_is_named_before_its_hide() {
+        let fx = served("ab-labels");
+        fake_presentmon(&fx);
+        fx.shared.set_hands(Some(Hands::Agent));
+        let calls = fx.dir.join("harness/calls.txt");
+        // Per notice and hide: its text ("hide"), the windows started by then, when the game had it.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let up = std::sync::Mutex::new(None);
+        let answer = Box::new(move |r: &Request| {
+            let windows = fs::read_to_string(&calls).map_or(0, |c| c.lines().count());
+            let mut up = up.lock().unwrap();
+            let (what, says) = match &r.verb {
+                Verb::Notice { text, .. } if up.as_ref() == Some(text) => {
+                    (text.clone(), status::ALREADY)
+                }
+                Verb::Notice { text, .. } => {
+                    *up = Some(text.clone());
+                    (text.clone(), "notice shown")
+                }
+                Verb::NoticeHide {} => {
+                    *up = None;
+                    ("hide".into(), "done")
+                }
+                _ => return vec![reply(r.id, true, "done", None)],
+            };
+            log.lock().unwrap().push((what, windows, Instant::now()));
+            vec![reply(r.id, true, says, None)]
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = fake_game_until(&token(&fx), answer, stop.clone());
+        let mut args = ab_args(json!(["A", "B", "A", "B"]));
+        args["states"][0]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 20}]);
+        args["states"][1]["actions"] = json!([{"cvar": "QuenTest/FrameMs", "set": 23}]);
+        let out = fx.run("measure_ab", args);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        // 4 windows of 0 + 1 + 0.5 + 0.5 s, and 3 lines of 0.5 + 3 s: 18.5.
+        let first = "quen: measuring for about 19 s. Next: A (window 1 of 4). Hands off.";
+        let next =
+            |l: &str, n: usize| format!("quen: measuring. Next: {l} (window {n} of 4). Hands off.");
+        let seen = seen.lock().unwrap();
+        let mut want = Vec::new();
+        for (n, text) in [
+            (0, first.to_string()),
+            (1, next("B", 2)),
+            (2, next("A", 3)),
+            (3, next("B", 4)),
+        ] {
+            want.extend([(text.clone(), n), (text, n), ("hide".to_string(), n)]);
+        }
+        let got: Vec<(String, usize)> = seen.iter().map(|(w, n, _)| (w.clone(), *n)).collect();
+        assert_eq!(
+            got, want,
+            "each window's line, then its hide, then the window"
+        );
+        for k in [1, 2, 3] {
+            let up = seen[3 * k + 2].2 - seen[3 * k + 1].2;
+            assert!(up >= status::NEXT_SHOWN, "window {}: up {up:?}", k + 1);
+        }
+        let label = out["timing_s"]["status_label"].as_f64().unwrap_or(-1.0);
+        assert!(
+            label >= 3.0 * (0.5 + 2.0),
+            "three answers and waits, summed: {out}"
         );
     }
 
