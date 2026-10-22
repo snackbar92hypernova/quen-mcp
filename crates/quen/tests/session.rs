@@ -1542,9 +1542,9 @@ fn a_launch_whose_natives_failed_ends_before_any_key() {
     assert_eq!(rows[0][0], "failed");
 }
 
-/// quen works the same with the W3 Game State Bridge installed (for RenoDX) and without it: it reads
-/// nothing the bridge writes (here its log says "loading" at every push quen's state makes: see FAKE_SCRIPT), needs it
-/// for no tool, and never parks either half of it, even under ALL.
+/// quen works the same with the W3 Game State Bridge installed and without it: it reads nothing the bridge writes (here
+/// its log says "loading" at every push quen's state makes: see FAKE_SCRIPT) and needs it for no tool. Kept beside ALL
+/// here, so it loads.
 #[test]
 fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
     let run = |bridge: bool| {
@@ -1570,7 +1570,11 @@ fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
             .map(|d| d["name"].as_str().unwrap())
             .collect();
         assert!(!names.iter().any(|n| n.contains("Game State")), "{names:?}");
-        let launched = launch_with(&mut quen, json!({"save": "ManualSave_old", "park": "ALL"}));
+        let mut spec = json!({"save": "ManualSave_old", "park": "ALL"});
+        if bridge {
+            spec["keep"] = json!("W3GameStateBridge.asi,modW3GameStateBridge");
+        }
+        let launched = launch_with(&mut quen, spec);
         let token = launched["token"].clone();
         for part in W3GSB.iter().filter(|_| bridge) {
             assert!(fx.path("game").join(part).exists(), "{part} was parked");
@@ -1669,8 +1673,9 @@ fn an_unknown_build_is_refused_unless_allowed() {
     assert_eq!(row[4], launched["game_build"]["stamp"]);
 }
 
-/// The W3 Game State Bridge is parked both halves or neither. One half alone is refused before anything changes;
-/// both named are parked for the session and given back at its end.
+/// The W3 Game State Bridge is parked both halves or neither, its pair learned from its files like any other. One half
+/// alone is refused before anything changes; ALL plans both; both named are parked for the session and given back at
+/// its end.
 #[test]
 fn the_w3_game_state_bridge_is_parked_only_as_a_pair() {
     let fx = Fixture::new();
@@ -1692,6 +1697,19 @@ fn the_w3_game_state_bridge_is_parked_only_as_a_pair() {
         );
     }
     fx.assert_restored();
+    let all = quen.tool("session_plan", json!({"park": "ALL"}));
+    assert_eq!(
+        all["park"]["pairs"],
+        json!([["modW3GameStateBridge", "W3GameStateBridge.asi"]]),
+        "{all}"
+    );
+    let parks: Vec<&str> = all["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str().filter(|c| c.contains("GameStateBridge")))
+        .collect();
+    assert_eq!(parks.len(), 2, "{all}");
     let launched = launch_with(
         &mut quen,
         json!({"park": "W3GameStateBridge.asi,modW3GameStateBridge"}),

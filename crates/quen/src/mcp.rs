@@ -843,7 +843,7 @@ pub(crate) fn tools() -> Value {
                         "additionalProperties": false,
                     },
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
-                    "park": {"type": "string", "description": "comma names or ALL: a Mods folder, bin file, Vortex mod (nexus:<id> or name) or its file; never the Native Bridge, quen's package; a script folder and its imports' binary only together, ALL takes both (not the W3 Game State Bridge's)"},
+                    "park": {"type": "string", "description": "comma names or ALL: a Mods folder, bin file, Vortex mod (nexus:<id> or name) or its file; never the Native Bridge, quen's package; a script folder and its imports' binary only together, both taken by ALL"},
                     "keep": {"type": "string", "description": "names as in park, kept"},
                     "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session, a mod menu's .xml into bin\\config\\r4game\\user_config_matrix\\pc; one there of that name is parked first. The end recycles them and each bin copy's new <stem>.log"},
                     "stage_mods": {"type": "array", "items": {"type": "string"}, "description": "mod folders (absolute paths) copied into Mods, as stage into bin"},

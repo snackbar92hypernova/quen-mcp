@@ -21,10 +21,6 @@ pub const W3_NEVER_PARK: &[&str] = &[
     "modQuen",
 ];
 
-/// The pair `ALL` leaves loaded: the W3 Game State Bridge, which the RenoDX add-on reads the game's state from. Named
-/// both, it parks; named one, it is refused, as any pair.
-pub const W3_ALL_SKIPS: [&str; 2] = ["W3GameStateBridge.asi", "modW3GameStateBridge"];
-
 /// The request word for every parkable mod.
 const ALL: &str = "ALL";
 
@@ -274,8 +270,8 @@ enum Target<'a> {
 /// (`nexus:<id>`, its name, its manager's folder: all its units, less those kept), else a managed mod's unit by its
 /// file or folder name. `ALL` is every Mods folder, every such bin file and every managed unit that is not a link,
 /// minus `keep` (a comma list of the same names), `never_park` (and every unit of a managed mod holding such a name),
-/// [`W3_ALL_SKIPS`], unsettled folders and their candidates, both halves of each of `pairs` it can't take whole, and
-/// the names listed explicitly, which keep their own place in the order. A bin `<stem>.ini` that `ALL` or a unit takes
+/// unsettled folders and their candidates, both halves of each of `pairs` it can't take whole, and the names listed
+/// explicitly, which keep their own place in the order. A bin `<stem>.ini` that `ALL` or a unit takes
 /// stays while its `<stem>` binary does.
 /// A Mods folder parked takes along the folder Script Merger merged it into. Refuses the whole plan on a bad, unknown,
 /// repeated or never-park name, a link, a name both requested and kept, one half of a pair, an unsettled folder or
@@ -452,7 +448,6 @@ pub fn plan<'a>(
         .iter()
         .flat_map(|u| std::iter::once(&u.folder).chain(&u.candidates))
         .map(String::as_str)
-        .chain(W3_ALL_SKIPS)
         .collect();
     let mut moves: Vec<Item> = Vec::new();
     if let Some(at) = all_at {
@@ -931,19 +926,28 @@ mod tests {
         let moves = run("ALL", "").unwrap();
         let want = [
             pair("GAME/Mods/modAlpha", "PARK/Mods/modAlpha"),
+            pair(
+                "GAME/Mods/modW3GameStateBridge",
+                "PARK/Mods/modW3GameStateBridge",
+            ),
             pair("GAME/Mods/modZeta", "PARK/Mods/modZeta"),
             pair("GAME/bin/x64/dxgi.dll", "PARK/bin/dxgi.dll"),
             pair("GAME/bin/x64/renodx.ADDON64", "PARK/bin/renodx.ADDON64"),
             pair("GAME/bin/x64/Tweaks.asi", "PARK/bin/Tweaks.asi"),
+            pair(
+                "GAME/bin/x64/W3GameStateBridge.asi",
+                "PARK/bin/W3GameStateBridge.asi",
+            ),
         ];
         assert_eq!(moves, want);
         let moves = run("ALL", "MODZETA, dxgi.dll, modQuen").unwrap();
-        assert_eq!(moves, [want[0].clone(), want[3].clone(), want[4].clone()]);
+        let kept = [0, 1, 4, 5, 6].map(|i| want[i].clone());
+        assert_eq!(moves, kept);
     }
 
     #[test]
     fn explicit_names_beside_all_keep_their_place_once() {
-        let moves = run("tweaks.asi,ALL,modZeta", "modAlpha").unwrap();
+        let moves = run("tweaks.asi,ALL,modZeta", "modAlpha,modW3GameStateBridge").unwrap();
         let want = [
             pair("GAME/bin/x64/Tweaks.asi", "PARK/bin/Tweaks.asi"),
             pair("GAME/bin/x64/dxgi.dll", "PARK/bin/dxgi.dll"),
@@ -969,6 +973,7 @@ mod tests {
         assert_eq!(W3_NEVER_PARK.len(), 4);
     }
 
+    /// The W3 Game State Bridge's pair, as any learned pair: both or neither by name, both by ALL.
     #[test]
     fn a_pair_is_parked_both_or_neither() {
         let both = [
@@ -1005,7 +1010,7 @@ mod tests {
             "W3GameStateBridge.asi".into(),
         );
         assert_eq!(run("modAlpha,w3gamestatebridge.asi", ""), Err(asi.clone()));
-        assert_eq!(run("ALL,modW3GameStateBridge", ""), Err(script.clone()));
+        assert_eq!(run("modW3GameStateBridge", ""), Err(script.clone()));
         assert_eq!(
             run("ALL,W3GameStateBridge.asi", "modW3GameStateBridge"),
             Err(asi.clone())
@@ -1016,17 +1021,20 @@ mod tests {
             ),
             "{script}"
         );
-        // ALL takes neither half, whatever keep says, unless both are named.
+        // ALL takes both halves, as any pair; with one half kept it takes neither.
         let all = run("ALL", "").unwrap();
+        assert!(all.contains(&both[0]) && all.contains(&both[1]), "{all:?}");
+        let kept = run("ALL", "modW3GameStateBridge").unwrap();
+        assert_eq!(kept.len(), all.len() - 2, "{kept:?}");
         assert!(
-            !all.iter().any(|m| m.0.contains("GameStateBridge")),
-            "{all:?}"
+            !kept.iter().any(|m| m.0.contains("GameStateBridge")),
+            "{kept:?}"
         );
-        assert_eq!(run("ALL", "modW3GameStateBridge").unwrap(), all);
         assert_eq!(run("ALL", "MODZETA").unwrap().len(), all.len() - 1);
+        // Named beside ALL: the same moves, the named ones in their place.
         let mut with_pair = run("ALL,modW3GameStateBridge,W3GameStateBridge.asi", "").unwrap();
-        assert_eq!(with_pair.split_off(all.len()), both);
-        assert_eq!(with_pair, all);
+        assert_eq!(with_pair.split_off(all.len() - 2), both);
+        assert_eq!(with_pair, kept);
         // Both named: each half is still checked on its own.
         assert_eq!(
             run(
@@ -1458,61 +1466,6 @@ mod tests {
                 Err(ParkError::NeverPark(name.into()))
             );
         }
-    }
-
-    /// The owner's rule: what ALL parked before learned pairs it still parks; the W3 Game State Bridge is the one pair it
-    /// leaves (RenoDX reads it), which parks named whole and is refused named by half.
-    #[test]
-    fn all_leaves_the_game_state_bridge_and_parks_other_pairs_whole() {
-        let (mut mods, mut bin) = game();
-        mods.push(dir("modWorld"));
-        bin.push(file("World.asi"));
-        let pairs: &[[&str; 2]] = &[GSB[0], ["modWorld", "World.asi"]];
-        let run = |requested: &str, keep: &str| {
-            let plan = plan(
-                requested,
-                keep,
-                W3_NEVER_PARK,
-                pairs,
-                Listing {
-                    dir: Path::new("GAME/Mods"),
-                    entries: &mods,
-                },
-                Listing {
-                    dir: Path::new("GAME/bin/x64"),
-                    entries: &bin,
-                },
-                Path::new("PARK"),
-                &More::default(),
-            )?;
-            let names = plan
-                .moves
-                .iter()
-                .map(|m| m.from.file_name().unwrap().to_string_lossy().into_owned());
-            Ok::<Vec<String>, ParkError>(names.collect())
-        };
-        let all = run("ALL", "").unwrap();
-        assert!(
-            all.contains(&"modWorld".into()) && all.contains(&"World.asi".into()),
-            "{all:?}"
-        );
-        assert!(
-            !all.iter().any(|n| n.contains("GameStateBridge")),
-            "{all:?}"
-        );
-        let both = run("ALL,W3GameStateBridge.asi,modW3GameStateBridge", "").unwrap();
-        assert_eq!(both.len(), all.len() + 2);
-        assert_eq!(
-            run("ALL,modW3GameStateBridge", ""),
-            Err(ParkError::Half(
-                "modW3GameStateBridge".into(),
-                "W3GameStateBridge.asi".into()
-            ))
-        );
-        assert_eq!(
-            run("World.asi", ""),
-            Err(ParkError::Half("World.asi".into(), "modWorld".into()))
-        );
     }
 
     #[test]

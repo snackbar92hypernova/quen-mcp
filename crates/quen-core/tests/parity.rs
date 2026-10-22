@@ -405,10 +405,10 @@ const BIN: &[(&str, &str)] = &[
     ("renodx-thewitcher3remastered.addon64", "file"),
     ("renodx-devkit.addon64", "file"),
 ];
-/// The harness's own names it never parks (W3_PARK_RENODX unset): what the adapter adds to `W3_NEVER_PARK` (park.rs).
 /// The W3 Game State Bridge's pair, as quen learns it from the files (park::learn): the harness never parks it.
 const GSB: &[[&str; 2]] = &[["W3GameStateBridge.asi", "modW3GameStateBridge"]];
 
+/// The harness's own names it never parks (W3_PARK_RENODX unset): what the adapter adds to `W3_NEVER_PARK` (park.rs).
 const HARNESS_OWN: &[&str] = &[
     "modRenoDXTest",
     "renodx-devkit.addon64",
@@ -452,6 +452,7 @@ fn park_plans() {
     let kept = "Python parks a name both requested and kept, Rust refuses";
     let quen = "Python predates quen's own mods";
     let link = "Python skips a junction in Mods but refuses the plan for any other link, Rust skips every link";
+    let bridge = "quen's ALL parks the W3GSB pair whole (learned from the files); the harness never parks it";
     let cases = vec![
         c("one_name", MODS, BIN, "modAlpha", "", None),
         c(
@@ -462,15 +463,22 @@ fn park_plans() {
             "",
             None,
         ),
-        c("all", MODS, BIN, "ALL", "", None),
-        c("all_keep", MODS, BIN, "ALL", "MODZETA, dxgi.dll", None),
+        c("all", MODS, BIN, "ALL", "", Some(bridge)),
+        c(
+            "all_keep",
+            MODS,
+            BIN,
+            "ALL",
+            "MODZETA, dxgi.dll",
+            Some(bridge),
+        ),
         c(
             "names_beside_all",
             MODS,
             BIN,
             "tweaks.asi,ALL,modZeta",
             "modAlpha",
-            None,
+            Some(bridge),
         ),
         c(
             "bridge_named",
@@ -595,7 +603,7 @@ fn park_plans() {
             BIN,
             "ALL",
             "modb\u{c9}ta",
-            None,
+            Some(bridge),
         ),
         c(
             "space_kept_under_all",
@@ -603,7 +611,7 @@ fn park_plans() {
             &spaced_bin,
             "ALL",
             "mod Spaced,My Tweaks.asi",
-            None,
+            Some(bridge),
         ),
         c("symlink_folder_named", &link_mods, BIN, "modSym", "", None),
         c(
@@ -1760,7 +1768,9 @@ fn boot_files_and_restore() {
                 "ToneMapPeakNits=800.5",
                 "+DevNew=0.1",
             ],
-            None,
+            Some(
+                "quen's ALL parks the W3GSB pair whole (learned from the files); the harness never parks it",
+            ),
         ),
         c(
             "keep_fg",

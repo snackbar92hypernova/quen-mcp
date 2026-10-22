@@ -50,8 +50,7 @@ pub const HARNESS_PARKED: &str = "mods_parked_by_harness";
 
 /// The names never parked, as the harness's `park_names` keeps them: the Native Bridge and quen's own package,
 /// the harness's test mod and the RenoDX devkit always, and our RenoDX add-on unless `park_renodx` (W3_PARK_RENODX=1).
-/// The W3 Game State Bridge is parked both halves or neither (its pair is learned from the files, [`pairs`]), and `ALL`
-/// leaves it (`park::W3_ALL_SKIPS`).
+/// A script folder and the binary it imports from park both or neither ([`pairs`]).
 pub fn never_park(park_renodx: bool) -> Vec<&'static str> {
     let mut names = park::W3_NEVER_PARK.to_vec();
     names.extend(["modRenoDXTest", "renodx-devkit.addon64"]);
