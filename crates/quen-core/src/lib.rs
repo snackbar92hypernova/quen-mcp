@@ -17,6 +17,7 @@ pub mod ledger; // SQLite schema, migrations, ingest, doc-reference scanner, har
 pub mod map; // world_map: the grid's classes, clearance, chokepoints, regions and edges, trace heat layers, profiles, walkers, the picture
 pub mod mem; // live-memory reads, scans, pointer chains, struct walks and patch plans (the Windows layer reads and writes)
 pub mod mods; // mod fingerprints (content and config hashes), the mod-set hash and diff
+pub mod ngfx; // Nsight Graphics captures: the shader decoder, the metadata cleaner, the counts, the perf CSV
 pub mod park; // park planner and never-park list
 pub mod protocol; // command-channel JSON lines
 pub mod reshade; // ReShade-style ini edits, byte-identical to the harness's ini_writer

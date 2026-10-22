@@ -229,7 +229,7 @@ param(
                     $g
                 })
             $groups += [pscustomobject]@{
-                matcher = '^mcp__quen__(session_launch|game_save|hands_take|mem_patch_instances|capture_clean)$'
+                matcher = '^mcp__quen__(session_launch|game_save|hands_take|mem_patch_instances|capture_clean|ngfx_replay)$'
                 hooks   = @([pscustomobject]@{ type = 'command'; command = $quen; args = @('focus', '--to', 'client'); timeout = 5 })
             }
             # In place, so the other hooks keep their order.

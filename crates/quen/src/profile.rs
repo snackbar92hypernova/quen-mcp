@@ -963,7 +963,7 @@ pub(crate) fn ngfx_args(args: &str) -> Result<(), String> {
 
 /// Arguments in one string: split at whitespace, but not inside double quotes, which are dropped
 /// (`--architecture "A B"` is two arguments).
-fn words(s: &str) -> Vec<String> {
+pub(crate) fn words(s: &str) -> Vec<String> {
     let (mut out, mut word, mut quoted) = (Vec::new(), None::<String>, false);
     for c in s.chars() {
         match c {

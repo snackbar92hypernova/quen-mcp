@@ -168,11 +168,22 @@ impl Job {
         cwd: &Path,
         log: &File,
     ) -> io::Result<Child> {
+        self.spawn_split(argv, env, cwd, (log, log))
+    }
+
+    /// [`Job::spawn`] with stdout to `out.0` (a pipe, say) and stderr to `out.1`.
+    pub fn spawn_split(
+        &self,
+        argv: &[String],
+        env: &[(&str, &str)],
+        cwd: &Path,
+        out: (&File, &File),
+    ) -> io::Result<Child> {
         let pi = create(
             argv,
             env,
             cwd,
-            log,
+            out,
             CREATE_SUSPENDED | CREATE_NO_WINDOW,
             false,
         )?;
@@ -248,23 +259,27 @@ impl Drop for Job {
 static DESKTOP_APP_INSIDE: u32 = 2;
 
 /// CreateProcessW for `argv` with `flags`, its environment [`CHILD_ENV`] plus `env` (`QUEN_*` only for `quen`, quen's
-/// own daemon): stdin NUL, stdout and stderr `out`, and no other handle inherited. The caller owns the returned process
-/// and thread handles.
+/// own daemon): stdin NUL, stdout `out.0` and stderr `out.1`, and no other handle inherited. The caller owns the
+/// returned process and thread handles.
 fn create(
     argv: &[String],
     env: &[(&str, &str)],
     cwd: &Path,
-    out: &File,
+    out: (&File, &File),
     flags: u32,
     quen: bool,
 ) -> io::Result<PROCESS_INFORMATION> {
     let mut cmd = command_line(argv)?;
     let env = env_block(env, quen)?;
     let cwd = wide(cwd.as_os_str())?;
-    // Fresh handles, inheritable, and named in the handle list: the child gets exactly these two.
+    // Fresh handles, inheritable, and named in the handle list: the child gets exactly these three.
     let nul = File::open("NUL")?;
-    let out = out.try_clone()?;
-    let handles = [nul.as_raw_handle(), out.as_raw_handle()];
+    let (out, err) = (out.0.try_clone()?, out.1.try_clone()?);
+    let handles = [
+        nul.as_raw_handle(),
+        out.as_raw_handle(),
+        err.as_raw_handle(),
+    ];
     // SAFETY: every pointer passed lives until CreateProcessW returns; the attribute list is deleted after it.
     unsafe {
         for handle in handles {
@@ -284,7 +299,7 @@ fn create(
         info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         info.StartupInfo.hStdInput = handles[0];
         info.StartupInfo.hStdOutput = handles[1];
-        info.StartupInfo.hStdError = handles[1];
+        info.StartupInfo.hStdError = handles[2];
         info.lpAttributeList = list;
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
         let created = check(UpdateProcThreadAttribute(
@@ -338,7 +353,7 @@ pub fn spawn_detached(
     out: &File,
     flags: u32,
 ) -> io::Result<Child> {
-    let pi = create(argv, env, cwd, out, flags, true)?;
+    let pi = create(argv, env, cwd, (out, out), flags, true)?;
     // SAFETY: the thread handle CreateProcessW returned, closed once.
     unsafe { CloseHandle(pi.hThread) };
     Ok(Child {

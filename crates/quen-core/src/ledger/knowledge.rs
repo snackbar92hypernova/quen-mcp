@@ -673,6 +673,135 @@ impl Ledger {
     }
 }
 
+/// A capture row as the extraction tools read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureRef {
+    pub id: i64,
+    pub boot_id: Option<i64>,
+    /// Relative to the capture root, `/` separators.
+    pub path: String,
+    pub sha256: String,
+    pub bytes: i64,
+    pub kind: String,
+    /// `capture_clean` took its file.
+    pub removed: bool,
+}
+
+/// One answer under a profile quen defines itself (ngfx-replay's flags, quen's shader decoder), as
+/// [`Ledger::add_extraction`] keeps it; its params are `{}`.
+#[derive(Debug, Clone)]
+pub struct Extraction<'a> {
+    pub tool: &'a str,
+    pub tool_version: Option<&'a str>,
+    /// `{id, name}`; the version goes in `tool_version`, so an update doesn't miss the cache.
+    pub provider: Value,
+    /// Everything the answer depends on: the exact flags, the decoder's revision.
+    pub parameters: Value,
+    pub target_sha256: &'a str,
+    pub operation: &'a str,
+    /// Of the output file.
+    pub result_sha256: &'a str,
+    /// The output file's capture row.
+    pub capture_id: i64,
+}
+
+/// The digest of a profile quen defines itself: the sha256 of the canonical JSON of its tool, provider and parameters.
+pub fn profile_digest(tool: &str, provider: &Value, parameters: &Value) -> String {
+    let profile = json!({"parameters": parameters, "provider": provider, "tool": tool});
+    sha256_hex(canonical(&profile).as_bytes())
+}
+
+impl Extraction<'_> {
+    /// Its cache key ([`extraction_key`]).
+    pub fn key(&self) -> String {
+        let digest = profile_digest(self.tool, &self.provider, &self.parameters);
+        extraction_key(self.target_sha256, &digest, self.operation, &json!({}))
+    }
+}
+
+impl Ledger {
+    /// The capture row `id`, else the one at `path` (relative to the capture root, either separator, any case).
+    pub fn capture_ref(&self, id: Option<i64>, path: Option<&str>) -> Result<Option<CaptureRef>> {
+        let path = path.map(|p| p.replace('\\', "/"));
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, boot_id, path, sha256, bytes, kind, removed_at IS NOT NULL FROM captures
+                 WHERE id = ?1 OR lower(path) = lower(?2) ORDER BY id = ?1 DESC LIMIT 1",
+                params![id, path],
+                |r| {
+                    Ok(CaptureRef {
+                        id: r.get(0)?,
+                        boot_id: r.get(1)?,
+                        path: r.get(2)?,
+                        sha256: r.get(3)?,
+                        bytes: r.get(4)?,
+                        kind: r.get(5)?,
+                        removed: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The newest extraction under `key` whose output file is still on disk (its capture row not removed): its id and
+    /// that row.
+    pub fn extraction_hit(&self, key: &str) -> Result<Option<(i64, CaptureRef)>> {
+        let hit: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT x.id, x.capture_id FROM extractions x JOIN captures c ON c.id = x.capture_id
+                 WHERE x.key_sha256 = ?1 AND c.removed_at IS NULL ORDER BY x.id DESC LIMIT 1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, capture)) = hit else {
+            return Ok(None);
+        };
+        Ok(self.capture_ref(Some(capture), None)?.map(|c| (id, c)))
+    }
+
+    /// Adds `x`, and its profile if new; its id.
+    pub fn add_extraction(&mut self, x: &Extraction) -> Result<i64> {
+        let digest = profile_digest(x.tool, &x.provider, &x.parameters);
+        self.atomic(|l| {
+            l.conn.execute(
+                "INSERT INTO extraction_profiles (digest, tool, provider, parameters) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT DO NOTHING",
+                params![digest, x.tool, canonical(&x.provider), canonical(&x.parameters)],
+            )?;
+            l.conn.execute(
+                &format!(
+                    "INSERT INTO extractions (tool, tool_version, target_sha256, profile_digest, operation, params,
+                       key_sha256, result_sha256, capture_id, t)
+                     VALUES (?1, ?2, ?3, ?4, ?5, '{{}}', ?6, ?7, ?8, {NOW})"
+                ),
+                params![
+                    x.tool,
+                    x.tool_version,
+                    x.target_sha256,
+                    digest,
+                    x.operation,
+                    x.key(),
+                    x.result_sha256,
+                    x.capture_id
+                ],
+            )?;
+            Ok(l.conn.last_insert_rowid())
+        })
+    }
+
+    /// Sets capture `id`'s `frame_state`, if it has none yet.
+    pub fn fill_frame_state(&mut self, id: i64, state: &Map<String, Value>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE captures SET frame_state = ?1 WHERE id = ?2 AND frame_state IS NULL",
+            params![Value::Object(state.clone()).to_string(), id],
+        )?;
+        Ok(())
+    }
+}
+
 /// A TSV cell: tab, line breaks and backslash escaped.
 fn cell(text: &str) -> String {
     text.replace('\\', r"\\")
@@ -693,6 +822,57 @@ mod tests {
         let key = |p: &Value| extraction_key(&"a".repeat(64), &"b".repeat(64), "xrefs", p);
         assert_eq!(key(&v), key(&same));
         assert_ne!(key(&v), key(&json!({})));
+    }
+
+    /// A quen-defined extraction is a hit until its output file is removed; another tool version keeps the key, other
+    /// flags miss it.
+    #[test]
+    fn quen_extractions_hit_until_their_file_goes() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let path = "imports/abc/cap/functions.json";
+        let row = crate::ledger::Capture {
+            path: path.into(),
+            sha256: "c".repeat(64),
+            bytes: 1,
+            kind: "json".into(),
+            t: "2026-10-23T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let capture_id = l.add_capture(&row).unwrap();
+        let (target, result) = ("a".repeat(64), "c".repeat(64));
+        let x = Extraction {
+            tool: "ngfx_replay",
+            tool_version: Some("1"),
+            provider: json!({"id": "ngfx_replay"}),
+            parameters: json!({"args": ["--metadata-functions"]}),
+            target_sha256: &target,
+            operation: "functions",
+            result_sha256: &result,
+            capture_id,
+        };
+        assert_eq!(l.extraction_hit(&x.key()).unwrap(), None);
+        let id = l.add_extraction(&x).unwrap();
+        let (hit, out) = l.extraction_hit(&x.key()).unwrap().unwrap();
+        assert_eq!((hit, out.id, out.path.as_str()), (id, capture_id, path));
+        let newer = Extraction {
+            tool_version: Some("2"),
+            ..x.clone()
+        };
+        assert_eq!(newer.key(), x.key());
+        let other = Extraction {
+            parameters: json!({"args": []}),
+            ..x.clone()
+        };
+        assert_ne!(other.key(), x.key());
+        l.conn
+            .execute(
+                "UPDATE captures SET removed_at = '2026-10-23T00:00:01Z', removed_to = 'recycle_bin' WHERE id = ?1",
+                [capture_id],
+            )
+            .unwrap();
+        assert_eq!(l.extraction_hit(&x.key()).unwrap(), None);
+        let by_path = l.capture_ref(None, Some(r"IMPORTS\abc\cap\functions.json"));
+        assert_eq!(by_path.unwrap().map(|c| c.removed), Some(true));
     }
 
     #[test]
