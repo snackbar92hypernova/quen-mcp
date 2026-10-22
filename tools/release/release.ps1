@@ -43,6 +43,9 @@ if ($crate -ne $Version) { throw "release: -Version $Version is not crates/quen'
 if (-not (Test-Path -LiteralPath $StreamlineDll -PathType Leaf)) { throw "release: no file at -StreamlineDll $StreamlineDll" }
 if ((Sha $StreamlineDll) -ne $SlSha256) { throw "release: $StreamlineDll is not the pinned interposer build ($SlSha256)" }
 if (-not $env:WNB_SDK) { throw "release: set WNB_SDK to the Witcher Native Bridge SDK folder (w3/README.md)" }
+foreach ($v in 'JAVA_HOME', 'FLEX_HOME', 'REDKIT') {
+    if (-not [Environment]::GetEnvironmentVariable($v)) { throw "release: set $v for w3\hud.py, the HUD line's bundle (w3/README.md)" }
+}
 # Shipped files must not name this PC or its user: the user and machine names, and the hooks' deny-list.
 # The hooks' order (.githooks/deny-scan): QUEN_DENY_LIST, then %USERPROFILE%\.quen, then the pre-move %APPDATA%\quen.
 $denyList = if ($env:QUEN_DENY_LIST) { $env:QUEN_DENY_LIST }
@@ -114,13 +117,14 @@ $pinned = [regex]::Matches((Get-Content -Raw -LiteralPath "$repo\crates\quen\src
     'version: "quen-w3 ' + [regex]::Escape($w3Version) + '",\s*sha256: "([0-9a-f]{64})"') | ForEach-Object { $_.Groups[1].Value }
 $zip = [IO.Compression.ZipFile]::OpenRead($w3Zip)
 try {
-    # The two pinned files; from 0.1.3 the zip also holds W3Quen-licences.txt, which the doctor doesn't pin.
-    $built = foreach ($entry in $zip.Entries | Where-Object { $_.Name -match '\.(asi|ws)$' }) {
+    # The four pinned files (W3Quen.asi, quen.ws and, from 0.1.16, the HUD line's blob0.bundle and metadata.store); the
+    # zip also holds W3Quen-licences.txt (from 0.1.3) and modQuen's README.txt (from 0.1.16), which the doctor doesn't pin.
+    $built = foreach ($entry in $zip.Entries | Where-Object { $_.Name -match '\.(asi|ws|bundle|store)$' }) {
         $s = $entry.Open()
         try { (Get-FileHash -Algorithm SHA256 -InputStream $s).Hash.ToLower() } finally { $s.Dispose() }
     }
 } finally { $zip.Dispose() }
-if (@($pinned).Count -ne 2 -or @($built).Count -ne 2 -or ($built | Where-Object { $_ -notin $pinned })) {
+if (@($pinned).Count -ne 4 -or @($built).Count -ne 4 -or ($built | Where-Object { $_ -notin $pinned })) {
     throw "release: quen-w3 $w3Version's files ($built) are not the doctor's pins ($pinned, crates/quen/src/doctor.rs)"
 }
 

@@ -234,10 +234,7 @@ The owner and the main session schedule it. Nothing here launches the game.
    - `game_keys {tokens: ["wait:20000"]}`, then `game_screenshot {tag: "c8_t20"}` and `game_exec qistate()`;
    - `game_exec qisave(false)`, then `game_screenshot {tag: "c8_off"}`.
 
-9. **Watermark** (optional, only if check 3 passed):
-   - `game_exec qiadd(1)`, then `game_exec qistate(1)`;
-   - `game_exec qishow(none, 1)` (Watermark ignores the text), then `game_screenshot {tag: "c9_watermark"}`;
-   - `game_exec qihide(1)`.
+9. **Watermark** (optional, only if check 3 passed; not run in boot 200): superseded by the 0.1.16 boot's check 9 (below), which runs the same chain with quen's own movie in the slot.
 
 **Teardown:**
 1. `game_exec qinhide(true)`, `game_exec qihide()`, `game_exec qisave(false)`, then `game_screenshot {tag: "c_end"}`: nothing of the probe's.
@@ -290,6 +287,38 @@ The owner and the main session schedule it. Nothing here launches the game.
   - Route 5 stays the fallback for the look.
 - **4:** the module's look decides between B as is and C (quen's own movie, styled). Its hide latency (one call, one tick) sets phase 2's wait at 0.1 s.
 - **5:** fills the design's §3.5 table. The expected answer: hidden with the HUD in photo mode and menus, and by its state in combat and scenes, coming back after. The notification covers those, as the design proposes.
+
+## The 0.1.16 boot: quen's own HUD movie (checks 9 to 13, about 15 minutes)
+
+Boot 200 ran checks 0 to 7. quen-w3 0.1.16 puts quen's own movie in the `WatermarkModule` slot (`w3\README.md`, section HUD line). This boot checks it. The owner and the main session schedule it; nothing here launches the game.
+
+**Needs:** quen-w3 0.1.16 installed (the doctor pins its bundle), the config's `indicator` on, quen 0.1.19 or later. Stage this probe for its read-backs only: `qistate(1)` reads the slot (its `textField` read gives `text=null`: quen's field is `tfText`), and `qihide(1)` plus the watch time a hide. **Never `qiadd(1)` or `qishow(..., 1)`:** they would add vanilla's `hud_watermark.swf` to the slot.
+
+**Launch, pose and time** as above (a test session, `debugscripts`, `photo: false`, noon, `WT_Clear`). The lasting line is quen's own: "agent at work" from the first call, sent again every 10 s.
+
+9. **The chain** (about 2 min):
+   - `game_exec qistate(1)` at once after the launch, then after `game_keys {tokens: ["wait:12000"]}` (one re-send). Expect, by the second read, `state WatermarkModule: script object=true visible=true alpha=80 .. state=OnDemand`, and the root's `loadError` as at the first read.
+   - `game_screenshot {tag: "c9_module"}`: the line at the top centre, not bottom left.
+   - **No module after two re-sends** (`script object=false`, or `loadError` up by 1): the movie didn't load from the bundle. The notification keeps carrying the line. Note `loadError`, keep `scriptslog.txt` and `W3Quen.log`, and skip 10 to 12.
+   - **The game exits:** `session_end`, report the last lines of `scriptslog.txt`, stop.
+10. **Look, font and place** (about 2 min): from `c9_module` and, after a `measure_presentmon {secs: 5}` (its measuring line, the longest text), `c10_long`:
+    - the text in the game's font, every glyph drawn (no boxes, nothing missing), white on the dark box, at about the HUD's other text's size;
+    - its place against the boss and oxygen bars' (top centre) and the minimap; the long line wrapped or whole within 1000 px;
+    - note x, y and height in px at 1080p: `QuenHud.as`'s `TOP` and `CENTRE` are set by eye and tuned from these.
+11. **The hide** (about 1 min): `game_screenshot {tag: "c11_capture"}`: quen takes its line down 0.5 s before (`status_hide` in `timing_s`), so the frame shows none. Then `game_keys {tokens: ["wait:12000"]}` (the line back), `game_exec qihide(1)`, and `game_scriptlog {channel: "QuenInd", lines: 20}`: `in the same call: visible=false`, the watch `ticks=1`.
+12. **The moves** (about 5 min). After each step a screenshot, and `game_exec qistate(1)` (exec works in photo mode and behind the menu):
+    - photo mode on (`game_photo {action: "enter"}`): the line on the notification within about 0.25 s (the state poll), the module not drawn: `c12_photo`;
+    - photo mode off: back on the module, the notification gone: `c12_back`;
+    - the pause menu (`game_keys {tokens: ["escape:400"]}`): the notification, `c12_pause`; then `focus {to: "game"}`;
+    - the inventory key (`game_keys {tokens: ["i"]}`), and after the menu closes: back on the module, `c12_hub`;
+    - a dialogue if one is reached (as check 5): the notification while it plays, the module after it.
+13. **No flicker on a re-send** (about 1 min): `game_keys {tokens: ["wait:25000"]}` with the line up, then `logs\serve.log`: two re-sends answered `notice already shown`; and `c13_resend` shows the line as in `c9_module`.
+
+**What decides:**
+- 9 passes: phase 2 C works in the game. 9 fails: the notification stays the carrier (0.1.15's behaviour, which 0.1.16 keeps wherever the movie isn't drawn), and the bundle's format is the first suspect (`hud.py`'s `cooked()`).
+- 10: the owner's eye decides the look; `TOP`, `CENTRE`, the size and the box are one constant each in `QuenHud.as`.
+- 11: the module's 0.1 s hide is within quen's 0.5 s wait either way.
+- 12: every place the HUD isn't drawn must show the notification; a place with neither is a bug in `QUEN_HudDrawn`.
 
 ## Cleanup
 

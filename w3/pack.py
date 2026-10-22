@@ -1,8 +1,9 @@
-# Builds and tests W3Quen.asi (asi\build.bat test, which needs WNB_SDK and MSVC), then packs quen's Witcher 3 package
-# into w3\out\quen-w3-<VERSION>.zip, whose root mirrors the game folder. Prints the sha256 of each file and of the zip,
-# for the release notes and quen's doctor pins. The zip is reproducible: same inputs, same bytes.
+# Builds and tests W3Quen.asi (asi\build.bat test, which needs WNB_SDK and MSVC) and modQuen's HUD bundle (hud.py,
+# which needs JAVA_HOME, FLEX_HOME and REDKIT), then packs quen's Witcher 3 package into w3\out\quen-w3-<VERSION>.zip,
+# whose root mirrors the game folder. Prints the sha256 of each file and of the zip, for the release notes and quen's
+# doctor pins. The zip is reproducible: same inputs, same bytes.
 # Usage: python -I w3\pack.py
-import hashlib, os, re, subprocess, zipfile
+import hashlib, os, re, subprocess, sys, zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The release is the one W3Quen.cpp names (kVersion), so the zip and the ASI's log line never disagree.
@@ -30,6 +31,10 @@ FILES = {  # path in the zip (= in the game folder): source
     "bin/x64_dx12/W3Quen.asi": os.path.join(OUT, "W3Quen.asi"),
     "bin/x64_dx12/W3Quen-licences.txt": os.path.join(OUT, "W3Quen-licences.txt"),
     "Mods/modQuen/content/scripts/local/quen.ws": os.path.join(HERE, "mod", "modQuen", "content", "scripts", "local", "quen.ws"),
+    # From 0.1.16: the HUD line's movie (hud.py), and the notice REDkit's licence asks of everything made with it.
+    "Mods/modQuen/content/blob0.bundle": os.path.join(OUT, "hud", "content", "blob0.bundle"),
+    "Mods/modQuen/content/metadata.store": os.path.join(OUT, "hud", "content", "metadata.store"),
+    "Mods/modQuen/README.txt": os.path.join(HERE, "mod", "modQuen", "README.txt"),
 }
 
 sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
@@ -49,6 +54,7 @@ def notice(path, lines):
 
 
 subprocess.run(["cmd", "/c", os.path.join(HERE, "asi", "build.bat"), "test"], check=True)
+subprocess.run([sys.executable, "-I", os.path.join(HERE, "hud.py")], check=True)
 with open(FILES["bin/x64_dx12/W3Quen-licences.txt"], "w", encoding="utf-8", newline="\n") as f:
     f.write("W3Quen.asi contains code of the projects below, under these licences.\n")
     for name, path, lines in LICENCES:

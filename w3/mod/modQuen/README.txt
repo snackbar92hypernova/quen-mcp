@@ -1,0 +1,3 @@
+Made with the Witcher III Modding Tool, developed and released by CD PROJEKT RED for use with The Witcher III: Wild Hunt. © 2014 and ™ CD PROJEKT RED. All rights reserved. Check out the Witcher III Modding Tool here: [http://redkit.cdprojektred.com/]
+
+modQuen is the script half of quen's in-game package for The Witcher 3, with bin\x64_dx12\W3Quen.asi (quen-mcp on GitHub, w3\README.md). From quen-w3 0.1.16 its content\blob0.bundle holds quen's own HUD movie, the agent's status line, packed with the Witcher III Modding Tool (REDkit): the notice above is the tool's licence's, which every mod made with it carries.
