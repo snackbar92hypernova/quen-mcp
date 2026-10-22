@@ -43,6 +43,10 @@ pub enum Kind {
     ReShade,
     /// A folder in `dlc`.
     Dlc,
+    /// Another file in bin that a mod manager's records name as a mod's (a DLL, a data file).
+    Bin,
+    /// A mod's menu XML in the menu folder, as a mod manager's records name it.
+    Menu,
 }
 
 impl Kind {
@@ -52,6 +56,8 @@ impl Kind {
         Kind::Addon,
         Kind::ReShade,
         Kind::Dlc,
+        Kind::Bin,
+        Kind::Menu,
     ];
 
     /// The serde name, also stored in the ledger.
@@ -62,6 +68,8 @@ impl Kind {
             Kind::Addon => "addon",
             Kind::ReShade => "reshade",
             Kind::Dlc => "dlc",
+            Kind::Bin => "bin",
+            Kind::Menu => "menu",
         }
     }
 

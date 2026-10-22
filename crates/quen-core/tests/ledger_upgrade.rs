@@ -72,6 +72,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0014_boot_samplers.sql",
         "964c577bdee9bdf1b7f20c36fedb4ee812d4aa7bb5a59f0e24f9994a9f34a2eb",
     ),
+    (
+        "0015_mod_kinds.sql",
+        "8f6620b592a18b90df6258e513ff90736c384e3815ec1a54af794cae81e0128b",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -534,6 +538,35 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
                 .is_err(),
             "v{k}"
         );
+        // 0015: a mod set, a label and a load status take kinds bin and menu; no other new kind, and a bin entry keeps
+        // 0002's pairing of home, file count and bytes.
+        now.pragma_update(None, "foreign_keys", true).unwrap();
+        now.execute_batch(&format!(
+            "INSERT INTO mod_set_entries (mod_set_id, kind, name, parked, home, content_hash, file_count, bytes)
+               VALUES (1, 'bin', 'dsound.dll', 1, 'quen-parked/bin/dsound.dll', '{0}', 1, 5),
+                      (1, 'menu', 'w3loadfix', 0, 'bin/config/r4game/user_config_matrix/pc/w3loadfix.xml', '{0}', 1, 9);
+             INSERT INTO mod_versions (content_hash, kind, name, version, provenance, source)
+               VALUES ('{0}', 'bin', 'dsound.dll', '1.0.8', 'nexus_file', 'W3LoadFix 13881 1.0.8');
+             INSERT INTO boot_mod_status (boot_id, kind, name, status) VALUES (1, 'menu', 'w3loadfix', 'loaded');",
+            sha(12)
+        ))
+        .unwrap();
+        for bad in [
+            "INSERT INTO mod_set_entries (mod_set_id, kind, name, parked, home, content_hash, file_count, bytes)
+               VALUES (1, 'other', 'x', 0, 'x', '0000000000000000000000000000000000000000000000000000000000000000', 1, 1)",
+            "INSERT INTO mod_set_entries (mod_set_id, kind, name, parked, home, content_hash, file_count, bytes)
+               VALUES (1, 'bin', 'y', 0, 'y', '0000000000000000000000000000000000000000000000000000000000000000', NULL, 1)",
+            "UPDATE mod_versions SET kind = 'other'",
+            "UPDATE boot_mod_status SET kind = 'other'",
+        ] {
+            assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
+        }
+        let index = rows(
+            &l,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'mod_set_entries_content'",
+            &[],
+        );
+        assert_eq!(index, vec![vec![json!(1)]], "v{k}");
         drop(now);
         let run = rows(
             &l,

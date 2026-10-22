@@ -101,7 +101,7 @@ Your config, ledger, logs and captures stay. When a new quen changes the ledger'
 | quen's in-game package | `bin\x64_dx12\W3Quen.asi`, `Mods\modQuen` | tells quen whether the game is in gameplay, a menu, a loading screen or photo mode; loads a save by name (`game_load`, and a launch of a save that isn't the newest); later the command channel into the game | `quen-w3-<version>.zip` from the GitHub Releases of quen-mcp. Unzip it into the game folder, or install it with Vortex ([With Vortex](#with-vortex)). |
 
 - Both are needed for every launch.
-- quen doesn't need the W3 Game State Bridge. If another mod of yours uses it (RenoDX does), leave it installed: quen reads nothing of it, and parks it only when a launch names both of its parts (`W3GameStateBridge.asi,modW3GameStateBridge`), never one alone: one without the other breaks the game's script compile.
+- quen doesn't need the W3 Game State Bridge and reads nothing of it. Like any mod whose script imports from its own ASI, its two parts are parked together (both named, or both under `ALL`), never one alone: one without the other breaks the game's script compile.
 - quen never parks the Native Bridge or its own package, even when a launch parks everything else.
 - **quen's package is checked exactly:** both files must come from the one release this quen expects. quen refuses a launch while only half of it is there, while the two files are from different releases, or while a part of the old layout is left: move an old `Mods\modQuen` (the pure-script one) and any `Mods\modQuenRpc` to the Recycle Bin before you unzip the package.
 - After installing them, start the game once on its own. The first start after adding script mods recompiles the game's scripts and takes longer.

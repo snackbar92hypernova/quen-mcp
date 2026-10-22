@@ -1542,9 +1542,9 @@ fn a_launch_whose_natives_failed_ends_before_any_key() {
     assert_eq!(rows[0][0], "failed");
 }
 
-/// quen works the same with the W3 Game State Bridge installed (for RenoDX) and without it: it reads
-/// nothing the bridge writes (here its log says "loading" at every push quen's state makes: see FAKE_SCRIPT), needs it
-/// for no tool, and never parks either half of it, even under ALL.
+/// quen works the same with the W3 Game State Bridge installed and without it: it reads nothing the bridge writes (here
+/// its log says "loading" at every push quen's state makes: see FAKE_SCRIPT) and needs it for no tool. Kept beside ALL
+/// here, so it loads.
 #[test]
 fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
     let run = |bridge: bool| {
@@ -1558,7 +1558,7 @@ fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
             for part in W3GSB {
                 let path = fx.path("game").join(part);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, "the bridge, another build").unwrap();
+                fs::write(path, w3gsb(part, "another build")).unwrap();
             }
         }
         let mut quen = Quen::start(&fx);
@@ -1570,7 +1570,11 @@ fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
             .map(|d| d["name"].as_str().unwrap())
             .collect();
         assert!(!names.iter().any(|n| n.contains("Game State")), "{names:?}");
-        let launched = launch_with(&mut quen, json!({"save": "ManualSave_old", "park": "ALL"}));
+        let mut spec = json!({"save": "ManualSave_old", "park": "ALL"});
+        if bridge {
+            spec["keep"] = json!("W3GameStateBridge.asi,modW3GameStateBridge");
+        }
+        let launched = launch_with(&mut quen, spec);
         let token = launched["token"].clone();
         for part in W3GSB.iter().filter(|_| bridge) {
             assert!(fx.path("game").join(part).exists(), "{part} was parked");
@@ -1591,7 +1595,7 @@ fn quen_works_the_same_with_or_without_the_w3_game_state_bridge() {
         for part in W3GSB.iter().filter(|_| bridge) {
             assert_eq!(
                 fs::read_to_string(fx.path("game").join(part)).unwrap(),
-                "the bridge, another build"
+                w3gsb(part, "another build")
             );
         }
         json!({
@@ -1669,15 +1673,16 @@ fn an_unknown_build_is_refused_unless_allowed() {
     assert_eq!(row[4], launched["game_build"]["stamp"]);
 }
 
-/// The W3 Game State Bridge is parked both halves or neither. One half alone is refused before anything changes;
-/// both named are parked for the session and given back at its end.
+/// The W3 Game State Bridge is parked both halves or neither, its pair learned from its files like any other. One half
+/// alone is refused before anything changes; ALL plans both; both named are parked for the session and given back at
+/// its end.
 #[test]
 fn the_w3_game_state_bridge_is_parked_only_as_a_pair() {
     let fx = Fixture::new();
     for part in W3GSB {
         let path = fx.path("game").join(part);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "the bridge").unwrap();
+        fs::write(path, w3gsb(part, "the bridge")).unwrap();
     }
     let mut quen = Quen::start(&fx);
     for one in ["W3GameStateBridge.asi", "modW3GameStateBridge"] {
@@ -1692,6 +1697,19 @@ fn the_w3_game_state_bridge_is_parked_only_as_a_pair() {
         );
     }
     fx.assert_restored();
+    let all = quen.tool("session_plan", json!({"park": "ALL"}));
+    assert_eq!(
+        all["park"]["pairs"],
+        json!([["modW3GameStateBridge", "W3GameStateBridge.asi"]]),
+        "{all}"
+    );
+    let parks: Vec<&str> = all["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str().filter(|c| c.contains("GameStateBridge")))
+        .collect();
+    assert_eq!(parks.len(), 2, "{all}");
     let launched = launch_with(
         &mut quen,
         json!({"park": "W3GameStateBridge.asi,modW3GameStateBridge"}),
@@ -1709,7 +1727,7 @@ fn the_w3_game_state_bridge_is_parked_only_as_a_pair() {
     assert_eq!(ended["ok"], true, "{ended}");
     fx.assert_restored();
     for part in W3GSB {
-        assert_eq!(fx.read(&format!("game/{part}")), "the bridge");
+        assert_eq!(fx.read(&format!("game/{part}")), w3gsb(part, "the bridge"));
     }
 }
 
@@ -2699,7 +2717,7 @@ fn vortex_s_mods_get_owners_refusals_and_a_link_report_and_nothing_changes_witho
             {"item": r"Mods\modAlpha", "owner": "Vortex: Alpha 1.2 (nexus 101)"},
             {"item": r"bin\x64_dx12\W3Fake.asi", "owner": "outside Vortex"},
         ],
-        "left_loaded": {"Loader 2.0 (nexus 202)": [r"bin\x64_dx12\dsound.dll"]},
+        "left_loaded": {},
     });
     let plan = quen.tool("session_plan", park.clone());
     assert_eq!(plan["vortex"], vortex, "{plan}");
@@ -2800,4 +2818,111 @@ fn vortex_s_mods_get_owners_refusals_and_a_link_report_and_nothing_changes_witho
     fx.assert_restored();
     running.kill().unwrap();
     running.wait().unwrap();
+}
+
+/// Phase 2 of Vortex: a synthetic Vortex mod (a script folder whose import its ASI's bytes hold, the ASI, a data file in
+/// bin, a menu XML, a readme at the game root; hardlinks of their staging copies, made here) parks as a unit by its
+/// Nexus id while the readme stays; one half of the pair learned from the files is refused; a partial park lists what
+/// stays loaded; the boot's mod set holds each unit parked, labelled with the mod's version; the end finds every link
+/// whole.
+#[test]
+fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
+    let fx = Fixture::new();
+    let staging = fx.path("vortex/staging");
+    let world = "World 303 2.2 2026-10-19T17-54Z Ef3";
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(
+        staging.join("__vortex_staging_folder"),
+        r#"{"instance":"i1","game":"witcher3"}"#,
+    )
+    .unwrap();
+    let files = [
+        (
+            r"Mods\modWorld\content\scripts\local\world.ws",
+            "import function BIW_Edge() : int;\n",
+        ),
+        (r"bin\x64_dx12\World.asi", "MZ\0BIW_Edge\0"),
+        (r"bin\x64_dx12\BIW_edges_0.bin", "edges"),
+        (
+            r"bin\config\r4game\user_config_matrix\pc\World.xml",
+            "<menu/>",
+        ),
+        ("Readme.txt", "readme"),
+    ];
+    let mut entries = Vec::new();
+    for (rel, bytes) in files {
+        let deployed = fx.path("game").join(rel);
+        fs::create_dir_all(deployed.parent().unwrap()).unwrap();
+        fs::write(&deployed, bytes).unwrap();
+        let copy = staging.join(world).join(rel);
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::hard_link(&deployed, copy).unwrap();
+        entries.push(json!({"relPath": rel, "source": world, "target": "", "time": 1}));
+    }
+    let manifest = json!({"instance": "i1", "version": 1, "deploymentMethod": "hardlink_activator",
+        "gameId": "witcher3", "deploymentTime": 1_792_623_500_298u64, "stagingPath": staging, "targetPath": "T",
+        "files": entries});
+    let root = fx.path(r"game\vortex.deployment.witcher3menumodroot.json");
+    fs::write(root, manifest.to_string()).unwrap();
+    let mut quen = Quen::start(&fx);
+
+    let half = quen.tool("session_plan", json!({"park": "World.asi"}));
+    let why = half["reason"].as_str().unwrap_or_default();
+    assert!(
+        half["refused"] == true
+            && why.contains(r#""World.asi" is parked only together with "modWorld""#),
+        "{half}"
+    );
+    let partial = quen.tool(
+        "session_plan",
+        json!({"park": "nexus:303", "keep": "BIW_edges_0.bin"}),
+    );
+    assert_eq!(
+        partial["vortex"]["left_loaded"],
+        json!({"World 2.2 (nexus 303)": [r"bin\x64_dx12\BIW_edges_0.bin"]}),
+        "{partial}"
+    );
+    let plan = quen.tool("session_plan", json!({"park": "nexus:303"}));
+    assert_eq!(
+        plan["park"]["pairs"],
+        json!([["modWorld", "World.asi"]]),
+        "{plan}"
+    );
+    assert_eq!(plan["vortex"]["left_loaded"], json!({}), "{plan}");
+    let parks = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str().unwrap().starts_with("park "))
+        .count();
+    assert_eq!(parks, 4, "{plan}");
+
+    let launched = launch_with(&mut quen, json!({"park": "nexus:303"}));
+    for (rel, _) in &files[..4] {
+        assert!(!fx.path("game").join(rel).exists(), "{rel} is in place");
+    }
+    assert_eq!(fx.read("game/Readme.txt"), "readme");
+    let ended = quen.tool("session_end", json!({"token": launched["token"]}));
+    assert_eq!(ended["ok"], true, "{ended}");
+    let links = json!({"checked": 5, "ok": 5, "deleted": [], "srcdeleted": [], "refchange": []});
+    assert_eq!(ended["vortex"], links, "{ended}");
+    fx.assert_restored();
+    for (rel, bytes) in files {
+        assert_eq!(fx.read(&format!("game/{}", rel.replace('\\', "/"))), bytes);
+    }
+    let entries = fx.ledger(
+        "SELECT kind, name, parked, version_label FROM mod_set_entries
+           WHERE mod_set_id = (SELECT mod_set_id FROM boots ORDER BY id DESC LIMIT 1) AND version_label IS NOT NULL
+           ORDER BY kind, name",
+    );
+    let entry = |kind: &str, name: &str| vec![json!(kind), json!(name), json!(1), json!("2.2")];
+    assert_eq!(
+        entries,
+        [
+            entry("asi", "World"),
+            entry("bin", "BIW_edges_0.bin"),
+            entry("menu", "World"),
+            entry("mods", "modWorld"),
+        ]
+    );
 }

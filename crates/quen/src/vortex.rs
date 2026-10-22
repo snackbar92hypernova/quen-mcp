@@ -60,10 +60,13 @@ fn running() -> Result<bool, String> {
         .any(|(_, name)| name.eq_ignore_ascii_case(&image)))
 }
 
-/// The launch's refusals with Vortex here (quen-core's `Inventory::refusal`), over the changes it makes: every move
-/// parks, every rewritten or kept file gets a new file at the end. Ok(None): no Vortex, nothing checked.
-pub(crate) fn check(config: &Config, changes: &[Change]) -> Result<Option<Inventory>, String> {
-    let Some(inv) = read(config) else {
+/// The launch's refusals with Vortex here (`inv`, quen-core's `Inventory::refusal`), over the changes it makes: every
+/// move parks, every rewritten or kept file gets a new file at the end. Ok(None): no Vortex, nothing checked.
+pub(crate) fn check(
+    inv: Option<Inventory>,
+    changes: &[Change],
+) -> Result<Option<Inventory>, String> {
+    let Some(inv) = inv else {
         return Ok(None);
     };
     let (mut parked, mut rewritten) = (Vec::new(), Vec::new());
@@ -82,29 +85,37 @@ pub(crate) fn check(config: &Config, changes: &[Change]) -> Result<Option<Invent
     }
 }
 
-/// session_plan's and session_launch's `vortex`: each parked item's owner, and with any park the Vortex files the game
-/// still loads that quen can't park, by mod.
+/// session_plan's and session_launch's `vortex`: each parked item's owner, and with any park what the game still loads
+/// of a Vortex mod it parks part of, and the Vortex files quen can't park, by mod.
 pub(crate) fn fields(inv: &Inventory, changes: &[Change]) -> Value {
-    let parked: Vec<Value> = changes
+    let moved: Vec<&Path> = changes
         .iter()
         .filter_map(|c| match c {
-            Change::Move { from, .. } => {
-                Some(json!({"item": inv.rel(from), "owner": inv.owner(from)}))
-            }
+            Change::Move { from, .. } => Some(from.as_path()),
             _ => None,
         })
         .collect();
+    let parked: Vec<Value> = moved
+        .iter()
+        .map(|from| json!({"item": inv.rel(from), "owner": inv.owner(from)}))
+        .collect();
     let mut out = json!({"parked": parked});
-    if !parked.is_empty() {
-        out["left_loaded"] = json!(inv.left_loaded());
+    if !moved.is_empty() {
+        out["left_loaded"] = json!(inv.left_loaded(&moved));
     }
     out
 }
 
+/// What the replay asks of a parked file gone from both its names (journal.rs `replay_with`): with the plan's records
+/// `inv`, a note when Vortex purged it (its staging copy is the file).
+pub(crate) fn purged(inv: Option<&Inventory>) -> impl Fn(&Path, &str) -> Option<String> + '_ {
+    move |path, id| inv?.purged(&Disk, path, id)
+}
+
 /// The end's link report, after the replay: every deployed file as Vortex's next deploy would class it, the ones broken
 /// in `before` (the plan's read) under `before_launch`. None when the manifests are gone.
-pub(crate) fn report(config: &Config, before: &[String]) -> Option<Value> {
-    read(config).map(|inv| json!(inv.links(before)))
+pub(crate) fn report(config: &Config, before: &Inventory) -> Option<Value> {
+    read(config).map(|inv| json!(inv.links(&before.broken())))
 }
 
 /// Labels the entries of a boot's mod set that one Vortex mod deployed with that mod's version (`mod_versions`,
@@ -114,8 +125,12 @@ pub(crate) fn report(config: &Config, before: &[String]) -> Option<Value> {
 pub(crate) fn label(ledger: &mut Ledger, inv: &Inventory, game_dir: &Path, entries: &[ModEntry]) {
     for e in entries {
         let installed = match (e.parked, e.home.file_name()) {
-            (true, Some(name)) if e.kind == Kind::ModsFolder => game_dir.join("Mods").join(name),
-            (true, Some(name)) => boot::bin_dir(game_dir).join(name),
+            (true, Some(name)) => match e.kind {
+                Kind::ModsFolder => game_dir.join("Mods").join(name),
+                Kind::Dlc => boot::dlc_dir(game_dir).join(name),
+                Kind::Menu => boot::menu_dir(game_dir).join(name),
+                _ => boot::bin_dir(game_dir).join(name),
+            },
             _ => game_dir.join(&e.home),
         };
         let [m] = inv.owners(&installed)[..] else {
@@ -174,16 +189,17 @@ pub(crate) fn summary(game_dir: Option<&Path>, documents: Option<&Path>) -> Valu
 pub fn tool() -> Value {
     json!({
         "name": "mods",
-        "description": "Read-only: the game's mods by Vortex's records (its deployment manifests in the game folder, \
-            Mods, DLC and documents; mods.settings). vortex: null without a manifest; else manifests (mod_type, \
-            method, deployed, stale: why its files count as outside Vortex), links over every deployed file (ok: \
-            still Vortex's hardlink; deleted, srcdeleted, refchange: what Vortex's next deploy lists) and running. \
-            mods: each Vortex mod (name, nexus_id, version from its folder's name; vortex: the folder), units (kind \
-            mods, bin, menu, dlc or other; path; files), inert files and links. load_order: mods.settings. outside: \
-            Mods folders and bin's .asi, .addon64 and dxgi.dll no manifest lists (without Vortex: all). undeployed: \
-            Vortex's mods no manifest lists. shared: a path two mods claim, a Mods folder with two mods' files. pair \
-            [x, y] (nexus:<id>, name or Vortex folder): the paths both carry, whose copy is deployed, the Mods \
-            folders both use. During a session its parked files show deleted. Any connection, beside a session.",
+        "description": "Read-only: the game's mods by Vortex's records (deployment manifests in the game folder, Mods, \
+            DLC, documents; mods.settings). vortex: null without a manifest; else manifests (mod_type, method, \
+            deployed, stale: why its files count as outside), links over every deployed file (ok: still \
+            Vortex's hardlink; deleted, srcdeleted, refchange: what Vortex's next deploy lists) and running. mods: \
+            each Vortex mod (name, nexus_id, version: from its folder's name, vortex), units (kind mods, \
+            bin, menu, dlc or other; path; files; outside: a Mods folder's files no manifest lists), inert files, \
+            links. load_order: mods.settings. outside: Mods folders and bin's .asi, .addon64 and dxgi.dll no \
+            manifest lists (without Vortex: all). undeployed: Vortex's mods no manifest lists. shared: a path two \
+            mods claim, a Mods folder with two mods' files. pair [x, y] (nexus:<id>, name or Vortex folder): paths \
+            both carry, whose copy is deployed, Mods folders both use. A session's parked files show deleted. Any \
+            connection, beside a session.",
         "inputSchema": {"type": "object", "properties": {
             "pair": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2,
                      "description": "two deployed Vortex mods to compare, each nexus:<id>, its name or its Vortex folder"},

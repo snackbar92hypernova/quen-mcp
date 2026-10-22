@@ -1,5 +1,5 @@
 //! Crash injection for the session journal (docs/intent.md, "The session journal"). A scripted session (back up 4
-//! files, patch 2, park 3 mods, place 2 files) is cut at every byte of every step's lines; each replay must give the
+//! files, patch 2, park 3 mods and a Vortex mod's DLL, menu XML and DLC folder, place 2 files) is cut at every byte of every step's lines; each replay must give the
 //! user's files back exactly, or report every difference it leaves. All files are synthetic.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use quen_core::journal::{Action, Fs, Journal, MemFs, ReplayReport, replay, sha256_hex};
-use quen_core::park::{self, Entry, Listing};
+use quen_core::park::{self, Entry, Home, Listing, Managed};
 use quen_core::settings;
 
 /// quen's own data root: the journal, backups and staged files, none of them the user's.
@@ -33,7 +33,8 @@ fn backup_of(path: &str) -> PathBuf {
 }
 
 /// The user's files before the session: 4 config files, 3 mods (one with a non-ASCII name, so cuts split a UTF-8
-/// character), and a bin file nobody touches.
+/// character), a Vortex mod's DLL (a hardlink of its staging copy), menu XML and DLC folder, and a bin file nobody
+/// touches.
 fn user_state() -> MemFs {
     let fs = MemFs::default();
     fs.put(
@@ -50,10 +51,18 @@ fn user_state() -> MemFs {
     fs.put("GAME/Mods/modBeta", "beta tree");
     fs.put("GAME/Mods/modGamma", "gamma tree");
     fs.put("GAME/bin/x64/untouched.dll", "not ours");
+    fs.put("STAGING/W3LoadFix/bin/x64_dx12/dsound.dll", "proxy");
+    fs.link(
+        "STAGING/W3LoadFix/bin/x64_dx12/dsound.dll",
+        "GAME/bin/x64/dsound.dll",
+    );
+    fs.put("GAME/menu/w3loadfix.xml", "<menu/>");
+    fs.put("GAME/DLC/dlcExtra", "dlc tree");
     fs
 }
 
-/// The scripted session over [`user_state`]: back up 4 files, patch 2, park 3 mods, place 2 files.
+/// The scripted session over [`user_state`]: back up 4 files, patch 2, park 3 mods and the Vortex mod's 3 units by
+/// `ALL`, place 2 files.
 fn session() -> (MemFs, Vec<Op>) {
     let fs = user_state();
     let configs = [
@@ -86,18 +95,51 @@ fn session() -> (MemFs, Vec<Op>) {
         dir: Path::new("GAME/Mods"),
         entries: &mods,
     };
+    let file = |name: &str, is_dir| Entry {
+        name: name.into(),
+        is_dir,
+        is_link: false,
+    };
+    let (bin, menu, dlc) = (
+        [file("dsound.dll", false), file("untouched.dll", false)],
+        [file("w3loadfix.xml", false)],
+        [file("dlcExtra", true)],
+    );
+    let managed = [Managed {
+        label: "W3LoadFix 1.0.8 (nexus 13881)".into(),
+        names: vec!["nexus:13881".into()],
+        units: vec![
+            (Home::Bin, "dsound.dll".into()),
+            (Home::Menu, "w3loadfix.xml".into()),
+            (Home::Dlc, "dlcExtra".into()),
+        ],
+        ties: Vec::new(),
+    }];
+    let more = park::More {
+        menu: Some(Listing {
+            dir: Path::new("GAME/menu"),
+            entries: &menu,
+        }),
+        dlc: Some(Listing {
+            dir: Path::new("GAME/DLC"),
+            entries: &dlc,
+        }),
+        managed: &managed,
+        ..park::More::default()
+    };
     let bin = Listing {
         dir: Path::new("GAME/bin/x64"),
-        entries: &[],
+        entries: &bin,
     };
     let plan = park::plan(
         "ALL",
         "",
         park::W3_NEVER_PARK,
-        park::W3_PAIRS,
+        &[],
         mods,
         bin,
         Path::new("GAME/quen-parked"),
+        &more,
     )
     .unwrap();
     ops.extend(plan.moves.into_iter().map(|m| Op::Move(m.from, m.to)));
@@ -262,9 +304,9 @@ fn crash_everywhere(make: fn() -> (MemFs, Vec<Op>)) -> usize {
 
 #[test]
 fn every_crash_point_of_the_session_restores_the_user_files() {
-    assert_eq!(session().1.len(), 11);
+    assert_eq!(session().1.len(), 14);
     let replays = crash_everywhere(session);
-    assert!(replays > 11 * 100, "{replays} replays");
+    assert!(replays > 14 * 100, "{replays} replays");
 }
 
 #[test]
@@ -333,7 +375,7 @@ fn a_full_replay_ends_the_session() {
         report.clean() && report.kept.is_empty() && report.notes.is_empty(),
         "{report:#?}"
     );
-    assert_eq!(report.undone.len(), 2 + 3 + 2, "{report:#?}");
+    assert_eq!(report.undone.len(), 2 + 6 + 2, "{report:#?}");
     // The placed files and the four spent backups went to the Recycle Bin, nothing was deleted.
     assert_eq!(fs.recycled(), report.recycled);
     assert_eq!(report.recycled.len(), 2 + 4);
@@ -409,9 +451,10 @@ fn a_copy_holding_only_the_launchs_own_settings_is_not_kept() {
         park: "",
         keep: "",
         never_park: park::W3_NEVER_PARK,
-        pairs: park::W3_PAIRS,
+        pairs: &[],
         mods: &[],
         bin: &[],
+        more: park::More::default(),
         renodx: None,
         load_from_dll_main: None,
         play: false,
@@ -687,9 +730,10 @@ fn a_native_boot_killed_before_any_write_replays_back() {
         park: "ALL",
         keep: "",
         never_park: park::W3_NEVER_PARK,
-        pairs: park::W3_PAIRS,
+        pairs: &[],
         mods: &mods,
         bin: &bin,
+        more: park::More::default(),
         renodx: Some(RenoDx {
             addon: "renodx.addon64",
             preset: &[("Nits", 250.0)],

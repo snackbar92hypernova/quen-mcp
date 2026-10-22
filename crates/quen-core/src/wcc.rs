@@ -79,6 +79,52 @@ pub fn stub_imports(text: &str) -> (String, usize) {
     (out, n)
 }
 
+/// The names a script file imports by `import function <name>`, each once in order, outside `//` and `/* */` comments:
+/// the functions a binary registers for the script (the game's exe, or an ASI through the Native Bridge). The file is
+/// UTF-16LE with its BOM, as some are, else UTF-8.
+pub fn imports(script: &[u8]) -> Vec<String> {
+    let text = match script.strip_prefix(&[0xFF, 0xFE]) {
+        Some(utf16) => {
+            let units: Vec<u16> = utf16
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        None => String::from_utf8_lossy(script).into_owned(),
+    };
+    let (mut code, mut rest) = (String::with_capacity(text.len()), text.as_str());
+    while let Some(at) = [rest.find("//"), rest.find("/*")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        code.push_str(&rest[..at]);
+        code.push(' ');
+        let end = match &rest[at..at + 2] {
+            "//" => rest[at..].find('\n').map(|n| at + n),
+            _ => rest[at + 2..].find("*/").map(|n| at + 2 + n + 2),
+        };
+        rest = end.map_or("", |end| &rest[end..]);
+    }
+    code.push_str(rest);
+    let words: Vec<&str> = code.split_whitespace().collect();
+    let mut names: Vec<String> = Vec::new();
+    for w in words
+        .windows(3)
+        .filter(|w| w[..2] == ["import", "function"])
+    {
+        let end = w[2]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(w[2].len());
+        let name = &w[2][..end];
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
 /// `Name(params) [: type] ;` at `s`'s start as a stub, and the bytes it took.
 fn stub(s: &str) -> Option<(String, usize)> {
     let word = |s: &str| {
@@ -198,6 +244,25 @@ mod tests {
              function Keep() {}\n"
         );
         assert_eq!(stub_imports("no imports").0, "no imports");
+    }
+
+    /// The names a script imports, each once, whatever the spacing; commented-out imports aren't.
+    #[test]
+    fn imports_are_named_outside_comments() {
+        let text = "import function QUEN_Next() : string;\n\
+                    import  function\tBIW_Edge (x : int);\r\n\
+                    // import function Old_One();\n\
+                    /* import function Old_Two();\n import function Old_Three(); */\n\
+                    function f() { x = 1; } // trailing\n\
+                    import function QUEN_Next() : string;\n\
+                    import latent function NotThisForm();\n";
+        assert_eq!(imports(text.as_bytes()), ["QUEN_Next", "BIW_Edge"]);
+        assert!(imports(b"function f() {} /* unclosed import function X();").is_empty());
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        assert_eq!(imports(&utf16), ["QUEN_Next", "BIW_Edge"]);
     }
 
     /// Every settings file is put back after, and a file wcc_lite writes that isn't there yet is recycled after.

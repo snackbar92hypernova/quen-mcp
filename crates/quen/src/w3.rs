@@ -1,6 +1,7 @@
 //! The Witcher 3 adapter: which mods a boot loaded, the game's exe, what is parked, quen's state log
 //! and the Native Bridge's. Read-only, but for removing the parking folders a replay emptied.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,9 @@ use quen_core::bridge_log;
 use quen_core::build::Build;
 use quen_core::ledger::Game;
 use quen_core::mods::{self, ConfigSource, Disk, HashCache, Kind, ModEntry, ModSpec};
-use quen_core::park;
+use quen_core::park::{self, Entry, Home, Learned, Merge};
+use quen_core::vortex::Inventory;
+use quen_core::wcc;
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -47,7 +50,7 @@ pub const HARNESS_PARKED: &str = "mods_parked_by_harness";
 
 /// The names never parked, as the harness's `park_names` keeps them: the Native Bridge and quen's own package,
 /// the harness's test mod and the RenoDX devkit always, and our RenoDX add-on unless `park_renodx` (W3_PARK_RENODX=1).
-/// The W3 Game State Bridge is parked both halves or neither (`park::W3_PAIRS`).
+/// A script folder and the binary it imports from park both or neither ([`pairs`]).
 pub fn never_park(park_renodx: bool) -> Vec<&'static str> {
     let mut names = park::W3_NEVER_PARK.to_vec();
     names.extend(["modRenoDXTest", "renodx-devkit.addon64"]);
@@ -61,15 +64,22 @@ pub fn never_park(park_renodx: bool) -> Vec<&'static str> {
 pub fn parked(game_dir: &Path) -> Vec<String> {
     parking(game_dir)
         .iter()
-        .flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten())
+        .flat_map(|(dir, _)| fs::read_dir(dir).into_iter().flatten().flatten())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
 }
 
-/// quen's parking folders: parked Mods folders, then parked bin files, then parked menu XMLs (finding 49).
-fn parking(game_dir: &Path) -> [PathBuf; 3] {
+/// quen's parking folders: parked Mods folders, then parked bin files, then parked menu XMLs (finding 49), then parked
+/// DLC folders; each beside the game folder it holds parked items of.
+fn parking(game_dir: &Path) -> [(PathBuf, PathBuf); 4] {
     let parked = game_dir.join(boot::PARKED);
-    [parked.join("Mods"), parked.join("bin"), parked.join("menu")]
+    let homes = [
+        (Home::Mods, game_dir.join("Mods")),
+        (Home::Bin, boot::bin_dir(game_dir)),
+        (Home::Menu, boot::menu_dir(game_dir)),
+        (Home::Dlc, boot::dlc_dir(game_dir)),
+    ];
+    homes.map(|(home, dir)| (parked.join(home.folder()), dir))
 }
 
 /// Makes the folders the boot's moves park into.
@@ -86,7 +96,7 @@ pub fn make_parking(changes: &[Change]) -> io::Result<()> {
 
 /// Removes quen's parking folders once a replay has emptied them; one that still holds anything stays.
 pub fn tidy_parking(game_dir: &Path) {
-    for dir in parking(game_dir) {
+    for (dir, _) in parking(game_dir) {
         let _ = fs::remove_dir(dir); // only an empty folder: remove_dir refuses any other
     }
     let _ = fs::remove_dir(game_dir.join(boot::PARKED));
@@ -96,40 +106,81 @@ pub fn tidy_parking(game_dir: &Path) {
 /// and `dxgi.dll` files in bin, where they are or in quen's parking folders (a parked one only if nothing of its kind and
 /// name is loaded: a staged copy took its place). An ASI's or
 /// add-on's config is its `<name>.ini` beside it, then ReShade.ini `[<name>]`, which overrides it (W3Perf's toggles).
-/// ponytail: dlc folders aren't fingerprinted (the game's own DLCs are GBs); add them with a list of the vanilla ones.
-pub fn mod_set(game_dir: &Path, cache: &mut HashCache) -> io::Result<Vec<ModEntry>> {
-    let bin = game_dir.join("bin").join("x64_dx12");
+/// With Vortex's records (`inv`), also what they name a mod's: its other files in bin (kind `bin`, by file name, its
+/// config its `<stem>.ini`; an ini whose stem another file in bin has is that file's config), its menu XMLs (kind
+/// `menu`, by stem) and its folders in `DLC` (kind `dlc`).
+/// ponytail: DLC folders outside Vortex aren't fingerprinted (4.04 kept the game's own DLCs there, GBs).
+pub fn mod_set(
+    game_dir: &Path,
+    cache: &mut HashCache,
+    inv: Option<&Inventory>,
+) -> io::Result<Vec<ModEntry>> {
+    let bin = boot::bin_dir(game_dir);
+    let parking = parking(game_dir);
+    let [mods, _, menu, dlc] = parking.clone().map(|(_, home)| home);
     let mut found = Vec::new();
-    for dir in [game_dir.join("Mods"), bin.clone()] {
-        let entries = match fs::read_dir(&dir) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound && dir != bin => continue, // no Mods folder: no mods
+    let homes = match inv {
+        Some(_) => &parking[..],
+        None => &parking[..2],
+    };
+    for dir in homes.iter().map(|(_, home)| home) {
+        let entries = match fs::read_dir(dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && *dir != bin => continue, // no Mods folder: no mods
             entries => entries?,
         };
         for entry in entries {
-            found.push((entry?.path(), false));
+            let path = entry?.path();
+            found.push((path.clone(), path, false));
         }
     }
-    for dir in parking(game_dir) {
+    for (dir, home) in &parking {
         for entry in fs::read_dir(dir).into_iter().flatten() {
-            found.push((entry?.path(), true));
+            let path = entry?.path();
+            let installed = home.join(path.file_name().unwrap_or_default());
+            found.push((path, installed, true));
         }
     }
+    let owned = |path: &Path| inv.is_some_and(|inv| !inv.owners(path).is_empty());
+    // The stems of bin's mods but inis, loaded or parked: an ini of one of them is that mod's config.
+    let stems: BTreeSet<String> = found
+        .iter()
+        .filter(|(_, at, _)| at.parent() == Some(bin.as_path()))
+        .filter_map(|(_, at, _)| {
+            let name = at.file_name()?.to_string_lossy().to_lowercase();
+            let (stem, ext) = name.rsplit_once('.')?;
+            (ext != "ini" && (park::bin_kind(&name) || owned(at))).then(|| stem.to_owned())
+        })
+        .collect();
     let mut specs = Vec::new();
-    for (home, parked) in found {
+    for (home, at, parked) in found {
+        let dir = at.parent().unwrap_or(game_dir);
         let file = home.file_name().unwrap_or_default().to_string_lossy();
         let lower = file.to_lowercase();
         let stem = home.file_stem().unwrap_or_default().to_string_lossy();
         let (kind, name) = if home.is_dir() {
-            if home.parent() == Some(bin.as_path()) {
+            if dir == mods {
+                (Kind::ModsFolder, file.into_owned())
+            } else if dir == dlc && owned(&at) {
+                (Kind::Dlc, file.into_owned())
+            } else {
                 continue;
             }
-            (Kind::ModsFolder, file.into_owned())
+        } else if dir == menu && owned(&at) {
+            (Kind::Menu, stem.into_owned())
+        } else if dir != bin {
+            continue;
         } else if lower.ends_with(".asi") {
             (Kind::Asi, stem.into_owned())
         } else if lower.ends_with(".addon64") {
             (Kind::Addon, stem.into_owned())
         } else if lower == "dxgi.dll" {
             (Kind::ReShade, "ReShade".to_owned())
+        } else if owned(&at)
+            && !lower
+                .strip_suffix(".ini")
+                .is_some_and(|s| stems.contains(s))
+        {
+            (Kind::Bin, file.into_owned())
         } else {
             continue;
         };
@@ -146,6 +197,11 @@ pub fn mod_set(game_dir: &Path, cache: &mut HashCache) -> io::Result<Vec<ModEntr
                     keys: Vec::new(),
                 },
             ],
+            Kind::Bin if !lower.ends_with(".ini") => vec![ConfigSource {
+                path: bin.join(Path::new(&name).with_extension("ini")),
+                section: None,
+                keys: Vec::new(),
+            }],
             _ => Vec::new(),
         };
         specs.push(ModSpec {
@@ -176,6 +232,97 @@ pub fn mod_set(game_dir: &Path, cache: &mut HashCache) -> io::Result<Vec<ModEntr
         .iter()
         .map(|spec| mods::fingerprint(&Disk, cache, spec).map(relative))
         .collect()
+}
+
+/// Which binary each script folder in Mods imports from (quen-core's `park::learn`), from the files: the
+/// `import function` names of every `.ws` under each folder of `mods` that isn't a link or on `never`, looked for in
+/// the binaries in bin quen parks or never parks (`.asi`, `.addon64`, `dxgi.dll`, and `managed`: a Vortex mod's other
+/// `.dll`, `.addon` files), less the natives of the game's exe (`game_exe` in bin). The game's own DLLs aren't read
+/// (hundreds of MB: 11 s on the owner's PC, 2026-10-22). Err names a file that can't be read.
+pub fn pairs(
+    game_dir: &Path,
+    game_exe: &str,
+    mods: &[Entry],
+    bin: &[Entry],
+    never: &[&str],
+    managed: &[park::Managed],
+) -> Result<Learned, String> {
+    let read = |path: &Path| fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
+    let (mods_dir, bin_dir) = (game_dir.join("Mods"), boot::bin_dir(game_dir));
+    let mut imports = Vec::new();
+    for e in mods.iter().filter(|e| e.is_dir && !e.is_link) {
+        if never.iter().any(|n| n.eq_ignore_ascii_case(&e.name)) {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut todo = vec![mods_dir.join(&e.name)];
+        while let Some(dir) = todo.pop() {
+            let entries = fs::read_dir(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => todo.push(path),
+                    Ok(t)
+                        if t.is_file()
+                            && path
+                                .extension()
+                                .is_some_and(|x| x.eq_ignore_ascii_case("ws")) =>
+                    {
+                        for name in wcc::imports(&read(&path)?) {
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !names.is_empty() {
+            imports.push((e.name.clone(), names));
+        }
+    }
+    let wanted: BTreeSet<String> = imports
+        .iter()
+        .flat_map(|(_, n)| n.iter().cloned())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Learned::default());
+    }
+    let natives = park::held(&read(&bin_dir.join(game_exe))?, &wanted);
+    let vortex = |name: &str| {
+        let mut units = managed.iter().flat_map(|m| &m.units);
+        units.any(|(home, n)| *home == Home::Bin && n.eq_ignore_ascii_case(name))
+    };
+    let binary = |name: &str| {
+        let lower = name.to_lowercase();
+        park::bin_kind(&lower)
+            || ([".dll", ".addon"].iter().any(|x| lower.ends_with(x)) && vortex(name))
+    };
+    let mut held = Vec::new();
+    for e in bin
+        .iter()
+        .filter(|e| !e.is_dir && !e.is_link && binary(&e.name))
+    {
+        held.push((
+            e.name.clone(),
+            park::held(&read(&bin_dir.join(&e.name))?, &wanted),
+        ));
+    }
+    Ok(park::learn(&imports, &held, &natives, never))
+}
+
+/// Script Merger's merges, from its inventory in the game folder (`WitcherScriptMerger\MergeInventory.xml`, where
+/// Vortex puts the tool): none without the file; Err why it can't be read.
+pub fn merges(game_dir: &Path) -> Result<Vec<Merge>, String> {
+    let path = game_dir
+        .join("WitcherScriptMerger")
+        .join("MergeInventory.xml");
+    match fs::read(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
+        Ok(bytes) => park::merges(&String::from_utf8_lossy(&bytes)),
+    }
 }
 
 /// The game's ledger row: its exe `exe` (the config's `game_exe` in bin) and the build the launch's gate read of it.

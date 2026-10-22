@@ -832,7 +832,7 @@ pub(crate) fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "enum": ["test", "play"], "description": "test (default): a test boot as above. play: a play session for the user (quen_guide): dx12user.settings, ReShade's ini and input.settings untouched unless asked; no park, keep, preset, profiler, extra_env, stage or stage_mods; without save the user picks one; photo defaults false; the user has the controls, and the session ends when the game exits"},
-                    "save": {"type": "string", "description": "a save in gamesaves: its name in any case, with or without .sav (as the game's own list names it); omitted: the newest QuickSave (mode play: none)"},
+                    "save": {"type": "string", "description": "a save in gamesaves: its name, any case, .sav optional; omitted: the newest QuickSave (mode play: none)"},
                     "settings": {
                         "type": "object",
                         "description": "dx12user.settings overrides, checked before anything is touched",
@@ -843,8 +843,8 @@ pub(crate) fn tools() -> Value {
                         "additionalProperties": false,
                     },
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
-                    "park": {"type": "string", "description": "mods to park: comma names, or ALL (the Native Bridge and quen's package never are; the W3 Game State Bridge only with both halves named: W3GameStateBridge.asi,modW3GameStateBridge)"},
-                    "keep": {"type": "string", "description": "with ALL: comma names to keep"},
+                    "park": {"type": "string", "description": "comma names or ALL: a Mods folder, bin file, Vortex mod (nexus:<id> or name) or its file; never the Native Bridge, quen's package; a script folder and its imports' binary only together, both taken by ALL"},
+                    "keep": {"type": "string", "description": "names as in park, kept"},
                     "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session, a mod menu's .xml into bin\\config\\r4game\\user_config_matrix\\pc; one there of that name is parked first. The end recycles them and each bin copy's new <stem>.log"},
                     "stage_mods": {"type": "array", "items": {"type": "string"}, "description": "mod folders (absolute paths) copied into Mods, as stage into bin"},
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
@@ -918,7 +918,9 @@ pub(crate) fn tools() -> Value {
                 settings_diff (what was asked), settings_written (each dx12user.settings line the launch changes, \
                 Section:Key=Value, of the forced keys and the overrides: a key already at its value isn't listed), \
                 command, game_build (the exe's sha256 and whether quen knows it), vortex (with Vortex's manifests: \
-                each parked item's owner, the Vortex files that stay loaded). Refused as the \
+                each parked item's owner; what stays loaded of a mod parked in part, and files quen can't park), park \
+                (pairs learned from the files, folders they can't settle, Script Merger folders parked along). \
+                Refused as the \
                 launch would be (a bad spec, a journal left, harness leftovers; with needs: what is missing), and \
                 while a session is live or another quen holds the lock: plan before a launch or after its end. \
                 Subagents may call it; only the agent the user talks to launches.",

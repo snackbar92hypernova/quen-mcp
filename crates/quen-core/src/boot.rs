@@ -47,13 +47,15 @@ pub struct Inputs<'a> {
     /// dx12user.settings overrides: [`settings::apply_flat`] and [`settings::apply_sections`] specs.
     pub flat: &'a str,
     pub sections: &'a str,
-    /// What to park ([`park::plan`]), from listings of `Mods` and `bin\x64_dx12` the caller read.
+    /// What to park ([`park::plan`]), from listings of `Mods` and `bin\x64_dx12` the caller read, and what else the
+    /// planner sees (the menu and DLC folders, a mod manager's mods, unsettled pairs, Script Merger's merges).
     pub park: &'a str,
     pub keep: &'a str,
     pub never_park: &'a [&'a str],
     pub pairs: &'a [[&'a str; 2]],
     pub mods: &'a [Entry],
     pub bin: &'a [Entry],
+    pub more: park::More<'a>,
     pub renodx: Option<RenoDx<'a>>,
     /// ReShade.ini `[ADDON] LoadFromDllMain`: the devkit's path to load it, `""` not to; `None` leaves it as it is.
     /// Independent of `renodx` (feature tests 2b: with the devkit alone, nothing loaded it).
@@ -157,6 +159,11 @@ pub fn menu_dir(game_dir: &Path) -> PathBuf {
     config.join("r4game").join("user_config_matrix").join("pc")
 }
 
+/// The game's `DLC` folder, where a mod manager deploys DLC mods (5.01 keeps its own DLC under `content`).
+pub fn dlc_dir(game_dir: &Path) -> PathBuf {
+    game_dir.join("DLC")
+}
+
 /// Whether [`stage`] copies `file` into [`menu_dir`] (a `.xml`: a mod's menu, finding 49) rather than bin.
 pub fn is_menu(file: &Path) -> bool {
     file.extension()
@@ -192,12 +199,14 @@ pub fn plan(fs: &dyn Fs, inputs: &Inputs) -> Result<Vec<Change>, String> {
             entries: inputs.bin,
         },
         &inputs.game_dir.join(PARKED),
+        &inputs.more,
     )
     .map_err(|e| format!("park: {e}"))?;
+    let dlc_dir = dlc_dir(inputs.game_dir);
     let script_mods = parked
         .moves
         .iter()
-        .any(|m| m.from.parent() == Some(&mods_dir));
+        .any(|m| m.from.parent() == Some(&mods_dir) || m.from.parent() == Some(&dlc_dir));
     changes.extend(parked.moves.into_iter().map(|m| Change::Move {
         from: m.from,
         to: m.to,
@@ -893,9 +902,10 @@ mod tests {
             park: "",
             keep: "",
             never_park: park::W3_NEVER_PARK,
-            pairs: park::W3_PAIRS,
+            pairs: &[["modW3GameStateBridge", "W3GameStateBridge.asi"]],
             mods,
             bin,
+            more: park::More::default(),
             renodx: None,
             load_from_dll_main: None,
             play: false,
