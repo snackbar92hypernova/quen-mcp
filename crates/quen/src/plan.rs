@@ -559,7 +559,7 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             session::utc_ms(SystemTime::now()),
             plan.tag
         );
-        if let Some(shown) = status::measuring(&cx, call, estimate.ceil() as u64, &mut None) {
+        if let Some(shown) = status::measuring(&cx, call, estimate.ceil() as u64, None, &mut None) {
             fields.insert("status".into(), json!(shown));
         }
         cx.live.in_plan.set(true);
@@ -1086,10 +1086,11 @@ mod tests {
         check["check"] = json!(true);
         let out = run(&mut session, check);
         assert_eq!(out["ok"], true, "{out}");
-        // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, the wait 1; and the plan's measuring
-        // line, confirmed after 0.5 s, up 5 s before its first window: 0.5 + 4.8 s more after the settime.
-        assert_eq!(out["estimate_s"], 30.5, "{out}");
-        assert_eq!(out["steps"][1]["est_s"], 24.0, "{out}");
+        // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, each after the line naming its state
+        // (0.5 s for the game's answer, and the 1 s its 3 s needs past the settle), the wait 1; and the plan's
+        // measuring line, confirmed after 0.5 s, up 5 s before its first window: 0.5 + 4.8 s more after the settime.
+        assert_eq!(out["estimate_s"], 36.5, "{out}");
+        assert_eq!(out["steps"][1]["est_s"], 30.0, "{out}");
         assert!(!fx.dir.join("data/captures/s1").exists(), "nothing written");
     }
 }

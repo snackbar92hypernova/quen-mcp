@@ -257,6 +257,15 @@ impl Call<'_> {
         self.progress(&format!("{step} done"));
     }
 
+    /// [`Call::lap`], added to what `step` took before in this call: a wait each window has, summed.
+    pub(crate) fn lap_sum(&mut self, step: &str) {
+        let before = self.timing.get(step).and_then(Value::as_f64).unwrap_or(0.0);
+        self.lap(step);
+        let secs = before + self.timing[step].as_f64().unwrap_or(0.0);
+        self.timing
+            .insert(step.into(), json!((secs * 100.0).round() / 100.0));
+    }
+
     /// The client cancelled this call or closed its connection, or quen is shutting down.
     pub(crate) fn stopped(&self) -> bool {
         self.shared.stopping.load(Ordering::SeqCst)
