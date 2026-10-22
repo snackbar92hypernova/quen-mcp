@@ -4,7 +4,7 @@
 //! quen-core's `gamedata`; nothing is written into the game folder or REDkit's. The bundles' tables of contents stay in
 //! memory while quen runs, each read again once its bundle's size or write time changes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -124,17 +124,18 @@ pub fn tools() -> Vec<Value> {
             "name": "script_compile",
             "description": "Runs REDkit's wcc_lite compilescripts on a scratch copy under quen's data root \
                 (logs\\<time>-compile): the game's content\\content0\\scripts, each Mods\\*\\content\\scripts over it \
-                (a file two mods carry: the first in name order wins, listed in conflicts), then extra. stubs: true \
-                turns the mods' import functions into plain stubs (wcc_lite can't bind them), so a clean tree exits 0. \
-                wcc_lite rewrites files in the game's documents folder: each *.settings and *.settings.bak there is \
-                backed up first and put back after, journaled, so a crash is undone by the replay. Result: \
-                exit_code, errors (file, line, msg; file relative to the tree), warning_count, wcc_log (its log, \
-                copied). Refused while a session is live, while the game or another wcc_lite runs, without REDkit, \
-                and until the user agreed in REDkit's licence dialog (quen_setup licence): needs says which. About \
-                25 s on the game's scripts: tell the user first. Counts as a busy machine for the measure tools.",
+                (a file two mods carry: the first in name order wins, listed in conflicts), then extra. stubs: true: \
+                as shipped, then, if some of the mods' and extra's imports can't bind, again in scratch\\stubbed with \
+                those as plain stubs (imports_stubbed; imports_bound: the rest). wcc_lite rewrites files in the \
+                game's documents folder: each *.settings and *.settings.bak there is backed up first and put back \
+                after, journaled. Result (the last run's): exit_code, errors (file, line, msg; file relative to the \
+                tree), warning_count, wcc_log (its log, copied). Refused while a session is live, \
+                while the game or another wcc_lite runs, without REDkit, and until the user agreed in REDkit's \
+                licence dialog (quen_setup licence): needs says which. About 25 s a run on the game's scripts: tell \
+                the user first. Counts as a busy machine for the measure tools.",
             "inputSchema": {"type": "object", "properties": {
                 "extra": list("mod folders outside the game (absolute paths), each holding content\\scripts, copied over the rest in this order"),
-                "stubs": {"type": "boolean", "description": "replace the mods' and extra's import functions with plain stubs; default false"},
+                "stubs": {"type": "boolean", "description": "a second run with the mods' and extra's imports wcc_lite couldn't bind as plain stubs; default false"},
                 "time_limit_s": {"type": "integer", "minimum": 60, "maximum": 1800, "description": "wcc_lite is killed after this, default 600"},
             }, "additionalProperties": false},
         }),
@@ -901,18 +902,20 @@ fn spill(
     }
 }
 
-/// One source of the compile's tree: a folder copied over what is there, its files counted, and whether its
-/// import functions were stubbed.
+/// One source of the compile's tree: a folder copied over what is there.
 struct Source {
     name: String,
     scripts: PathBuf,
-    stub: bool,
 }
 
-/// Copies every file under `from` into `to` (folders made as needed), each `.ws` with its import functions stubbed
-/// when `stub`; the relative paths copied, and how many imports were stubbed.
-fn copy_scripts(from: &Path, to: &Path, stub: bool) -> io::Result<(Vec<String>, usize)> {
-    let (mut copied, mut stubbed) = (Vec::new(), 0);
+/// Copies every file under `from` into `to` (folders made as needed); the relative paths copied. With `stub`, each
+/// `.ws` comes with the names it imports, and its import functions named in `stub` are stubbed.
+fn copy_scripts(
+    from: &Path,
+    to: &Path,
+    stub: Option<&BTreeSet<String>>,
+) -> io::Result<Vec<(String, Vec<String>)>> {
+    let mut copied = Vec::new();
     let mut todo = vec![from.to_owned()];
     while let Some(dir) = todo.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -929,35 +932,34 @@ fn copy_scripts(from: &Path, to: &Path, stub: bool) -> io::Result<(Vec<String>, 
             let is_ws = rel
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("ws"));
-            let out = match (stub && is_ws, bytes.strip_prefix(&[0xFF, 0xFE])) {
-                (false, _) => bytes,
+            let stub = stub.filter(|_| is_ws);
+            let names = stub.map_or_else(Vec::new, |_| wcc::imports(&bytes));
+            // A file importing none of `stub` is copied byte for byte.
+            let stub = stub.filter(|stub| names.iter().any(|n| stub.contains(n)));
+            let out = match (stub, bytes.strip_prefix(&[0xFF, 0xFE])) {
+                (None, _) => bytes,
                 // UTF-16LE with its BOM, as some script files are.
-                (true, Some(utf16)) => {
+                (Some(stub), Some(utf16)) => {
                     let units: Vec<u16> = utf16
                         .chunks_exact(2)
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
-                    let (text, n) = wcc::stub_imports(&String::from_utf16_lossy(&units));
-                    stubbed += n;
+                    let text = wcc::stub_imports(&String::from_utf16_lossy(&units), stub);
                     [0xFF, 0xFE]
                         .into_iter()
                         .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
                         .collect()
                 }
-                (true, None) => match String::from_utf8(bytes) {
-                    Ok(text) => {
-                        let (text, n) = wcc::stub_imports(&text);
-                        stubbed += n;
-                        text.into_bytes()
-                    }
+                (Some(stub), None) => match String::from_utf8(bytes) {
+                    Ok(text) => wcc::stub_imports(&text, stub).into_bytes(),
                     Err(e) => e.into_bytes(),
                 },
             };
             fs::write(&dest, out)?;
-            copied.push(rel.display().to_string());
+            copied.push((rel.display().to_string(), names));
         }
     }
-    Ok((copied, stubbed))
+    Ok(copied)
 }
 
 fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -1009,54 +1011,97 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
             )
         })
         .filter(|(_, scripts)| scripts.is_dir())
-        .map(|(name, scripts)| Source {
-            name,
-            scripts,
-            stub: stubs,
-        })
+        .map(|(name, scripts)| Source { name, scripts })
         .collect();
     mods.sort_by_key(|m| m.name.to_lowercase());
     // The first in name order wins a file two mods carry: copied last.
     let mut sources = vec![Source {
         name: r"content\content0\scripts".into(),
         scripts: game.join(r"content\content0\scripts"),
-        stub: false,
     }];
     sources.extend(mods.into_iter().rev());
     sources.extend(extra.iter().map(|p| Source {
         name: p.display().to_string(),
         scripts: p.join(r"content\scripts"),
-        stub: stubs,
     }));
-    let (tree, out_dir) = (scratch.join("scripts"), scratch.join("out"));
+    // The game's scripts as they are, the mods' and extra's with their imports named in `stub` stubbed.
+    let copy = |tree: &Path, stub: &BTreeSet<String>| {
+        sources
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                copy_scripts(&s.scripts, tree, (k > 0).then_some(stub)).map_err(|e| {
+                    Done::Failed(format!("copying {}: {e}", s.scripts.display()), Map::new())
+                })
+            })
+            .collect::<Result<Vec<_>, Done>>()
+    };
+    let copies = copy(&scratch.join("scripts"), &BTreeSet::new())?;
     let mut copied = Vec::new();
     let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (k, s) in sources.iter().enumerate() {
-        let (files, stubbed) = copy_scripts(&s.scripts, &tree, s.stub).map_err(|e| {
-            Done::Failed(format!("copying {}: {e}", s.scripts.display()), Map::new())
-        })?;
-        if k > 0 && k < sources.len() - extra.len() {
-            for f in &files {
+    // The mods' and extra's files in the tree (a path's last copy), with the names each imports.
+    let mut imported: BTreeMap<String, &[String]> = BTreeMap::new();
+    for (k, (s, files)) in sources.iter().zip(&copies).enumerate() {
+        for (f, names) in files.iter().filter(|_| k > 0) {
+            if k < sources.len() - extra.len() {
                 by_file
                     .entry(gamedata::key(f))
                     .or_default()
                     .push(s.name.clone());
             }
+            imported.insert(gamedata::key(f), names);
         }
-        copied.push(json!({"source": s.name, "files": files.len(), "imports_stubbed": stubbed}));
+        copied.push(json!({"source": s.name, "files": files.len()}));
     }
+    let imports: BTreeSet<String> = imported.into_values().flatten().cloned().collect();
     let conflicts: Vec<Value> = by_file
         .into_iter()
         .filter(|(_, mods)| mods.len() > 1)
         .map(|(file, mods)| json!({"file": file, "used": mods.last(), "mods": mods}))
         .collect();
-    fs::create_dir_all(&out_dir)
-        .map_err(|e| Done::Failed(format!("{}: {e}", out_dir.display()), Map::new()))?;
-    call.lap("copy");
+    call.lap_sum("copy");
     let mut fields = Fields::new();
     fields.insert("scratch".into(), json!(scratch));
     fields.insert("sources".into(), json!(copied));
     fields.insert("conflicts".into(), json!(conflicts));
+    // As shipped first: wcc_lite's own errors name the imports it can't bind, and only those are stubbed for the
+    // second run. It binds the engine's natives itself, and a stub of one is an error (finding 100).
+    let mut out = fields.clone();
+    let errors = compile_pass(session, call, &exe, &docs, &scratch, limit, &mut out)?;
+    if !stubs {
+        return Ok(out);
+    }
+    let stub: BTreeSet<String> = wcc::unbound(&errors)
+        .into_iter()
+        .filter(|n| imports.contains(n))
+        .collect();
+    if !stub.is_empty() {
+        let dir = scratch.join("stubbed");
+        copy(&dir.join("scripts"), &stub)?;
+        call.lap_sum("copy");
+        out = fields;
+        compile_pass(session, call, &exe, &docs, &dir, limit, &mut out)?;
+    }
+    let bound: Vec<&String> = imports.difference(&stub).collect();
+    out.insert("imports_stubbed".into(), json!(stub));
+    out.insert("imports_bound".into(), json!(bound));
+    Ok(out)
+}
+
+/// One wcc_lite compilescripts of `dir`\scripts into `dir`\out under [`run_journaled`], its files in `dir`, killed
+/// past `limit`. `fields` gains the result's (exit_code, log, wcc_log, error counts, errors, messages); its errors.
+fn compile_pass(
+    session: &mut Session,
+    call: &mut Call,
+    exe: &Path,
+    docs: &Path,
+    dir: &Path,
+    limit: Duration,
+    fields: &mut Fields,
+) -> Result<Vec<wcc::Message>, Done> {
+    let (tree, out_dir) = (dir.join("scripts"), dir.join("out"));
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| Done::Failed(format!("{}: {e}", out_dir.display()), Map::new()))?;
     let argv = [
         exe.display().to_string(),
         "compilescripts".into(),
@@ -1066,19 +1111,13 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
         "-noninteractivecrash".into(),
     ];
     let started = SystemTime::now();
-    let (code, log) = run_journaled(
-        session,
-        call,
-        &docs,
-        &scratch,
-        &argv,
-        &mut fields,
-        |_, t| (t > limit).then(|| "it ran past time_limit_s".into()),
-    )?;
+    let (code, log) = run_journaled(session, call, docs, dir, &argv, fields, |_, t| {
+        (t > limit).then(|| "it ran past time_limit_s".into())
+    })?;
     fields.insert("exit_code".into(), json!(code));
     fields.insert("log".into(), json!(log));
-    let bin = exe.parent().and_then(Path::parent).unwrap_or(&exe);
-    let (log_in, copy) = (bin.join("wcc.log"), scratch.join("wcc.log"));
+    let bin = exe.parent().and_then(Path::parent).unwrap_or(exe);
+    let (log_in, copy) = (bin.join("wcc.log"), dir.join("wcc.log"));
     // An earlier run's log isn't this one's.
     let fresh = fs::metadata(&log_in)
         .and_then(|m| m.modified())
@@ -1096,7 +1135,7 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
             fields.insert("error_count".into(), json!(errors.len()));
             fields.insert("warning_count".into(), json!(warnings.len()));
             if errors.len() > ERRORS_INLINE || !warnings.is_empty() {
-                let all = scratch.join("messages.json");
+                let all = dir.join("messages.json");
                 let written = fs::write(
                     &all,
                     json!({"errors": errors, "warnings": warnings}).to_string(),
@@ -1110,12 +1149,13 @@ fn compile(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
                 "errors".into(),
                 json!(errors.iter().take(ERRORS_INLINE).collect::<Vec<_>>()),
             );
+            Ok(errors)
         }
         Err(e) => {
             fields.insert("wcc_log".into(), json!(format!("not copied: {e}")));
+            Ok(Vec::new())
         }
     }
-    Ok(fields)
 }
 
 /// What every wcc_lite run needs, checked before anything changes (`tool` names the caller in needs): REDkit, the
@@ -1225,7 +1265,7 @@ fn run_wcc(
         Journal::create(&JournalFs, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     boot::apply(&JournalFs, &mut journal, changes, &|| call.stopped())
         .map_err(|e| format!("backing up the documents folder's settings: {e}"))?;
-    call.lap("journal");
+    call.lap_sum("journal");
     let log = scratch.join("wcc_lite.log");
     let exe = Path::new(&argv[0]);
     let job = Job::new().map_err(|e| format!("wcc_lite's job: {e}"))?;
@@ -1254,7 +1294,7 @@ fn run_wcc(
         }
     };
     call.artifact(&log);
-    call.lap("wcc_lite");
+    call.lap_sum("wcc_lite");
     Ok((code, log))
 }
 
@@ -1658,11 +1698,15 @@ mod tests {
         );
     }
 
-    /// A mod's scripts are copied with their imports stubbed, UTF-8 and UTF-16 alike; without stubs, as they are.
+    /// A mod's scripts are copied with the imports named stubbed, UTF-8 and UTF-16 alike, each with the names it
+    /// imports; without stubs, as they are.
     #[test]
     fn scripts_are_copied_with_stubs() {
         let t = Temp::new("scripts");
-        t.put(r"mod\local\a.ws", "import function A() : int;\n");
+        t.put(
+            r"mod\local\a.ws",
+            "import function A() : int;\nimport function Bound();\n",
+        );
         let utf16: Vec<u8> = [0xFF, 0xFE]
             .into_iter()
             .chain(
@@ -1672,16 +1716,29 @@ mod tests {
             )
             .collect();
         t.put(r"mod\b.ws", &utf16);
-        let (files, stubbed) = copy_scripts(&t.0.join("mod"), &t.0.join("tree"), true).unwrap();
-        assert_eq!((files.len(), stubbed), (2, 2));
+        let stub = ["A", "B"].map(String::from).into();
+        let mut files = copy_scripts(&t.0.join("mod"), &t.0.join("tree"), Some(&stub)).unwrap();
+        files.sort();
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            [
+                ("b.ws".into(), names(&["B"])),
+                (r"local\a.ws".into(), names(&["A", "Bound"]))
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(t.0.join(r"tree\local\a.ws")).unwrap(),
+            "function A() : int { return 0; }\nimport function Bound();\n"
+        );
         let b = fs::read(t.0.join(r"tree\b.ws")).unwrap();
         let back: Vec<u16> = b[2..]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(String::from_utf16(&back).unwrap(), "function B() { }");
-        let (_, stubbed) = copy_scripts(&t.0.join("mod"), &t.0.join("plain"), false).unwrap();
-        assert_eq!(stubbed, 0);
+        let plain = copy_scripts(&t.0.join("mod"), &t.0.join("plain"), None).unwrap();
+        assert!(plain.iter().all(|(_, names)| names.is_empty()));
         assert_eq!(fs::read(t.0.join(r"plain\b.ws")).unwrap(), utf16);
     }
 
