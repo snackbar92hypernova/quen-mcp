@@ -23,7 +23,8 @@
 //   quen-w3 0.1.5) reads back "x y z heading day hour rain snow skyclear weather" (rain, snow and skyclear from quen-w3
 //   0.1.9) and changes nothing. notice (from quen-w3 0.1.8) shows quen's text on screen for 8 s, as QUEN_Say does, and
 //   changes nothing; from quen-w3 0.1.15 for the time quen gives, with notice.hide to take it down and sound to play a
-//   sound event. items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
+//   sound event; from quen-w3 0.1.16 a lasting one on quen's own HUD module where the HUD draws it (QUEN_Show).
+//   items.add (from quen-w3 0.1.10) adds an item by its name, as the console's additem does, equips it
 //   if asked, and reads back "before after equipped": the item's count before and after, and 0 or 1. world.actors (from
 //   quen-w3 0.1.10) reads back the actors near the player (QUENRPC_Actors) and changes nothing; from quen-w3 0.1.12 by
 //   tag or class, each with its id. From quen-w3 0.1.13 four more reads that change nothing: scene.frame, what the
@@ -67,6 +68,10 @@ import function QUEN_CamAt(frame : int) : string;
 @addField(CR4Game) var quenPhotoMenu : CR4PhotomodeMenu;  // photo mode's menu while it is open, else NULL
 @addField(CR4Game) var quenGradeOpen : array<float>;     // the grading sliders (QUEN_Grade) as that menu opened
 @addField(CR4Game) var quenNoclip : bool;  // cam.noclip turned the photo-mode camera's no-clip on
+@addField(CR4Game) var quenHud : CR4ScriptedHud;  // the HUD whose module table holds quen's line (QUEN_HudModule)
+@addField(CR4Game) var quenHudReady : bool;       // that HUD got UpdateHUD() once quen's module had loaded
+@addField(CR4Game) var quenLine : string;         // quen's lasting line (a notice of a minute or more), "" when none
+@addField(CR4Game) var quenLineMs : float;        // its time
 
 @wrapMethod(CR4Game) function OnTick()
 {
@@ -96,6 +101,9 @@ import function QUEN_CamAt(frame : int) : string;
 	quenStateSent = 0;
 	quenStateDue = 0;
 	QUEN_State(0);
+	// A load or the main menu: quen sends its line again into the next game, whose HUD has no table entry yet.
+	quenLine = "";
+	quenHud = NULL;
 }
 
 // Photo mode switches on before its menu opens and off before it closes (photomodeManager.ws), so these polls see the
@@ -283,7 +291,140 @@ function QUENRPC_Env() : string
 	{
 		quenStateSent = flags;
 		QUEN_State(flags);
+		// From quen-w3 0.1.16: photo mode, a menu or a scene in or out, quen's lasting line moves between its HUD
+		// module and the notification (QUEN_Show).
+		if (quenLine != "")
+			QUEN_Show(quenLine, quenLineMs);
 	}
+}
+
+// ---- quen's line ----
+
+// quen's own HUD module (from quen-w3 0.1.16): Mods\modQuen's bundle holds its movie,
+// gameplay\gui_new\swf\hud\hud_quen.redswf (quen-mcp w3\hud\quen\QuenHud.as), registered under the HUD's dormant
+// WatermarkModule: vanilla never creates it, its script class has no OnTick, its anchor sits at the top centre. The
+// entry is added at run time on the HUD root's moduleManager, as Hud.as adds the others, then DiscardHudModule and
+// CreateHudModule (the indicator probe boot, 2026-10-21: no vanilla file or wrap). Its movie loads on a later tick.
+// Returns the module's sprite once loaded, NULL until then; with load, adds the entry first on a HUD without it.
+@addMethod(CR4Game) function QUEN_HudModule(load : bool) : CScriptedFlashSprite
+{
+	var hud : CR4ScriptedHud;
+	var manager : CScriptedFlashObject;
+	var add : CScriptedFlashFunction;
+	var module : CHudModule;
+	var s : CScriptedFlashSprite;
+
+	hud = (CR4ScriptedHud)GetHud();
+	if (!hud || !hud.GetHudFlash())
+		return NULL;
+	if (hud != quenHud)
+	{
+		if (!load)
+			return NULL;
+		quenHud = hud;
+		quenHudReady = false;
+		manager = hud.GetHudFlash().GetMemberFlashObject("moduleManager");
+		if (manager)
+			add = manager.GetMemberFlashFunction("AddEntry");
+		if (!add)
+			return NULL;
+		// Hud.as's own depth for it (its commented-out entry).
+		add.InvokeSelfThreeArgs(FlashArgString("WatermarkModule"), FlashArgString("hud_quen.swf"), FlashArgInt(10));
+		hud.DiscardHudModule("WatermarkModule");
+		hud.CreateHudModule("WatermarkModule");
+		return NULL;
+	}
+	module = hud.GetHudModule("WatermarkModule");
+	if (module)
+		s = module.GetModuleFlash();
+	if (!s || !s.GetMemberFlashFunction("SetText"))  // not loaded yet, or another mod's movie in the slot
+		return NULL;
+	if (!quenHudReady)
+	{
+		// A module that loads late comes up in its Flash Hide state: the current input context, sent again, gives it
+		// that context's state (the probe boot: OnDemand in Exploration).
+		quenHudReady = true;
+		hud.UpdateHUD();
+	}
+	return s;
+}
+
+// Whether the HUD draws quen's module now: its root shown (the user's HUD toggle and a quest's ShowHud hide it, hud.ws
+// ForceShow), no photo mode and no menu (neither draws the HUD, while its Flash still reads shown: the probe boot), and
+// the module out of its Flash Hide state (scenes, the radial menu and death hide it: Hud.as hudModuleStateArray).
+@addMethod(CR4Game) function QUEN_HudDrawn(s : CScriptedFlashSprite) : bool
+{
+	var gui : CR4GuiManager;
+	var states : CScriptedFlashObject;
+
+	gui = GetGuiManager();
+	if (!s || GetPhotomodeEnabled() || !gui || gui.IsAnyMenu() || !GetHud().GetHudFlash().GetVisible())
+		return false;
+	states = s.GetMemberFlashObject("stateMachine");
+	return states && states.GetMemberFlashString("current") != "Hide";
+}
+
+// quen's module hidden within the call in any state (the probe boot: the next tick shows nothing): ShowElement(false,
+// true) as hudModuleBase.ws sends it, so a context change doesn't bring it back, then again past the state.
+@addMethod(CR4Game) function QUEN_HudHide()
+{
+	var s : CScriptedFlashSprite;
+	var show : CScriptedFlashFunction;
+
+	s = QUEN_HudModule(false);
+	if (!s)
+		return;
+	show = s.GetMemberFlashFunction("ShowElement");
+	show.InvokeSelfTwoArgs(FlashArgBool(false), FlashArgBool(true));
+	show.InvokeSelfThreeArgs(FlashArgBool(false), FlashArgBool(true), FlashArgBool(true));
+}
+
+// quen's line on screen for ms: a lasting one (a minute or more: the module has no timer) on quen's HUD module where
+// the HUD draws it, the notification taken down when it holds quen's line; else on the overlay popup's notification,
+// as to 0.1.15 (it shows in gameplay, photo mode and over the pause menu: the probe boot), the module hidden. The
+// reply: "notice already shown" when the line is up there with this text (quen's re-send changes nothing on screen),
+// "notice shown", or "" when it can't be shown (no HUD module drawn and no overlay popup).
+@addMethod(CR4Game) function QUEN_Show(text : string, ms : float) : string
+{
+	var gui : CR4GuiManager;
+	var popup : CR4OverlayPopup;
+	var note, s : CScriptedFlashSprite;
+	var field : CScriptedFlashTextField;
+	var noted : string;
+
+	gui = GetGuiManager();
+	if (gui)
+		popup = (CR4OverlayPopup)gui.GetPopup('OverlayPopup');
+	if (popup && popup.GetPopupFlash())
+		note = popup.GetPopupFlash().GetChildFlashSprite("notificationModule");
+	if (note)
+		field = note.GetChildFlashTextField("tfMessage");
+	// OverlayPopupMenu.as's notificationModule and its tfMessage (the probe boot's reads).
+	if (field && note.GetVisible() && note.GetAlpha() > 0)
+		noted = field.GetText();
+	if (ms >= 60000)
+		s = QUEN_HudModule(true);
+	if (QUEN_HudDrawn(s))
+	{
+		if (noted != "" && (noted == text || noted == quenLine))
+			popup.ClearNotificationsQueue();
+		field = s.GetChildFlashTextField("tfText");
+		if (field && s.GetVisible() && s.GetAlpha() > 0 && field.GetText() == text)
+			return "notice already shown";
+		s.GetMemberFlashFunction("SetText").InvokeSelfOneArg(FlashArgString(text));
+		s.GetMemberFlashFunction("ShowElement").InvokeSelfTwoArgs(FlashArgBool(true), FlashArgBool(true));
+		return "notice shown";
+	}
+	QUEN_HudHide();
+	// Only on the overlay popup there is: without one, the GUI manager's ShowNotification requests it with the text,
+	// which may then show after a notice.hide found none to hide.
+	if (!popup || !popup.GetPopupFlash())
+		return "";
+	if (noted == text)
+		return "notice already shown";
+	// queue false: quen's replaces a notification on screen (OverlayPopupMenu.as showNotification).
+	popup.ShowNotification(text, ms, false);
+	return "notice shown";
 }
 
 // ---- camera paths ----
@@ -886,8 +1027,6 @@ function QUENRPC_PhotoPose() : string
 	var t : GameTime;
 	var gui : CR4GuiManager;
 	var popup : CR4OverlayPopup;
-	var note : CScriptedFlashSprite;
-	var field : CScriptedFlashTextField;
 	var fx : CR4PhotomodeEffects;
 	var item, cls : name;
 	var ids : array<SItemUniqueId>;
@@ -1317,36 +1456,32 @@ function QUENRPC_PhotoPose() : string
 
 		case "notice":
 			// "<duration_ms> <text>", which the ASI checked: 1 to 3600000 ms (8000 from a quen before 0.1.15), 1 to 160
-			// bytes, no control character. Only on the overlay popup there is: without one, the GUI manager's ShowNotification
-			// requests it with the text, which may then show after a notice.hide found none to hide. queue false: quen's
-			// replaces a notification on screen (OverlayPopupMenu.as showNotification). From 0.1.15, the same text still
-			// up (OverlayPopupMenu.as notificationModule visible, its tfMessage, the probe boot's reads) is kept as it is,
-			// so quen's re-send every 10 s doesn't take it down and back up.
+			// bytes, no control character. From 0.1.15, the same text still up is kept as it is, so quen's re-send every
+			// 10 s doesn't take it down and back up. From 0.1.16 a lasting line goes on quen's HUD module where the HUD
+			// draws it, and on the notification elsewhere (QUEN_Show); a game state change moves it (QUEN_PollState).
 			QUENRPC_Split(args, head, text);
-			gui = theGame.GetGuiManager();
-			if (gui)
-				popup = (CR4OverlayPopup)gui.GetPopup('OverlayPopup');
-			if (!popup || !popup.GetPopupFlash())
+			line = QUEN_Show(text, StringToFloat(head));
+			if (line == "")
 			{
 				QUEN_Reply(handle, false, "no overlay popup to show a notice on (a load, the main menu)", "");
 				return;
 			}
-			note = popup.GetPopupFlash().GetChildFlashSprite("notificationModule");
-			if (note)
-				field = note.GetChildFlashTextField("tfMessage");
-			if (note && field && note.GetVisible() && note.GetAlpha() > 0 && field.GetText() == text)
+			quenLine = "";
+			if (StringToFloat(head) >= 60000)
 			{
-				QUEN_Reply(handle, true, "notice already shown", "");
-				return;
+				quenLine = text;
+				quenLineMs = StringToFloat(head);
 			}
-			popup.ShowNotification(text, StringToFloat(head), false);
-			QUEN_Reply(handle, true, "notice shown", "");
+			QUEN_Reply(handle, true, line, "");
 			return;
 
 		case "notice.hide":
 			// From 0.1.15: ClearNotificationsQueue, so no queued notification follows into quen's capture: the 0.3 s fade
 			// of hideNotification (OverlayPopupMenu.as), measured 0.312 s in the probe boot. No overlay popup: no
-			// notification to hide.
+			// notification to hide. From 0.1.16 also quen's HUD module, within the call, and the line forgotten, so no
+			// game state change brings it back.
+			quenLine = "";
+			QUEN_HudHide();
 			gui = theGame.GetGuiManager();
 			if (gui)
 				popup = (CR4OverlayPopup)gui.GetPopup('OverlayPopup');

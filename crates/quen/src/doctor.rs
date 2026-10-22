@@ -40,6 +40,11 @@ pub(crate) struct Pin {
 /// quen's in-game package: its two files, which only work as a pair from one release.
 const PACKAGE_ASI: &str = r"bin\x64_dx12\W3Quen.asi";
 const PACKAGE_SCRIPT: &str = r"Mods\modQuen\content\scripts\local\quen.ws";
+/// From quen-w3 0.1.16, modQuen's bundle of the HUD line (w3\hud.py): both files from the ASI's release.
+const PACKAGE_HUD: [&str; 2] = [
+    r"Mods\modQuen\content\blob0.bundle",
+    r"Mods\modQuen\content\metadata.store",
+];
 /// What a mod manager may own of quen's package and of the Native Bridge (`owner`).
 const PACKAGE_OWNED: [&str; 2] = [PACKAGE_ASI, r"Mods\modQuen"];
 const BRIDGE_OWNED: [&str; 2] = [
@@ -65,6 +70,32 @@ const PINS: &[Pin] = &[
         version: "2.0",
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
+    },
+    // 0.1.16: the lasting line on quen's own HUD movie in gameplay (modQuen's bundle, w3\hud.py), in quen.ws; the ASI
+    // differs from 0.1.15's only in its version.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.16",
+        sha256: "75f2d862378e8f53dfd6290c906a0ed9a91c57c8a1a0838a1556faa44f1ecbb2",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.16",
+        sha256: "2589964c0deec1d9708b10951ad2160e914954e29c8a3a37a7c35a3581c78dcb",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[0],
+        version: "quen-w3 0.1.16",
+        sha256: "7592bfafef3c54ff258940f0c732a47e90903b3c4e5e74537a858d7269a1f2c1",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[1],
+        version: "quen-w3 0.1.16",
+        sha256: "7d05a5ee2297d231e71afe10a567a499ff23d78a769d5fa2df01804d120dab7c",
+        exact: true,
     },
     // 0.1.15: notice's duration, notice.hide and sound (the status line, status.rs) in both files.
     Pin {
@@ -519,7 +550,7 @@ pub(crate) const PACKAGE: Dep = Dep {
         0.1.13, world_frame, world_ground, world_ray, world_nav, world_map, game_frame, game_place and game_exec (and \
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
         x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
-        its 0.5 s hide before captures and windows",
+        its 0.5 s hide before captures and windows; from quen-w3 0.1.16, that line in the game's HUD where it is drawn",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
@@ -590,10 +621,27 @@ fn package(cx: &Cx) -> State {
             state.version.as_deref().unwrap_or("unpinned"),
         ));
     }
+    // From quen-w3 0.1.16 its release's HUD bundle too (PACKAGE_HUD), when the ASI's release has pins for it.
+    let version = state.version.clone().unwrap_or_default();
+    let mut hud = cx
+        .pins
+        .iter()
+        .filter(|p| PACKAGE_HUD.contains(&p.file) && p.version == version);
+    let stale = hud.find(|p| {
+        fs::read(game.join(p.file))
+            .map(|b| sha256_hex(&b))
+            .ok()
+            .as_deref()
+            != Some(p.sha256)
+    });
+    if let Some(pin) = stale.filter(|_| state.status == "found") {
+        state.status = "wrong_version";
+        state.note = Some(format!("{} is not {version}'s", pin.file));
+    }
     if state.status == "wrong_version" {
         state.note = state
             .note
-            .map(|n| format!("{n}: unzip one release package over both"));
+            .map(|n| format!("{n}: unzip one release package into the game folder"));
     }
     state
 }
@@ -1917,6 +1965,9 @@ mod tests {
             pin(PACKAGE_ASI, "3", "asi 3"),
             pin(PACKAGE_SCRIPT, "3", "ws 2"),
             pin(PACKAGE_SCRIPT, OLD_MODQUEN, "old ws"),
+            // Release 2 holds the HUD line's bundle too (as quen-w3 0.1.16 does).
+            pin(PACKAGE_HUD[0], "2", "bundle 2"),
+            pin(PACKAGE_HUD[1], "2", "store 2"),
         ];
         let cx = cx(&t, &config, &pins);
         let broken = |why: &str| {
@@ -1965,8 +2016,16 @@ mod tests {
         broken("the old pure-script modQuen: replace it with the release package");
         t.put(&script, "ws 3");
         broken("quen.ws is not the version quen expects (1, 2, 3): unzip one release package");
-        // A quen.ws two releases share pairs with either's ASI, and with no other.
+        // A release's HUD bundle comes with it: missing, or another release's, it is the wrong version.
         t.put(&script, "ws 2");
+        t.put(&asi, "asi 2");
+        broken(r"Mods\modQuen\content\blob0.bundle is not 2's: unzip one release package");
+        t.put(r"game\Mods\modQuen\content\blob0.bundle", "bundle 2");
+        t.put(r"game\Mods\modQuen\content\metadata.store", "store 1");
+        broken(r"Mods\modQuen\content\metadata.store is not 2's");
+        t.put(r"game\Mods\modQuen\content\metadata.store", "store 2");
+        // A quen.ws two releases share pairs with either's ASI, and with no other; a release without a bundle doesn't
+        // look at one.
         for (bytes, version) in [("asi 2", "2"), ("asi 3", "3")] {
             t.put(&asi, bytes);
             let state = (PACKAGE.check)(&cx);
