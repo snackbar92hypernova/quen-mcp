@@ -37,9 +37,11 @@ fn scratch(out: &Value) -> PathBuf {
     )
 }
 
-/// The tree holds the game's scripts and the mods' (stubbed, the first in name order winning a conflict), the switches
-/// are passed, the log's errors and warnings are parsed, and the documents folder's settings are put back (bytes and
-/// write time), the file wcc_lite made recycled, the journal retired. Without REDkit: refused with needs.
+/// The tree holds the game's scripts and the mods' (the first in name order winning a conflict), the switches are
+/// passed, the log's errors and warnings are parsed, and the documents folder's settings are put back (bytes and write
+/// time), the file wcc_lite made recycled, the journal retired. Without stubs, one run on the scripts as they are. With
+/// stubs, that run, then one with only the imports it couldn't bind stubbed: an engine native a mod imports is left to
+/// bind, as a stub of it is an error (finding 100). Without REDkit: refused with needs.
 #[test]
 fn script_compile_runs_wcc_lite_and_puts_the_settings_back() {
     let fx = Fixture::new();
@@ -50,13 +52,22 @@ fn script_compile_runs_wcc_lite_and_puts_the_settings_back() {
         path
     };
     put(r"game\content\content0\scripts\game\x.ws", "class X {}\n");
-    put(
-        r"game\Mods\modA\content\scripts\local\a.ws",
-        "import function A() : int;\n",
-    );
+    let a = "import function A() : int;\n";
+    put(r"game\Mods\modA\content\scripts\local\a.ws", a);
     put(r"game\Mods\modB\content\scripts\local\a.ws", "// modB\n");
+    let native = "import function SetCommunityRadius(r : float);\n";
+    put(r"game\Mods\modGraphics\content\scripts\local\g.ws", native);
     let profile = put(r"docs\profile.settings", "[Telemetry]\noriginal=1\n");
     let mtime = fs::metadata(&profile).unwrap().modified().unwrap();
+    let put_back = || {
+        assert_eq!(
+            fs::read_to_string(&profile).unwrap(),
+            "[Telemetry]\noriginal=1\n"
+        );
+        assert_eq!(fs::metadata(&profile).unwrap().modified().unwrap(), mtime);
+        assert!(!fx.path(r"docs\editoruser.settings").exists());
+        assert!(!fx.path(r"data\state\journal.jsonl").exists());
+    };
     let mut quen = Quen::start(&fx);
     let without = quen.tool("script_compile", json!({}));
     assert_eq!(
@@ -66,33 +77,61 @@ fn script_compile_runs_wcc_lite_and_puts_the_settings_back() {
     drop(quen);
     redkit(&fx);
     let mut quen = Quen::start(&fx);
-    let out = quen.tool("script_compile", json!({"stubs": true}));
-    assert_eq!(out["ok"], true, "{out}");
-    assert_eq!(out["exit_code"], 1);
-    assert_eq!(out["error_count"], 2);
-    let first = json!({"file": r"local\a.ws", "line": 1, "msg": "Cannot find global function 'A' to import."});
-    assert_eq!(out["errors"][0], first);
-    assert_eq!(out["warning_count"], 1);
-    assert_eq!(out["conflicts"][0]["file"], r"local\a.ws");
-    assert_eq!(out["conflicts"][0]["used"], "modA");
+
+    let plain = quen.tool("script_compile", json!({}));
+    assert_eq!(plain["ok"], true, "{plain}");
     assert_eq!(
-        fs::read_to_string(&profile).unwrap(),
-        "[Telemetry]\noriginal=1\n"
+        (&plain["exit_code"], &plain["error_count"]),
+        (&json!(1), &json!(1))
     );
-    assert_eq!(fs::metadata(&profile).unwrap().modified().unwrap(), mtime);
-    assert!(!fx.path(r"docs\editoruser.settings").exists());
-    assert!(!fx.path(r"data\state\journal.jsonl").exists());
-    let scratch = scratch(&out);
-    assert!(scratch.join("journal.jsonl").is_file());
-    let a = fs::read_to_string(scratch.join(r"scripts\local\a.ws")).unwrap();
-    assert_eq!(a, "function A() : int { return 0; }\n");
-    assert!(scratch.join(r"scripts\game\x.ws").is_file());
-    let said = fs::read_to_string(scratch.join("wcc_lite.log")).unwrap();
+    let first = json!({"file": r"local\a.ws", "line": 1, "msg": "Cannot find global function 'A' to import."});
+    assert_eq!(plain["errors"], json!([first]));
+    assert_eq!(plain["warning_count"], 1);
+    assert_eq!(plain["conflicts"][0]["file"], r"local\a.ws");
+    assert_eq!(plain["conflicts"][0]["used"], "modA");
+    assert!(plain.get("imports_stubbed").is_none(), "{plain}");
+    put_back();
+    let dir = scratch(&plain);
+    assert!(dir.join("journal.jsonl").is_file());
+    assert_eq!(
+        fs::read_to_string(dir.join(r"scripts\local\a.ws")).unwrap(),
+        a
+    );
+    assert!(dir.join(r"scripts\game\x.ws").is_file());
+    assert!(!dir.join("stubbed").exists());
+    let said = fs::read_to_string(dir.join("wcc_lite.log")).unwrap();
     assert!(
         said.contains("-agreetoterms -noninteractivecrash"),
         "{said}"
     );
-    assert!(scratch.join("wcc.log").is_file());
+    assert!(dir.join("wcc.log").is_file());
+
+    // The scratch folder is named by the second.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let out = quen.tool("script_compile", json!({"stubs": true}));
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(
+        (&out["exit_code"], &out["error_count"]),
+        (&json!(0), &json!(0)),
+        "{out}"
+    );
+    assert_eq!(out["imports_stubbed"], json!(["A"]));
+    assert_eq!(out["imports_bound"], json!(["SetCommunityRadius"]));
+    put_back();
+    let dir = scratch(&out);
+    let shipped = fs::read_to_string(dir.join("wcc.log")).unwrap();
+    assert!(shipped.contains("'A' to import"), "{shipped}");
+    assert!(
+        out["wcc_log"]
+            .as_str()
+            .unwrap()
+            .ends_with(r"stubbed\wcc.log"),
+        "{out}"
+    );
+    let stubbed = |rel: &str| fs::read_to_string(dir.join(r"stubbed\scripts").join(rel)).unwrap();
+    assert_eq!(stubbed(r"local\a.ws"), "function A() : int { return 0; }\n");
+    assert_eq!(stubbed(r"local\g.ws"), native);
+    assert!(dir.join(r"stubbed\journal.jsonl").is_file());
     assert!(fx.path("recycled").read_dir().unwrap().count() >= 1);
 }
 

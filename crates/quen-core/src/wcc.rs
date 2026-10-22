@@ -1,7 +1,8 @@
 //! REDkit's `wcc_lite compilescripts`, the platform-neutral part: the script errors and warnings in its log, the stubs
-//! that replace a mod's `import function`s (wcc_lite has no Native Bridge to bind them), and the journal's changes
-//! that put back what it writes in the game's documents folder.
+//! that replace the `import function`s it can't bind (it has no Native Bridge to bind a mod's natives), and the
+//! journal's changes that put back what it writes in the game's documents folder.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Serialize;
@@ -55,19 +56,31 @@ pub fn messages(log: &str) -> (Vec<Message>, Vec<Message>) {
     (errors, warnings)
 }
 
-/// `text` with each `import function Name(params) [: type];` replaced by a plain function returning that type's empty
-/// value, as the offline compile in w3/README.md does; and how many it replaced. Anything else is left as it is.
-pub fn stub_imports(text: &str) -> (String, usize) {
+/// The imports wcc_lite couldn't bind, from its errors `Cannot find global function '<name>' to import.`
+pub fn unbound(errors: &[Message]) -> BTreeSet<String> {
+    errors
+        .iter()
+        .filter_map(|e| {
+            e.msg
+                .strip_prefix("Cannot find global function '")?
+                .strip_suffix("' to import.")
+        })
+        .map(Into::into)
+        .collect()
+}
+
+/// `text` with each `import function Name(params) [: type];` whose name is one of `names` replaced by a plain function
+/// returning that type's empty value, as the offline compile in w3/README.md does. Anything else is left as it is.
+pub fn stub_imports(text: &str, names: &BTreeSet<String>) -> String {
     const IMPORT: &str = "import function ";
-    let (mut out, mut rest, mut n) = (String::with_capacity(text.len()), text, 0);
+    let (mut out, mut rest) = (String::with_capacity(text.len()), text);
     while let Some(at) = rest.find(IMPORT) {
         out.push_str(&rest[..at]);
         let after = &rest[at + IMPORT.len()..];
-        match stub(after) {
+        match stub(after, names) {
             Some((stub, used)) => {
                 out.push_str(&stub);
                 rest = &after[used..];
-                n += 1;
             }
             None => {
                 out.push_str(IMPORT);
@@ -76,7 +89,7 @@ pub fn stub_imports(text: &str) -> (String, usize) {
         }
     }
     out.push_str(rest);
-    (out, n)
+    out
 }
 
 /// The names a script file imports by `import function <name>`, each once in order, outside `//` and `/* */` comments:
@@ -125,13 +138,16 @@ pub fn imports(script: &[u8]) -> Vec<String> {
     names
 }
 
-/// `Name(params) [: type] ;` at `s`'s start as a stub, and the bytes it took.
-fn stub(s: &str) -> Option<(String, usize)> {
+/// `Name(params) [: type] ;` at `s`'s start as a stub when `names` holds Name, and the bytes it took.
+fn stub(s: &str, names: &BTreeSet<String>) -> Option<(String, usize)> {
     let word = |s: &str| {
         s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(s.len())
     };
     let name = &s[..word(s)];
+    if !names.contains(name) {
+        return None;
+    }
     let rest = &s[name.len()..];
     let params = &rest[..rest
         .find(')')
@@ -225,25 +241,39 @@ mod tests {
         assert_eq!(warnings[0].line, 6);
     }
 
-    /// Each import becomes a plain function returning its type's empty value; other text stays byte for byte.
+    /// Each import named becomes a plain function returning its type's empty value; other text, imports not named
+    /// among it, stays byte for byte.
     #[test]
-    fn imports_become_stubs() {
+    fn named_imports_become_stubs() {
         let text = "import function QUEN_Next() : string;\n\
                     import function QUEN_State(flags : int);\r\n\
                     import function WNB_Flag( on : bool )  :  bool ;\n\
+                    import function SetCommunityRadius(r : float);\n\
                     // import function broken(;\n\
                     function Keep() {}\n";
-        let (out, n) = stub_imports(text);
-        assert_eq!(n, 3);
+        let names = ["QUEN_Next", "QUEN_State", "WNB_Flag", "broken"]
+            .map(String::from)
+            .into();
         assert_eq!(
-            out,
+            stub_imports(text, &names),
             "function QUEN_Next() : string { return \"\"; }\n\
              function QUEN_State(flags : int) { }\r\n\
              function WNB_Flag( on : bool ) : bool { return false; }\n\
+             import function SetCommunityRadius(r : float);\n\
              // import function broken(;\n\
              function Keep() {}\n"
         );
-        assert_eq!(stub_imports("no imports").0, "no imports");
+        assert_eq!(stub_imports(text, &BTreeSet::new()), text);
+    }
+
+    /// The names come from wcc_lite's binding errors only.
+    #[test]
+    fn unbound_imports_are_named_by_the_errors() {
+        let log = "[Script]: Error local\\quen.ws[49]: Cannot find global function 'QUEN_Next' to import.\n\
+                   [Script]: Error imports.ws[1]: Cannot find global function 'WNB_GetApiVersion' to import.\n\
+                   [Script]: Error game\\x.ws[2]: Unknown function 'Nope'.\n";
+        let names: Vec<String> = unbound(&messages(log).0).into_iter().collect();
+        assert_eq!(names, ["QUEN_Next", "WNB_GetApiVersion"]);
     }
 
     /// The names a script imports, each once, whatever the spacing; commented-out imports aren't.
