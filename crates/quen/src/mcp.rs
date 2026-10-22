@@ -25,7 +25,7 @@ use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
     camera, capture, channel, config, data, disk, doctor, focus, game, hands, image, ledger,
-    measure, mem, photo, plan, save, scene, setup, vortex,
+    measure, mem, ngfx, photo, plan, save, scene, setup, vortex,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -39,7 +39,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 18] = [
+const LONG: [&str; 20] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -58,6 +58,8 @@ const LONG: [&str; 18] = [
     "run_plan",
     "data_scan",
     "script_compile",
+    "ngfx_extract",
+    "ngfx_replay",
 ];
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
@@ -66,8 +68,8 @@ const LONG: [&str; 18] = [
 /// world_frame, world_ground, world_ray, world_nav, world_map and game_listsaves read through the game's channel
 /// (world_map's map files and their captures rows are its own); game_scriptlog reads the game's script log;
 /// measure_image reads quen's screenshots and writes its measurement rows; mods reads Vortex's records and the game's
-/// folders.
-const READ_ONLY: [&str; 29] = [
+/// folders; ngfx_extract reads a capture file, its outputs and an import's hard link under the capture root.
+const READ_ONLY: [&str; 30] = [
     "session_status",
     "session_plan",
     "quen_guide",
@@ -97,6 +99,7 @@ const READ_ONLY: [&str; 29] = [
     "data_scan",
     "measure_image",
     "mods",
+    "ngfx_extract",
 ];
 
 /// A tool call for the session thread, a connection that closed, the config file changed (quen_setup wrote it, or a
@@ -961,6 +964,7 @@ pub(crate) fn tools() -> Value {
     list.extend(data::tools());
     list.extend(ledger::tools());
     list.extend(disk::tools());
+    list.extend(ngfx::tools());
     let job = json!({
         "type": "object",
         "properties": {"job": {"type": "string", "description": "the job id the call answered"}},
@@ -1148,7 +1152,7 @@ mod tests {
     }
 
     /// The client prompts for every launch, every capture cleanup, every save, every hand-over of a play session to the
-    /// agent and every instance patch, and for nothing else, so the plan, which takes the launch's arguments but user_ok, stays free for
+    /// agent, every instance patch and every capture replay, and for nothing else, so the plan, which takes the launch's arguments but user_ok, stays free for
     /// subagents.
     #[test]
     fn only_the_launch_asks_the_user_and_the_plan_takes_its_arguments() {
@@ -1167,7 +1171,8 @@ mod tests {
                 "game_save",
                 "hands_take",
                 "mem_patch_instances",
-                "capture_clean"
+                "capture_clean",
+                "ngfx_replay"
             ]
         );
         for name in marked {

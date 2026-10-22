@@ -37,6 +37,8 @@ mod measure;
 #[cfg(windows)]
 mod mem;
 #[cfg(windows)]
+mod ngfx;
+#[cfg(windows)]
 mod photo;
 #[cfg(windows)]
 mod plan;

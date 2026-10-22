@@ -18,7 +18,7 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod development, tes
 ## What quen does on your PC
 
 **Programs it starts**
-- `witcher3.exe`, and around it Nsight Systems or Nsight Graphics if you configured them; PresentMon for the measure tools; REDkit's `wcc_lite.exe` for `script_compile`. Each runs inside a Windows Job Object. quen kills only what is in its job, never a program by name, so a copy of the game you started yourself is left alone.
+- `witcher3.exe`, and around it Nsight Systems or Nsight Graphics if you configured them; PresentMon for the measure tools; REDkit's `wcc_lite.exe` for `script_compile`; Nsight Graphics' `ngfx-replay.exe` (beside the configured `ngfx.exe`, never the replayer a capture carries) for `ngfx_extract` and `ngfx_replay`, and `ngfx.exe` around it for `ngfx_replay`'s GPU Trace. Each runs inside a Windows Job Object. quen kills only what is in its job, never a program by name, so a copy of the game you started yourself is left alone.
 - Each of them gets a short, fixed list of environment variables (Windows' own, and quen's), never your whole environment. An API key or token in your agent's environment doesn't reach the game, its mods, a profiler or PresentMon.
 - quen needs no admin rights. PresentMon needs your account in the Windows *Performance Log Users* group ([INSTALL.md](INSTALL.md) §1).
 - quen downloads and installs nothing. A launch's `stage` copies files already on your PC into the game folder for that session only.
@@ -31,6 +31,10 @@ quen lets a coding agent drive The Witcher 3 on your PC for mod development, tes
 - It adds a save only through `game_save`, which your client asks you about on every call: the game writes one new manual save. quen checks the save folder before and after, and anything else that changed ends the session (in a play session, it gives you the controls back). A save you make while you have the controls is yours, and the session's end lists it.
 - It removes captures and its other leftovers (session logs, its ledger's backups) only through `capture_clean`, which your client asks you about on every call, as for a launch.
 - Its own data (the ledger, logs, captures, the journal) stays under its data root, `%USERPROFILE%\.quen\` by default.
+- An Nsight Graphics capture (`.ngfx-capture`) holds the game's whole environment when it was captured: your computer's and your user name, your folders, every variable. Like GPU Trace's `REPRO_INFO.xls`, it stays in the capture root and is never shared: not in a repo, an issue, a shared note or a ledger text column.
+- `ngfx_extract` reads such a capture and changes nothing in it. A capture outside quen's capture root gets a second name there, a hard link (never a copy or a move): the original stays where it is. ngfx-replay prints the capture's metadata, and quen writes only a cleaned copy (`metadata.json`): the environment's variable names, Nsight's own settings, your user folder as `%USERPROFILE%`, no computer or user name, no launch token. The raw text is never written.
+- `ngfx_replay` replays a capture on the GPU for about a minute (GPU Trace locks the GPU's clocks while it runs). Your client asks you on every call, as for a launch, and quen refuses it while a game session or the game runs. Its temporary files go to `<data root>\tmp\ngfx`.
+- `quen_doctor` reads Nsight Graphics' settings file (`%APPDATA%\NVIDIA Corporation\NVIDIA Nsight Graphics.ini`) to see whether Nsight asked its first-start privacy question. quen never writes that file and never answers the question.
 - The data tools (`data_find`, `data_read`, `data_scan`) read the game's bundles and REDkit's depot, and write nothing there.
 - `mods`, `quen_doctor` and a launch read the Vortex mod manager's records: its deployment manifests, `mods.settings`, its staging folder's names and the ids of the files it deployed. quen writes none of them, and never starts or drives Vortex.
 - `script_compile` runs wcc_lite on a copy of the scripts under the data root. wcc_lite writes its `wcc.log` in REDkit's `bin` folder, and rewrites `editoruser.settings` and `profile.settings` (and their `.bak`) in the game's documents folder: quen backs up every `*.settings` and `*.settings.bak` there first and puts them back after, journaled like a session's changes.
@@ -75,7 +79,7 @@ Only your account can write these. A program running as you could change them, b
 
 | Input | What quen takes from it |
 |---|---|
-| The config file (`%USERPROFILE%\.quen\config.toml`, or the file `QUEN_CONFIG` names) | the game and data folders, and the programs quen starts (PresentMon, Nsight, REDkit's wcc_lite) |
+| The config file (`%USERPROFILE%\.quen\config.toml`, or the file `QUEN_CONFIG` names) | the game and data folders, and the programs quen starts (PresentMon, Nsight and the `ngfx-replay.exe` beside its `ngfx.exe`, REDkit's wcc_lite) |
 | The journal (`<data root>\state\journal.jsonl`) | what to move back, restore and send to the Recycle Bin after a crash. The replay checks hashes and file ids before it undoes a step. |
 | The RE knowledge base (`kb` in the config): `patches.tsv`, `instance_patches.tsv`, `cvar_layout.tsv` | which memory patches are allowed, and where a cvar's value lives in memory |
 | A PresentMon quen finds itself | without `presentmon` in the config, quen runs the newest `PresentMon-<version>-x64.exe` in its installer's folder under Program Files, else the first `PresentMon.exe` on your PATH. Set the config's absolute path instead. The measure tools return the path they ran, as `presentmon`. |

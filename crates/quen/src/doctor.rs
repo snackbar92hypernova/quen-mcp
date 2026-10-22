@@ -764,6 +764,52 @@ pub(crate) const NSIGHT_GRAPHICS: Dep = Dep {
     check: |cx| cx.profiler(&cx.config.ngfx, "ngfx"),
 };
 
+pub(crate) const NGFX_REPLAY: Dep = Dep {
+    name: "NVIDIA Nsight Graphics replayer (ngfx-replay)",
+    required: false,
+    enables: "ngfx_extract (a capture's metadata, final image, calls, objects, log errors) and ngfx_replay",
+    how_to_get: "part of NVIDIA Nsight Graphics (https://developer.nvidia.com/nsight-graphics): ngfx-replay.exe beside \
+        the ngfx.exe quen's config names (quen_setup). Nsight asks a privacy question once per version: the user \
+        opens Nsight Graphics once and answers it; quen only reads the answer",
+    check: ngfx_replay,
+};
+
+/// ngfx-replay.exe beside the configured ngfx.exe (only that install runs, never a capture's bundled replayer), its
+/// version, and whether that version of Nsight asked its first-start privacy question: read from Nsight's settings
+/// file, never written.
+fn ngfx_replay(cx: &Cx) -> State {
+    let Some(ngfx) = &cx.config.ngfx else {
+        return State::missing("no ngfx in quen's config: quen_setup sets it".into());
+    };
+    let exe = ngfx.with_file_name("ngfx-replay.exe");
+    if !exe.is_file() {
+        return State::missing(format!("no ngfx-replay.exe beside {}", ngfx.display()));
+    }
+    let version = crate::win::file_version(&exe);
+    let ini = env::var_os("APPDATA")
+        .map(|d| PathBuf::from(d).join(r"NVIDIA Corporation\NVIDIA Nsight Graphics.ini"));
+    let asked = ini.as_ref().map(fs::read_to_string);
+    let note = match (&version, asked) {
+        (None, _) => "no version resource: Nsight's first-start question can't be checked".into(),
+        (_, None | Some(Err(_))) => {
+            "Nsight's settings file wasn't found: it hasn't asked its first-start question yet"
+                .into()
+        }
+        (Some(v), Some(Ok(ini))) if quen_core::ngfx::privacy_asked(&ini, v) => {
+            format!("Nsight {v} asked its first-start privacy question")
+        }
+        (Some(v), Some(Ok(_))) => format!(
+            "Nsight {v} hasn't asked its first-start privacy question yet: the user opens Nsight Graphics once and \
+             answers it (quen never answers it)"
+        ),
+    };
+    State {
+        version,
+        note: Some(note),
+        ..State::found(exe)
+    }
+}
+
 pub(crate) const GPU_COUNTERS: Dep = Dep {
     name: "NVIDIA GPU performance counters for all users",
     required: false,
@@ -1225,7 +1271,7 @@ fn kb_table(cx: &Cx, file: &str) -> State {
 }
 
 /// Every dependency, required ones first, as quen_doctor lists them.
-const DEPS: [&Dep; 22] = [
+const DEPS: [&Dep; 23] = [
     &GAME,
     &NATIVE_BRIDGE,
     &PACKAGE,
@@ -1237,6 +1283,7 @@ const DEPS: [&Dep; 22] = [
     &DEVKIT,
     &NSIGHT_SYSTEMS,
     &NSIGHT_GRAPHICS,
+    &NGFX_REPLAY,
     &GPU_COUNTERS,
     &RENDERDOC,
     &STREAMLINE,
@@ -2415,6 +2462,14 @@ mod tests {
         let state = (NSIGHT_SYSTEMS.check)(&cx(&t, &config, &[]));
         assert_eq!(state.status, "found");
         assert!(state.note.unwrap().contains("not in quen's config"));
+        // ngfx-replay only beside the configured ngfx.exe (a synthetic file: no version, so no privacy answer read).
+        assert_eq!((NGFX_REPLAY.check)(&cx(&t, &config, &[])).status, "missing");
+        config.ngfx = Some(t.put(r"ng\ngfx.exe", ""));
+        assert_eq!((NGFX_REPLAY.check)(&cx(&t, &config, &[])).status, "missing");
+        let replay = t.put(r"ng\ngfx-replay.exe", "");
+        let state = (NGFX_REPLAY.check)(&cx(&t, &config, &[]));
+        assert_eq!((state.status, state.path), ("found", Some(replay)));
+        assert!(state.note.unwrap().contains("no version resource"));
     }
 
     /// The renderdoc profile's parts: RenderDoc from the config (its exe is renderdoccmd.exe), the game's interposer

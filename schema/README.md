@@ -179,7 +179,9 @@ every tool. Exceptions, from before this was the rule: the history import names 
 `quen_guide` existed say `screenshot`. So tell what took a file by `method`, not `kind`. `method` (how it was taken,
 e.g. `printwindow`, `wgc_fp16`, `presentmon`; a mem tool's name, e.g. `mem_walk`, for its result too big to answer
 inline, kind `json`; `world_map` for its map's JSON and its PNG, a drawing without `encoding`, `frame_state` holding
-the map's mode, at, size, cell, source capture ids and world); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
+the map's mode, at, size, cell, source capture ids and world; `ngfx_capture` for an Nsight Graphics frame capture, kind
+`ngfx-capture`, `frame_state` the facts of its metadata once `ngfx_extract` read it; `ngfx_extract` and `ngfx_replay`
+for their output files, on the capture's boot and on none); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
 `pq_codes_f16`, `scrgb_f16`; any other buffer, e.g. scene-linear data or a G-buffer target, leaves it NULL and gives its
 format in `frame_state`); `includes_overlay`, `includes_desktop`; `display_state` and `frame_state` (JSON objects: the
 display and the frame when it was taken; quen's `display_state` names the monitor by `monitor_sha`, a short hash of its model name,
@@ -272,7 +274,10 @@ tool's word).
 
 One analysis profile, stored once. `digest` (key: REA's `analysis_profile.digest`); `tool` (`rea`); `provider` (JSON
 object: id, name, version); `parameters` (JSON object: everything the profile commits to, among them `analysis_seeds`,
-the seed file's path and sha256), so a query can show what differs between two profiles.
+the seed file's path and sha256), so a query can show what differs between two profiles. quen's own
+profiles: `tool` `ngfx_replay` (`parameters` `{"args": [...]}`: ngfx-replay's flags) or `quen` (its shader decoder:
+`{"decoder", "revision"}`), `provider` `{id, name}`, and `digest` the sha256 of the canonical JSON `{"parameters",
+"provider", "tool"}`.
 
 ### extractions (table)
 
@@ -289,6 +294,10 @@ get it at the next open); `entity_id` → entities (the function or label at tha
 recorded); `capture_id` → captures (the bundle file holding the whole record, decompiled text included: a pinned capture
 under the capture root); `t` (when imported). An exact hit is the same `key_sha256` with its file present
 (`captures.removed_at` NULL); a near hit is the same target, operation and params under another profile.
+`ngfx_extract`'s rows (an Nsight Graphics capture read headlessly): `tool` `ngfx_replay` (its version in
+`tool_version`) or `quen` (the shader decoder); `target_sha256` the capture's; `operation` the op (`metadata`,
+`screenshot`, `functions`, `objects`, `errors`, `shaders`); `params` `{}`; `evidence_id`, `confidence`, `rva` and
+`entity_id` NULL; `result_sha256` and `capture_id` the output file's.
 
 ### links (table)
 

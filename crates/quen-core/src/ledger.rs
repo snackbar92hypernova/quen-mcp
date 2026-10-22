@@ -21,7 +21,9 @@ pub use ingest::{
     SweepFrame, SweepRun, Tag,
 };
 pub use kb::{KbClaims, KbScan, Section, git_head, sections};
-pub use knowledge::{About, BundleImport, canonical, extraction_key};
+pub use knowledge::{
+    About, BundleImport, CaptureRef, Extraction, canonical, extraction_key, profile_digest,
+};
 pub use migrate::{Harness, Plan, Summary};
 pub(crate) use refs::glob;
 pub use refs::{Candidate, CaptureRow, Ref, ScanSummary, Scanner};

@@ -1104,6 +1104,7 @@ impl<'a> Session<'a> {
                 data::call(self, call, n, args)
             }
             "run_plan" => crate::plan::call(self, call, args),
+            n @ ("ngfx_extract" | "ngfx_replay") => crate::ngfx::call(self, call, n, args),
             _ => self.recover(call, true),
         }
     }
