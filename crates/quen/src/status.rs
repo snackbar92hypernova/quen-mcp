@@ -6,7 +6,9 @@
 //! **Lasting** (quen-w3 0.1.15 or later, the config's `indicator` on): one line, up for an hour, sent at each
 //! transition and again [`RESEND`] after it was last sent while a state is set: the game's own notifications and its
 //! hub menu's key clear it without quen seeing it (the probe boot). modQuen keeps a line that is still up with the same
-//! text, so then a re-send changes nothing on screen.
+//! text, so then a re-send changes nothing on screen. From quen-w3 0.1.16 modQuen draws every lasting line on a HUD
+//! movie of its own where the game draws its HUD, which no game notification replaces, and on the notification
+//! elsewhere (w3/README.md, HUD line); the replies are the same.
 //! - **working:** a call of the connection that launched starts, with the agent's controls ([`start`], hands_take);
 //! - **measuring:** a measure call, a sweep or a run_plan, from its checks to its end ([`measuring`], [`poll`]);
 //! - **yours:** whenever the user has the controls: a play session from its launch, hands_give .. hands_take ([`poll`]);
@@ -70,7 +72,8 @@ pub(crate) const CONFIRM_EVERY: Duration = Duration::from_millis(500);
 /// How many times [`measuring`] asks (2 s): unconfirmed by then, the line's time counts from its first send.
 const CONFIRM_TRIES: u32 = 4;
 /// modQuen's reply to a line whose text is up already (quen-w3 0.1.15: notificationModule visible, alpha above 0, its
-/// tfMessage the same text).
+/// tfMessage the same text; from 0.1.16 the same read of its HUD movie when the line is there), so [`confirm`]'s count
+/// starts from the element that shows it.
 pub(crate) const ALREADY: &str = "notice already shown";
 /// A transition's notice: the package's own 8 s.
 const ONCE: Duration = Duration::from_secs(8);

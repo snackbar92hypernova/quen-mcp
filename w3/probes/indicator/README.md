@@ -288,7 +288,7 @@ The owner and the main session schedule it. Nothing here launches the game.
 - **4:** the module's look decides between B as is and C (quen's own movie, styled). Its hide latency (one call, one tick) sets phase 2's wait at 0.1 s.
 - **5:** fills the design's §3.5 table. The expected answer: hidden with the HUD in photo mode and menus, and by its state in combat and scenes, coming back after. The notification covers those, as the design proposes.
 
-## The 0.1.16 boot: quen's own HUD movie (checks 9 to 13, about 15 minutes)
+## The 0.1.16 boot: quen's own HUD movie (checks 9 to 14, about 18 minutes)
 
 Boot 200 ran checks 0 to 7. quen-w3 0.1.16 puts quen's own movie in the `WatermarkModule` slot (`w3\README.md`, section HUD line). This boot checks it. The owner and the main session schedule it; nothing here launches the game.
 
@@ -313,12 +313,17 @@ Boot 200 ran checks 0 to 7. quen-w3 0.1.16 puts quen's own movie in the `Waterma
     - the inventory key (`game_keys {tokens: ["i"]}`), and after the menu closes: back on the module, `c12_hub`;
     - a dialogue if one is reached (as check 5): the notification while it plays, the module after it.
 13. **No flicker on a re-send** (about 1 min): `game_keys {tokens: ["wait:25000"]}` with the line up, then `logs\serve.log`: two re-sends answered `notice already shown`; and `c13_resend` shows the line as in `c9_module`.
+14. **A game notification doesn't touch quen's HUD line** (about 3 min; the reason for the movie: the notification is one slot, and in Crowds' A/B boot 214 other notices took quen's "Next" labels off it before they were read):
+    - with the line on the movie: `game_exec testnotify()` (vanilla, 4 s), then at once `game_screenshot {tag: "c14_vanilla"}` and `game_exec qistate(1)`: vanilla's text bottom left and quen's line still at the top centre, `visible=true`, state `OnDemand`;
+    - `game_keys {tokens: ["i"]}` (the inventory key), then `game_screenshot {tag: "c14_hub"}` once quen's state shows no menu: quen's line on the movie (while a menu is open it is on the notification, by design);
+    - a "Next" label against a notice: `measure_ab {tag: "c14", secs: 5, settle: 3, order: ["A", "B"], states: [{label: "A", actions: [{console: "testnotify()"}]}, {label: "B", actions: [{console: "testnotify()"}]}]}`. Before the call, tell the owner: from the call's start, watch the top centre of the game for about 30 s; "quen: measuring ... Next: A" and then "Next: B" stay there, each at least 3 s before its window, while "Some test notification" comes and goes bottom left. Ask only whether each label stayed up until it vanished for its window. `status_label` and `status_confirm` in `timing_s` show the holds counted from the movie's answer.
 
 **What decides:**
 - 9 passes: phase 2 C works in the game. 9 fails: the notification stays the carrier (0.1.15's behaviour, which 0.1.16 keeps wherever the movie isn't drawn), and the bundle's format is the first suspect (`hud.py`'s `cooked()`).
 - 10: the owner's eye decides the look; `TOP`, `CENTRE`, the size and the box are one constant each in `QuenHud.as`.
 - 11: the module's 0.1 s hide is within quen's 0.5 s wait either way.
 - 12: every place the HUD isn't drawn must show the notification; a place with neither is a bug in `QUEN_HudDrawn`.
+- 14 passes: in gameplay no game notice takes quen's line off. A label gone before its window is a bug (the movie read `visible` and the text while not drawn, or the line went to the notification in gameplay).
 
 ## Cleanup
 
