@@ -1,5 +1,5 @@
 # Tests install.ps1 on synthetic files only: a release built here around a quen.exe you give, a scratch USERPROFILE, a
-# fake game folder with a fake Native Bridge, a stand-in claude that only logs its arguments, and a stand-in process
+# fake game folder with a fake Native Bridge, another whose package a synthetic Vortex deployed, a stand-in claude that only logs its arguments, and a stand-in process
 # named witcher3.exe. Nothing touches this PC's game folder, its .quen or its Claude config; the user PATH is tested on a
 # scratch registry key. Exit code 0 when every check passes.
 # Usage: powershell -ExecutionPolicy Bypass -File tools\release\install-test.ps1 -Quen <quen.exe> [-Release <folder>]
@@ -54,8 +54,8 @@ function Sums($dir) {
 }
 # Every file the installer could touch, with its sha256: what "nothing changed" compares. Not in it: the test's logs, and
 # each run's own temp folder, which ends in the Recycle Bin's stand-in.
-function Tree {
-    $files = Get-ChildItem -LiteralPath $home_, $game, $rel, $recycle -Recurse -File -Force |
+function Tree([string[]]$dirs = @($home_, $game, $rel, $recycle)) {
+    $files = Get-ChildItem -LiteralPath $dirs -Recurse -File -Force |
         Where-Object FullName -notmatch '\\[0-9a-f]{8}-quen-install-[0-9a-f]{32}\\'
     ($files | ForEach-Object { "$($_.FullName)=$(Sha $_.FullName)" }) -join "`n"
 }
@@ -86,7 +86,9 @@ if ($Release) {
     Put "$src\quen.ws" 'synthetic quen.ws'
     Put "$src\sl.interposer.dll" 'synthetic interposer'
     Put "$src\license.txt" 'synthetic licence'
-    Zip "$rel\quen-0.1.0-windows-x64.zip" ([ordered]@{ 'quen.exe' = "$src\quen.exe"; 'README.md' = "$src\README.md" })
+    # Named for the given quen.exe's version, which install.ps1 checks against the zip's name.
+    $given = ("$(& $Quen --version)" -split ' ')[1]
+    Zip "$rel\quen-$given-windows-x64.zip" ([ordered]@{ 'quen.exe' = "$src\quen.exe"; 'README.md' = "$src\README.md" })
     Zip "$rel\quen-w3-9.9.9.zip" ([ordered]@{ 'bin/x64_dx12/W3Quen.asi' = "$src\W3Quen.asi"; 'Mods/modQuen/content/scripts/local/quen.ws' = "$src\quen.ws" })
     Zip "$rel\quen-streamline-dev-interposer-2.14.1.zip" ([ordered]@{ 'sl.interposer.dll' = "$src\sl.interposer.dll"; 'license.txt' = "$src\license.txt" })
     Copy-Item -LiteralPath $install -Destination $rel
@@ -248,6 +250,66 @@ Check (-not (Test-Path -LiteralPath "$game\Mods\modQuen") -and -not (Test-Path -
 Check ((Test-Path -LiteralPath "$x64\WitcherNativeBridge.asi") -and (Test-Path -LiteralPath "$x64\witcher3.exe")) 'the Native Bridge and the game stay'
 Check ((Test-Path -LiteralPath "$home_\.quen\config.toml") -and $r.out -match 'stays: your config') '.quen stays, and the message names it'
 Check ((ClaudeLog) -match 'mcp remove --scope user quen') 'claude mcp remove --scope user quen'
+
+# A game whose quen package Vortex installed: a synthetic deployment manifest lists it, and its files are hardlinks to a
+# staging stand-in, as Vortex deploys. Every run leaves it, and Vortex's copy, as they were, and says why.
+$gameV = Join-Path $root 'game-vortex'
+$source = 'quen-w3 synthetic Vortex mod'
+$staging = Join-Path $root "vortex-staging\$source"
+Put "$gameV\bin\x64_dx12\witcher3.exe" 'synthetic, not a game'
+Put "$gameV\bin\x64_dx12\WitcherNativeBridge.asi" 'synthetic Native Bridge'
+Put "$gameV\bin\x64_dx12\dinput8.dll" 'synthetic ASI loader'
+foreach ($f in 'bin\x64_dx12\W3Quen.asi', 'Mods\modQuen\content\scripts\local\quen.ws') {
+    Put "$staging\$f" "synthetic Vortex copy of $f"
+    [void][IO.Directory]::CreateDirectory((Split-Path "$gameV\$f"))
+    [void](New-Item -ItemType HardLink -Path "$gameV\$f" -Target "$staging\$f")
+}
+$manifest = "$gameV\vortex.deployment.witcher3tl.json"
+$manifestText = ConvertTo-Json -Depth 5 ([ordered]@{
+        instance = 'synthetic'; deploymentMethod = 'hardlink_activator'; stagingPath = (Split-Path $staging)
+        files = @('bin\x64_dx12\W3Quen.asi', 'Mods\modQuen\content\scripts\local\quen.ws' | ForEach-Object { [ordered]@{ relPath = $_; source = $source; target = ''; time = 1 } })
+    })
+Put $manifest $manifestText
+$vortexDirs = $gameV, (Split-Path $staging)
+function Recycled { @(Get-ChildItem -LiteralPath $recycle -Name | Where-Object { $_ -notmatch '-quen-install-[0-9a-f]{32}$' }) }
+$says = "quen's in-game package in .*game-vortex is Vortex's \($([regex]::Escape($source))\): update it in Vortex"
+
+Write-Host 'Vortex''s package, install: quen.exe placed, the package left'
+$beforeV = Tree $vortexDirs
+$binBefore = Recycled
+$r = Install @('n', 'n', 'n') @('-From', $rel, '-GameDir', $gameV)
+Check ($r.code -eq 0 -and $r.out -match $says) "exit 0, update it in Vortex ($($r.code))"
+Check ((Sha $exe) -eq $quenSha) 'quen.exe placed'
+Check ((Tree $vortexDirs) -eq $beforeV -and ((Recycled) -join '|') -eq ($binBefore -join '|')) 'the package and Vortex''s copy as they were, nothing recycled'
+
+Write-Host 'Vortex''s package, -Update: quen.exe replaced, the package left'
+$r = Install @('n', 'n', 'n') @('-From', $rel2, '-GameDir', $gameV, '-Update')
+Check ($r.code -eq 0 -and $r.out -match $says) "exit 0, update it in Vortex ($($r.code))"
+Check ((Sha $exe) -eq (Sha $exe2)) 'quen.exe is the new build'
+$new = @(Recycled | Where-Object { $_ -notin $binBefore })
+Check ((Tree $vortexDirs) -eq $beforeV -and $new.Count -eq 1 -and $new[0] -like '*-quen.exe') "the package as it was, only the old quen.exe recycled ($new)"
+
+Write-Host 'refused: a Vortex manifest that does not parse'
+Put $manifest '{"files": '
+$before = Tree ($vortexDirs + $home_, $recycle)
+$r = Install @() @('-From', $rel2, '-GameDir', $gameV)
+Check ($r.code -ne 0 -and $r.out -match 'refused, nothing was changed: .*vortex\.deployment\.witcher3tl\.json doesn''t parse') "refused ($($r.code))"
+Check ((Tree ($vortexDirs + $home_, $recycle)) -eq $before) 'nothing changed'
+
+Write-Host 'Vortex''s hardlinks, no manifest: the package left'
+[IO.File]::Delete($manifest)  # this test's own file
+$before = Tree ($vortexDirs + $home_, $recycle)
+$r = Install @('n', 'n', 'n') @('-From', $rel2, '-GameDir', $gameV)
+Check ($r.code -eq 0 -and $r.out -match "quen's in-game package in .*game-vortex is Vortex's \(a hardlink\): update it in Vortex") "exit 0, update it in Vortex ($($r.code))"
+Check ((Tree ($vortexDirs + $home_, $recycle)) -eq $before) 'nothing changed'
+
+Write-Host 'Vortex''s package, -Uninstall: yes'
+Put $manifest $manifestText
+$beforeV = Tree $vortexDirs
+$r = Install @('y') @('-Uninstall', '-GameDir', $gameV)
+Check ($r.code -eq 0 -and $r.out -match "stays: quen's in-game package in .*game-vortex, which is Vortex's \($([regex]::Escape($source))\): uninstall it in Vortex") "exit 0, uninstall it in Vortex ($($r.code))"
+Check (-not (Test-Path -LiteralPath (Split-Path $exe))) '.quen\bin is gone'
+Check ((Tree $vortexDirs) -eq $beforeV) 'the package and Vortex''s copy as they were'
 
 Write-Host 'the user PATH, on a scratch registry key'
 $ast = [Management.Automation.Language.Parser]::ParseFile($install, [ref]$null, [ref]$null)

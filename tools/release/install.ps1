@@ -1,8 +1,9 @@
 # quen's installer (INSTALL.md, Quick install), shipped as a release asset beside the zips. It gets one
 # quen release from GitHub, or from a folder of its files, and checks every zip against the release's SHA256SUMS.txt
 # before opening it. Then it puts quen.exe in %USERPROFILE%\.quen\bin and, unless -NoGamePackage, quen's in-game package
-# in the game folder. It installs no third-party tool, needs no admin rights, asks before each change, and sends what it
-# replaces or removes to the Recycle Bin. Every check runs before the first change: a refusal changes nothing.
+# in the game folder (one Vortex installed is left to Vortex). It installs no third-party tool, needs no admin rights,
+# asks before each change, and sends what it replaces or removes to the Recycle Bin. Every check runs before the first
+# change: a refusal changes nothing.
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1 [-Version <x.y.z>] [-From <folder>] [-GameDir <folder>]
 #            [-NoGamePackage] [-WithRenderDoc] [-Update | -Uninstall] [-WhatIf]
 # Tested with Windows PowerShell 5.1, the one in Windows. Kept ASCII: it reads a file without a BOM in the ANSI code page.
@@ -155,6 +156,27 @@ param(
             if ($w3) { Refuse "The Witcher 3 is running (witcher3.exe, pid $($w3.Id -join ', ')): close it first" }
             $dir
         }
+        # Who in Vortex owns quen's package in $game: the source (Vortex's mod folder) of a package file a Vortex
+        # deployment manifest lists (vortex.deployment*.json in the game folder or Mods, as quen's mods tool reads them),
+        # else 'a hardlink' for a package file with more than one name, as Vortex deploys; $null for neither. Such a
+        # package is updated and removed in Vortex: replaced here, Vortex's next deploy would import the new files over
+        # its own copy of the old ones.
+        function VortexOwner($game) {
+            $files = @(@('bin\x64_dx12\W3Quen.asi', 'bin\x64_dx12\W3Quen-licences.txt') | ForEach-Object { Join-Path $game $_ } |
+                Where-Object { Test-Path -LiteralPath $_ }) +
+                @(Get-ChildItem -LiteralPath (Join-Path $game 'Mods\modQuen') -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object FullName)
+            foreach ($dir in $game, (Join-Path $game 'Mods')) {
+                foreach ($m in Get-ChildItem -LiteralPath $dir -Filter 'vortex.deployment*.json' -File -ErrorAction SilentlyContinue) {
+                    $json = try { [IO.File]::ReadAllText($m.FullName) | ConvertFrom-Json } catch {
+                        Refuse "$($m.FullName) doesn't parse ($($_.Exception.Message)), so whether Vortex owns quen's package can't be told"
+                    }
+                    $hit = @($json.files | Where-Object { $_.relPath -and (Join-Path $dir "$($_.relPath)".Replace('/', '\')) -in $files })
+                    if ($hit) { return $hit[0].source }
+                }
+            }
+            if ($files | Where-Object { (Get-Item -LiteralPath $_ -Force).LinkType -eq 'HardLink' }) { return 'a hardlink' }
+            $null
+        }
         # The user PATH as Windows keeps it: %VARIABLES% unexpanded, which [Environment]'s User target would expand for good.
         function UserPath {
             $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($envKey)
@@ -239,9 +261,12 @@ param(
             $remove = @($bin)
             if (-not $NoGamePackage) {
                 $game = Find-Game $exe
+                $vortex = VortexOwner $game
                 # Mods first: script mods left calling an ASI that isn't there fail the game's script compile.
-                $remove += @(@('Mods\modQuen', 'Mods\modQuenRpc', 'bin\x64_dx12\W3Quen.asi') | ForEach-Object { Join-Path $game $_ } |
-                    Where-Object { Test-Path -LiteralPath $_ })
+                if (-not $vortex) {
+                    $remove += @(@('Mods\modQuen', 'Mods\modQuenRpc', 'bin\x64_dx12\W3Quen.asi') | ForEach-Object { Join-Path $game $_ } |
+                        Where-Object { Test-Path -LiteralPath $_ })
+                }
             }
             $remove | ForEach-Object { NeedsBin $_ }
             $path = UserPath
@@ -250,6 +275,7 @@ param(
             Say 'uninstall:'
             if ($procs) { Write-Host "  stop: quen.exe (pid $($procs.Id -join ', '): your MCP clients' quen and its quen serve; no session is live)" }
             $remove | ForEach-Object { Show $_ }
+            if ($vortex) { Write-Host "  stays: quen's in-game package in $game, which is Vortex's ($vortex): uninstall it in Vortex" }
             if ($onPath) { Write-Host "  out of your user PATH: $bin" }
             if ($claude) { Write-Host '  out of Claude Code: claude mcp remove --scope user quen' }
             if (-not (Ask 'Uninstall quen as listed?')) { Say 'nothing was changed'; return }
@@ -345,10 +371,15 @@ param(
             if ($hasExe -and $newQuen) { NeedsBin $exe }
             $procs = if ($newQuen) { Running } else { @() }
 
-            # The in-game package: placed whole after quen's old package files go to the Recycle Bin.
+            # The in-game package: placed whole after quen's old package files go to the Recycle Bin, unless it is Vortex's.
             $package = $false
             if ($w3Zip) {
                 $game = Find-Game $newExe
+                $vortex = VortexOwner $game
+            }
+            if ($vortex) {
+                Say "quen's in-game package in $game is Vortex's ($vortex): update it in Vortex. This installer leaves it as it is"
+            } elseif ($w3Zip) {
                 $x64 = Join-Path $game 'bin\x64_dx12'
                 $loader = (Test-Path -LiteralPath "$x64\dinput8.dll") -or (Test-Path -LiteralPath "$x64\winmm.dll")
                 if (-not ((Test-Path -LiteralPath "$x64\WitcherNativeBridge.asi") -and $loader)) {

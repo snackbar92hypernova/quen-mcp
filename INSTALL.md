@@ -27,7 +27,7 @@ irm https://github.com/snackbar92hypernova/quen-mcp/releases/latest/download/ins
 What it does, with every check before the first change:
 1. Downloads the latest release (`-Version <x.y.z>` for another) into a new temp folder, or uses the release files in `-From <folder>`. It checks every zip against the release's `SHA256SUMS.txt` before opening it.
 2. Puts `quen.exe` in `%USERPROFILE%\.quen\bin`. It offers to add that folder to your user PATH, and, when `claude` is on your PATH, to register quen in Claude Code (`claude mcp add --scope user quen -- <path> mcp`). When `claude` is on your PATH or `%USERPROFILE%\.claude` exists, it offers to add the hook that brings Claude Code's window to the front for its prompts before quen's calls (section 4): it backs `settings.json` up first, keeps every other setting and hook, and refuses, changing nothing, when the file isn't valid JSON. It prints the lines for VS Code and Cursor (section 4).
-3. Installs quen's in-game package into the game folder `quen setup` reports, or `-GameDir <folder>` (`-NoGamePackage` skips it). It refuses while the game runs or the Native Bridge is missing, lists each file it will place or move, and asks. An old `Mods\modQuen`, any `Mods\modQuenRpc` and an old `W3Quen.asi` go to the Recycle Bin.
+3. Installs quen's in-game package into the game folder `quen setup` reports, or `-GameDir <folder>` (`-NoGamePackage` skips it). It refuses while the game runs or the Native Bridge is missing, lists each file it will place or move, and asks. An old `Mods\modQuen`, any `Mods\modQuenRpc` and an old `W3Quen.asi` go to the Recycle Bin. A package Vortex installed is left as it is ([With Vortex](#with-vortex)).
 4. With `-WithRenderDoc`, unzips quen's Streamline dev interposer into `%USERPROFILE%\.quen\tools\streamline`.
 5. Runs `quen doctor` and prints what is missing, with where to get it.
 
@@ -35,8 +35,17 @@ Then ask your agent to run `quen_setup`, then `quen_doctor` (section 3).
 
 - It refuses, and changes nothing, while a quen session is live or its journal is left: end the session, or run `quen recover`.
 - **`-Update`** replaces an installed `quen.exe` (and, with `-WithRenderDoc`, the interposer) with the release's; without it, the script refuses to. A `quen.exe` running from `.quen\bin` is stopped first, after you agree, when no session is live. Then restart Claude Desktop (its MCP dialog has no Reconnect for user-scope servers), or in the Claude Code CLI reconnect quen with `/mcp`: a client session keeps the tool list it got when it connected. `session_status` gives the running quen's version (`quen`).
-- **`-Uninstall`** sends `.quen\bin` and the package to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
+- **`-Uninstall`** sends `.quen\bin` and the package (unless Vortex installed it) to the Recycle Bin, and takes quen out of Claude Code (when `claude` is on your PATH) and your user PATH, after one confirmation. The rest of `%USERPROFILE%\.quen` (config, ledger, logs, captures) stays.
 - **`-WhatIf`** prints every step and changes nothing. It still downloads and checks the release, in a temp folder that then goes to the Recycle Bin.
+
+### With Vortex
+
+If Vortex manages your Witcher 3 mods:
+1. Install the Witcher Native Bridge with Vortex (Nexus Mods, mod 13743). quen's package needs it, and its download brings the ASI loader (`dinput8.dll`).
+2. Install quen's in-game package with Vortex: `quen-w3-<version>.zip`, a download of its own. Its folders mirror the game folder (`bin\x64_dx12\W3Quen.asi`, `bin\x64_dx12\W3Quen-licences.txt`, `Mods\modQuen\content\scripts\local\quen.ws`), so Vortex's Witcher 3 extension deploys it unchanged into the game folder: its `witcher3tl` installer keeps every path. That was read in Vortex's source, not yet tried in Vortex. The package bundles no ASI loader ([w3/README.md](w3/README.md) says why), so it doesn't clash with the Native Bridge's.
+3. Install quen itself with `install.ps1 -NoGamePackage`.
+
+`install.ps1` leaves a package Vortex installed to Vortex, with `-Update` and `-Uninstall` too, and says so: update and remove it in Vortex. It tells by Vortex's deployment manifests in the game folder (`vortex.deployment*.json`), or by the package's files being hardlinks, as Vortex deploys them. `quen_doctor` gives the package's `owner`.
 
 ## Updating
 
@@ -50,7 +59,7 @@ Each release's notes on GitHub say what changed and what to do.
    powershell -ExecutionPolicy Bypass -File install.ps1 -Update
    ```
 
-   It replaces `quen.exe`, stopping a running one first after you agree. The in-game package is replaced whenever the release's version differs from the one in the game, with or without `-Update`; the old one goes to the Recycle Bin.
+   It replaces `quen.exe`, stopping a running one first after you agree. The in-game package is replaced whenever the release's version differs from the one in the game, with or without `-Update`; the old one goes to the Recycle Bin. A package Vortex installed is updated in Vortex.
 3. Restart Claude Desktop, or in the Claude Code CLI reconnect quen with `/mcp`: a client keeps the tool list it got when it connected. Your agent's `session_status` then gives the new version (`quen`).
 
 **Built from source:** close the MCP clients that use quen and wait until no `quen.exe` runs (Task Manager): Windows can't replace a running one. Then `git pull` and the same `cargo install` line as in section 2. For the in-game package, unzip the release's `quen-w3-<version>.zip` into the game folder, after moving the old `Mods\modQuen` to the Recycle Bin; `quen doctor` names the version it expects.
@@ -89,7 +98,7 @@ Your config, ledger, logs and captures stay. When a new quen changes the ledger'
 | Part | Files | What quen uses it for | Where to get it |
 |---|---|---|---|
 | Witcher Native Bridge 2.0 | `bin\x64_dx12\WitcherNativeBridge.asi` and the ASI loader in its download (`dinput8.dll`; an Ultimate ASI Loader named `winmm.dll` works too) | lets the scripts of quen's package call its ASI | public, on Nexus Mods. Needs the Microsoft Visual C++ Redistributable (x64). |
-| quen's in-game package | `bin\x64_dx12\W3Quen.asi`, `Mods\modQuen` | tells quen whether the game is in gameplay, a menu, a loading screen or photo mode; loads a save by name (`game_load`, and a launch of a save that isn't the newest); later the command channel into the game | `quen-w3-<version>.zip` from the GitHub Releases of quen-mcp. Unzip it into the game folder. |
+| quen's in-game package | `bin\x64_dx12\W3Quen.asi`, `Mods\modQuen` | tells quen whether the game is in gameplay, a menu, a loading screen or photo mode; loads a save by name (`game_load`, and a launch of a save that isn't the newest); later the command channel into the game | `quen-w3-<version>.zip` from the GitHub Releases of quen-mcp. Unzip it into the game folder, or install it with Vortex ([With Vortex](#with-vortex)). |
 
 - Both are needed for every launch.
 - quen doesn't need the W3 Game State Bridge. If another mod of yours uses it (RenoDX does), leave it installed: quen reads nothing of it, and parks it only when a launch names both of its parts (`W3GameStateBridge.asi,modW3GameStateBridge`), never one alone: one without the other breaks the game's script compile.

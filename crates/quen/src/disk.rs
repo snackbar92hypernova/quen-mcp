@@ -20,7 +20,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::config::Config;
 use crate::session::{self, Call, Done, Session, Shared};
-use crate::{capture, doctor, game, input, win};
+use crate::{capture, doctor, game, input, measure, win};
 
 /// The selection keys both tools take.
 const SELECT: [&str; 5] = [
@@ -70,8 +70,8 @@ pub fn tools() -> Vec<Value> {
                 good, and the call waits: yes deletes it (deleted), no keeps it in place (kept). Ledger rows stay, \
                 with removed_at and removed_to. Emptied folders go (folders, leftover_folders). missing: true also \
                 marks the rows in capture_usage's missing (removed_to missing). Refused, nothing moved: no \
-                selection, no user_ok, a session live, a journal a dead quen left, PresentMon running, another quen \
-                holding the game lock. What it couldn't take: left.",
+                selection, no user_ok, a session live, a journal a dead quen left, quen's PresentMon running, \
+                another quen holding the game lock. What it couldn't take: left.",
             // Claude Code prompts for this tool on every call, in every permission mode, as for session_launch.
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": schema(clean),
@@ -357,20 +357,6 @@ pub(crate) fn clean(session: &mut Session, call: &mut Call, args: &Value) -> Don
             .to_string()
             .into();
     }
-    // Windows' question before a permanent delete takes the focus, and the game pauses without it. PresentMon's
-    // capture exe runs only while something measures; PresentMonService.exe, its app's service, runs all the time.
-    let procs = game::tree().unwrap_or_default();
-    let measuring = |name: &str| name.starts_with("presentmon") && !name.contains("service");
-    if let Some((.., name)) = procs
-        .iter()
-        .find(|(.., name)| measuring(&name.to_lowercase()))
-    {
-        return format!(
-            "{name} runs (a measurement): a cleanup may open a Windows dialog, which takes the focus; clean once it \
-             ends"
-        )
-        .into();
-    }
     if let Err(why) = session.take_lock(&config, "capture_clean") {
         return why.into();
     }
@@ -380,6 +366,16 @@ pub(crate) fn clean(session: &mut Session, call: &mut Call, args: &Value) -> Don
         return "a journal a dead quen left exists: session_recover first"
             .to_string()
             .into();
+    }
+    // Windows' question before a permanent delete takes the focus, and the game pauses without it.
+    if let Some((pid, exe)) = measure::presentmon_running(&config, game::images) {
+        session.release_lock();
+        return format!(
+            "PresentMon {} runs (pid {pid}, a measurement): a cleanup may open a Windows dialog, which takes the \
+             focus; clean once it ends",
+            exe.display()
+        )
+        .into();
     }
     let max = (
         recycle_max(&config.capture_root()),

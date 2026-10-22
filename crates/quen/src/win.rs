@@ -597,8 +597,8 @@ impl Write for Pipe {
     }
 }
 
-/// Checks that process `pid`, the other end of a pipe, runs this same quen executable as this same user.
-pub fn check_peer(pid: u32) -> io::Result<()> {
+/// Process `pid`'s handle (query rights only) and its exe's full path.
+pub(crate) fn process_image(pid: u32) -> io::Result<(OwnedHandle, PathBuf)> {
     // SAFETY: the handle is owned at once; the buffer and its length match.
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -614,16 +614,25 @@ pub fn check_peer(pid: u32) -> io::Result<()> {
             buf.as_mut_ptr(),
             &mut len,
         ))?;
-        let image = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
-        if fs::canonicalize(&image)? != fs::canonicalize(env::current_exe()?)? {
-            return Err(io::Error::other(format!(
-                "pid {pid} runs {}, not this quen",
-                image.display()
-            )));
-        }
-        if process_user(process.as_raw_handle())? != process_user(GetCurrentProcess())? {
-            return Err(io::Error::other(format!("pid {pid} runs as another user")));
-        }
+        Ok((
+            process,
+            PathBuf::from(OsString::from_wide(&buf[..len as usize])),
+        ))
+    }
+}
+
+/// Checks that process `pid`, the other end of a pipe, runs this same quen executable as this same user.
+pub fn check_peer(pid: u32) -> io::Result<()> {
+    let (process, image) = process_image(pid)?;
+    if fs::canonicalize(&image)? != fs::canonicalize(env::current_exe()?)? {
+        return Err(io::Error::other(format!(
+            "pid {pid} runs {}, not this quen",
+            image.display()
+        )));
+    }
+    // SAFETY: the pseudo-handle of this process, which needs no closing.
+    if process_user(process.as_raw_handle())? != process_user(unsafe { GetCurrentProcess() })? {
+        return Err(io::Error::other(format!("pid {pid} runs as another user")));
     }
     Ok(())
 }
