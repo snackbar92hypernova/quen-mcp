@@ -1,7 +1,7 @@
 //! The park planner. It decides which mods to move out of the game's way for a boot, from folder listings only
 //! (no file-system access here), and refuses the whole plan on any doubt. A mod manager's mod (Vortex's, [`Managed`])
 //! parks as a unit: everything of it the game loads. Which script folder needs which binary is learned from the files
-//! ([`learn`]): a script folder and the binary its imports are in move both or neither.
+//! ([`learn`]): a script folder and the binary its imports are in move both or neither, and `ALL` takes them both.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -20,6 +20,10 @@ pub const W3_NEVER_PARK: &[&str] = &[
     "W3Quen.asi",
     "modQuen",
 ];
+
+/// The pair `ALL` leaves loaded: the W3 Game State Bridge, which the RenoDX add-on reads the game's state from. Named
+/// both, it parks; named one, it is refused, as any pair.
+pub const W3_ALL_SKIPS: [&str; 2] = ["W3GameStateBridge.asi", "modW3GameStateBridge"];
 
 /// The request word for every parkable mod.
 const ALL: &str = "ALL";
@@ -241,13 +245,15 @@ impl fmt::Display for ParkError {
 
 impl std::error::Error for ParkError {}
 
-/// An item a plan moves: where, its entry, and whether `ALL` or a managed mod's unit took it (its config may stay).
+/// An item a plan moves: where, its entry, whether `ALL` or a managed mod's unit took it (its config may stay), and
+/// whether `ALL` did (it leaves a pair it can't take whole).
 #[derive(Clone, Copy)]
 struct Item<'a> {
     home: Home,
     listing: Listing<'a>,
     entry: &'a Entry,
     derived: bool,
+    by_all: bool,
 }
 
 impl Item<'_> {
@@ -268,8 +274,9 @@ enum Target<'a> {
 /// (`nexus:<id>`, its name, its manager's folder: all its units, less those kept), else a managed mod's unit by its
 /// file or folder name. `ALL` is every Mods folder, every such bin file and every managed unit that is not a link,
 /// minus `keep` (a comma list of the same names), `never_park` (and every unit of a managed mod holding such a name),
-/// both halves of each of `pairs`, unsettled folders and their candidates, and the names listed explicitly, which keep
-/// their own place in the order. A bin `<stem>.ini` that `ALL` or a unit takes stays while its `<stem>` binary does.
+/// [`W3_ALL_SKIPS`], unsettled folders and their candidates, both halves of each of `pairs` it can't take whole, and
+/// the names listed explicitly, which keep their own place in the order. A bin `<stem>.ini` that `ALL` or a unit takes
+/// stays while its `<stem>` binary does.
 /// A Mods folder parked takes along the folder Script Merger merged it into. Refuses the whole plan on a bad, unknown,
 /// repeated or never-park name, a link, a name both requested and kept, one half of a pair, an unsettled folder or
 /// candidate named, a managed mod tied to what it can't park, and when `ALL` would take a name that isn't [`plain`].
@@ -400,6 +407,7 @@ pub fn plan<'a>(
                     listing,
                     entry: e,
                     derived: false,
+                    by_all: false,
                 });
             }
             Target::Mod(m) => {
@@ -422,6 +430,7 @@ pub fn plan<'a>(
                         listing,
                         entry: e,
                         derived: true,
+                        by_all: false,
                     });
                 }
             }
@@ -438,23 +447,38 @@ pub fn plan<'a>(
             return Err(ParkError::Tied(m.label.clone(), tie.why.clone()));
         }
     }
-    let paired: Vec<&str> = pairs.iter().flatten().copied().collect();
-    let unsettled: Vec<&str> = more
+    let skip: Vec<&str> = more
         .unsettled
         .iter()
         .flat_map(|u| std::iter::once(&u.folder).chain(&u.candidates))
         .map(String::as_str)
+        .chain(W3_ALL_SKIPS)
         .collect();
     let mut moves: Vec<Item> = Vec::new();
     if let Some(at) = all_at {
-        let taken = all(
-            &listing, more, &never, &is_kept, &paired, &unsettled, &explicit,
-        )?;
+        let taken = all(&listing, more, &never, &is_kept, &skip, &explicit)?;
         moves.extend_from_slice(&explicit[..at]);
         moves.extend(taken);
         moves.extend_from_slice(&explicit[at..]);
     } else {
         moves = explicit;
+    }
+    let moved = |name: &str, moves: &[Item]| {
+        moves
+            .iter()
+            .any(|m| m.entry.name.eq_ignore_ascii_case(name))
+    };
+    // A pair `ALL` took one half of (the other kept, never parked or not there): it leaves both.
+    while let Some(half) = pairs.iter().find_map(|&[a, b]| {
+        let half = match (moved(a, &moves), moved(b, &moves)) {
+            (true, false) => a,
+            (false, true) => b,
+            _ => return None,
+        };
+        let by_all = |m: &Item| m.by_all && m.entry.name.eq_ignore_ascii_case(half);
+        moves.iter().position(by_all)
+    }) {
+        moves.remove(half);
     }
     // A config `ALL` or a unit took stays with its binary: a file of bin's kinds or a managed unit there, not an ini.
     let unit = |name: &str| {
@@ -481,11 +505,6 @@ pub fn plan<'a>(
         .map(|m| m.entry.name.clone())
         .collect();
     moves.retain(|m| !(m.home == Home::Bin && configs.contains(&m.entry.name)));
-    let moved = |name: &str, moves: &[Item]| {
-        moves
-            .iter()
-            .any(|m| m.entry.name.eq_ignore_ascii_case(name))
-    };
     for &[a, b] in pairs {
         match (moved(a, &moves), moved(b, &moves)) {
             (true, false) => return Err(ParkError::Half(a.into(), b.into())),
@@ -528,6 +547,7 @@ pub fn plan<'a>(
                 listing,
                 entry: e,
                 derived: true,
+                by_all: false,
             });
         }
     }
@@ -544,14 +564,13 @@ pub fn plan<'a>(
 }
 
 /// What `ALL` takes, home by home in name order: Mods folders, bin's `.asi` / `.addon64` / `dxgi.dll` and managed
-/// units, then the menu's and DLC's managed units; none a link, kept, never parked, paired, unsettled or in `taken`.
+/// units, then the menu's and DLC's managed units; none a link, kept, never parked, on `skip` or in `taken`.
 fn all<'a>(
     listing: &dyn Fn(Home) -> Option<Listing<'a>>,
     more: &More<'a>,
     never: &dyn Fn(Home, &str) -> bool,
     kept: &dyn Fn(Home, &str) -> bool,
-    paired: &[&str],
-    unsettled: &[&str],
+    skip: &[&str],
     taken: &[Item],
 ) -> Result<Vec<Item<'a>>, ParkError> {
     let mut out = Vec::new();
@@ -576,8 +595,7 @@ fn all<'a>(
             .filter(|e| {
                 !never(home, &e.name)
                     && !kept(home, &e.name)
-                    && !listed(paired, &e.name)
-                    && !listed(unsettled, &e.name)
+                    && !listed(skip, &e.name)
                     && !taken.iter().any(|t| t.is(home, &e.name))
             })
             .collect();
@@ -590,6 +608,7 @@ fn all<'a>(
             listing,
             entry,
             derived: true,
+            by_all: true,
         }));
     }
     Ok(out)
@@ -1390,30 +1409,48 @@ mod tests {
     }
 
     #[test]
-    fn all_takes_vortex_units_but_never_park_mods_and_pairs() {
+    fn all_takes_vortex_units_and_whole_pairs_but_never_park_mods() {
         let all = run_vortex("ALL", "", WORLD, &[], &[]).unwrap();
         assert_eq!(
             all,
             [
                 "GAME/Mods/modOwn -> PARK/Mods/modOwn",
                 "GAME/Mods/modShared -> PARK/Mods/modShared",
+                "GAME/Mods/modWorld -> PARK/Mods/modWorld",
                 "GAME/bin/dsound.dll -> PARK/bin/dsound.dll",
                 "GAME/bin/edges_0.bin -> PARK/bin/edges_0.bin",
                 "GAME/bin/Own.asi -> PARK/bin/Own.asi",
                 "GAME/bin/w3loadfix.dll -> PARK/bin/w3loadfix.dll",
                 "GAME/bin/w3loadfix.ini -> PARK/bin/w3loadfix.ini",
                 "GAME/bin/World.addon64 -> PARK/bin/World.addon64",
+                "GAME/bin/World.asi -> PARK/bin/World.asi",
+                "GAME/bin/World.ini -> PARK/bin/World.ini",
                 "GAME/menu/w3loadfix.xml -> PARK/menu/w3loadfix.xml",
                 "GAME/menu/World.xml -> PARK/menu/World.xml",
                 "GAME/DLC/dlcExtra -> PARK/dlc/dlcExtra",
             ]
         );
-        // The pair's ASI stays, so does its ini; graphics.xml and Own.ini are no mod's units. The pair named beside ALL.
-        let with = run_vortex("ALL,nexus:14126", "", WORLD, &[], &[]).unwrap();
-        assert_eq!(with.len(), all.len() + 3, "{with:?}");
-        // Without learned pairs, ALL takes both halves.
-        let no_pairs = run_vortex("ALL", "", &[], &[], &[]).unwrap();
-        assert_eq!(no_pairs.len(), all.len() + 3, "{no_pairs:?}");
+        // graphics.xml and Own.ini are no mod's units. The mod named beside ALL changes only the order; without learned
+        // pairs ALL takes the same.
+        let mut with = run_vortex("ALL,nexus:14126", "", WORLD, &[], &[]).unwrap();
+        with.sort();
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(with, sorted);
+        assert_eq!(run_vortex("ALL", "", &[], &[], &[]).unwrap(), all);
+        // One half kept: ALL leaves both, and the ASI's ini with them; one half named beside it is still refused.
+        let kept = run_vortex("ALL", "World.asi", WORLD, &[], &[]).unwrap();
+        assert_eq!(kept.len(), all.len() - 3, "{kept:?}");
+        assert!(
+            !kept
+                .iter()
+                .any(|m| m.contains("modWorld") || m.contains("World.ini")),
+            "{kept:?}"
+        );
+        assert_eq!(
+            run_vortex("ALL,modWorld", "World.asi", WORLD, &[], &[]),
+            Err(ParkError::Half("modWorld".into(), "World.asi".into()))
+        );
         // The Native Bridge's mod: never, by any of its names or units.
         for name in ["nexus:13743", "Native Bridge", "dinput8.dll"] {
             assert_eq!(
@@ -1421,6 +1458,61 @@ mod tests {
                 Err(ParkError::NeverPark(name.into()))
             );
         }
+    }
+
+    /// The owner's rule: what ALL parked before learned pairs it still parks; the W3 Game State Bridge is the one pair it
+    /// leaves (RenoDX reads it), which parks named whole and is refused named by half.
+    #[test]
+    fn all_leaves_the_game_state_bridge_and_parks_other_pairs_whole() {
+        let (mut mods, mut bin) = game();
+        mods.push(dir("modWorld"));
+        bin.push(file("World.asi"));
+        let pairs: &[[&str; 2]] = &[GSB[0], ["modWorld", "World.asi"]];
+        let run = |requested: &str, keep: &str| {
+            let plan = plan(
+                requested,
+                keep,
+                W3_NEVER_PARK,
+                pairs,
+                Listing {
+                    dir: Path::new("GAME/Mods"),
+                    entries: &mods,
+                },
+                Listing {
+                    dir: Path::new("GAME/bin/x64"),
+                    entries: &bin,
+                },
+                Path::new("PARK"),
+                &More::default(),
+            )?;
+            let names = plan
+                .moves
+                .iter()
+                .map(|m| m.from.file_name().unwrap().to_string_lossy().into_owned());
+            Ok::<Vec<String>, ParkError>(names.collect())
+        };
+        let all = run("ALL", "").unwrap();
+        assert!(
+            all.contains(&"modWorld".into()) && all.contains(&"World.asi".into()),
+            "{all:?}"
+        );
+        assert!(
+            !all.iter().any(|n| n.contains("GameStateBridge")),
+            "{all:?}"
+        );
+        let both = run("ALL,W3GameStateBridge.asi,modW3GameStateBridge", "").unwrap();
+        assert_eq!(both.len(), all.len() + 2);
+        assert_eq!(
+            run("ALL,modW3GameStateBridge", ""),
+            Err(ParkError::Half(
+                "modW3GameStateBridge".into(),
+                "W3GameStateBridge.asi".into()
+            ))
+        );
+        assert_eq!(
+            run("World.asi", ""),
+            Err(ParkError::Half("World.asi".into(), "modWorld".into()))
+        );
     }
 
     #[test]
