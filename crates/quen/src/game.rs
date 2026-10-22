@@ -1527,6 +1527,17 @@ pub(crate) fn processes() -> io::Result<Vec<(u32, String)>> {
         .collect())
 }
 
+/// The id and full image path of every process whose image is named `name` (any case), from one snapshot; a process
+/// whose path this user can't read (another user's, one that exited since) is left out, as is everything when the
+/// snapshot fails.
+pub(crate) fn images(name: &str) -> Vec<(u32, PathBuf)> {
+    let named = processes().unwrap_or_default().into_iter();
+    let named = named.filter(|(_, image)| image.eq_ignore_ascii_case(name));
+    named
+        .filter_map(|(pid, _)| Some((pid, crate::win::process_image(pid).ok()?.1)))
+        .collect()
+}
+
 /// Every process's id, its parent's id and its image name (one Toolhelp snapshot). A parent id may name a process that
 /// exited, or another that took its id since.
 pub(crate) fn tree() -> io::Result<Vec<(u32, u32, String)>> {

@@ -21,6 +21,7 @@ use quen_core::trace::{self, MetricVerdict, Metrics, Reference, Sample, Sampler}
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::HWND;
 
+use crate::config::Config;
 use crate::game::{self, Action, Ctx, Cvar, Fields, ctx, flag};
 use crate::hands::Hands;
 use crate::session::{self, Call, Done, Session, last_line, utc_ms};
@@ -297,6 +298,24 @@ fn quiet(strict: bool, skewed: Vec<String>) -> Result<Value, String> {
 /// Where this session's CSVs go, beside its screenshots.
 pub(crate) fn captures(cx: &Ctx) -> PathBuf {
     cx.config.capture_root().join(&cx.live.id)
+}
+
+/// The PresentMon quen measures with, if it runs: its pid and exe. That is the exe a window starts (quen_doctor's check:
+/// the config's, else where its installer puts it, else on PATH), compared by full path with each process `named` gives
+/// for its file name ([`game::images`]). Other PresentMon copies are no quen measurement: Intel's PresentMonService and
+/// AMD's overlay each run one all the time (2026-10-22).
+pub(crate) fn presentmon_running(
+    config: &Config,
+    named: impl FnOnce(&str) -> Vec<(u32, PathBuf)>,
+) -> Option<(u32, PathBuf)> {
+    let exe = doctor::check(&doctor::PRESENTMON, config, None).path?;
+    let want = fs::canonicalize(&exe).ok()?;
+    let running = named(&exe.file_name()?.to_string_lossy());
+    let pid = running
+        .into_iter()
+        .find(|(_, image)| fs::canonicalize(image).is_ok_and(|image| image == want))?
+        .0;
+    Some((pid, exe))
 }
 
 /// PresentMon, checked before anything runs: its exe (quen_doctor's check: the config's, else on PATH or where its
@@ -2747,5 +2766,53 @@ fn main() {
             ["analyzeheadless.bat", "cargo.exe", "java.exe"]
         );
         assert!(busy(&[(1, "witcher3.exe".into())]).is_empty());
+    }
+
+    /// Only the PresentMon quen starts is a measurement, by its full path: Intel's service's and AMD's overlay's copies,
+    /// and a copy of the same exe elsewhere, aren't (2026-10-22: two of them blocked capture_clean). Without a
+    /// PresentMon quen can run, no process is looked at. The process lists are synthetic.
+    #[test]
+    fn only_quens_own_presentmon_is_a_measurement() {
+        let dir = std::env::temp_dir().join(format!("quen-pm-running-{}", std::process::id()));
+        let put = |rel: &str| {
+            let path = dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "synthetic").unwrap();
+            path
+        };
+        let exe = put(r"Intel\PresentMon\PresentMonConsoleApplication\PresentMon-2.4.1-x64.exe");
+        let others = vec![
+            (
+                1,
+                put(r"Intel\PresentMon\PresentMonService\PresentMon_x64.exe"),
+            ),
+            (2, put(r"WindowsApps\AMD\PresentMon-x64.exe")),
+            (3, put(r"copy\PresentMon-2.4.1-x64.exe")),
+            (4, dir.join(r"gone\PresentMon-2.4.1-x64.exe")),
+        ];
+        let config = Config {
+            presentmon: Some(exe.clone()),
+            ..Config::default()
+        };
+        let mut asked = Vec::new();
+        let running = presentmon_running(&config, |name| {
+            asked.push(name.to_owned());
+            others.clone()
+        });
+        assert_eq!(
+            (running, &asked[..]),
+            (None, &["PresentMon-2.4.1-x64.exe".to_owned()][..])
+        );
+        // quen's own, its path in another case, as a process list may give it.
+        let mine = PathBuf::from(exe.to_string_lossy().to_uppercase());
+        let all = [others, vec![(5, mine)]].concat();
+        assert_eq!(presentmon_running(&config, |_| all), Some((5, exe)));
+        let config = Config {
+            presentmon: Some(dir.join("nowhere.exe")),
+            ..Config::default()
+        };
+        let running = presentmon_running(&config, |_| panic!("the processes were looked at"));
+        assert_eq!(running, None);
+        fs::remove_dir_all(&dir).unwrap(); // this test's own folder
     }
 }

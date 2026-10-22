@@ -18,6 +18,7 @@ use quen_core::build::{self, Build, Gate};
 use quen_core::detect;
 use quen_core::journal::sha256_hex;
 use quen_core::ledger::{Ledger, git_head};
+use quen_core::vortex::Inventory;
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
@@ -39,6 +40,12 @@ pub(crate) struct Pin {
 /// quen's in-game package: its two files, which only work as a pair from one release.
 const PACKAGE_ASI: &str = r"bin\x64_dx12\W3Quen.asi";
 const PACKAGE_SCRIPT: &str = r"Mods\modQuen\content\scripts\local\quen.ws";
+/// What a mod manager may own of quen's package and of the Native Bridge (`owner`).
+const PACKAGE_OWNED: [&str; 2] = [PACKAGE_ASI, r"Mods\modQuen"];
+const BRIDGE_OWNED: [&str; 2] = [
+    r"bin\x64_dx12\WitcherNativeBridge.asi",
+    r"Mods\modNativeBridge",
+];
 /// The version of the pure-script modQuen from before the package, pinned only to name it: the package replaces it.
 const OLD_MODQUEN: &str = "the old pure-script modQuen (witcher3-mods 464ff2b)";
 /// NVIDIA Streamline's interposer in the game: what a renderdoc launch swaps out and its end puts back (profile.rs).
@@ -399,7 +406,13 @@ pub(crate) fn package_at_least(
     let Some(old) = package_version(config).filter(|v| before.contains(v)) else {
         return Ok(());
     };
-    let why = format!("quen's package in the game is {old}: {tool} needs quen-w3 {since} or later");
+    let mut why =
+        format!("quen's package in the game is {old}: {tool} needs quen-w3 {since} or later");
+    let inv = crate::vortex::read(config);
+    let game = config.game_dir.as_deref();
+    if let Some(m) = game.and_then(|g| vortex_owner(inv.as_ref(), g, &PACKAGE_OWNED)) {
+        why.push_str(&format!(", and it is Vortex's ({m}): update it in Vortex"));
+    }
     let need = json!({
         "dependency": PACKAGE.name,
         "status": "wrong_version",
@@ -424,6 +437,18 @@ fn pins() -> &'static [Pin] {
         });
         PINS.iter().copied().chain(test).collect()
     })
+}
+
+/// The Vortex mods whose deployment manifests (`inv`) list a file of `rels` (in the game folder `game`), None when none
+/// does: then quen's installer or the user installed it. What Vortex owns is updated in Vortex; install.ps1 leaves it.
+fn vortex_owner(inv: Option<&Inventory>, game: &Path, rels: &[&str]) -> Option<String> {
+    let owners = rels
+        .iter()
+        .flat_map(|rel| inv.map(|inv| inv.owners(&game.join(rel))));
+    let mut mods: Vec<String> = owners.flatten().map(|m| m.id.display()).collect();
+    mods.sort();
+    mods.dedup();
+    (!mods.is_empty()).then(|| mods.join(" + "))
 }
 
 /// The version of quen's package in the game: its W3Quen.asi's pin, None when it has none.
@@ -1581,14 +1606,40 @@ pub(crate) fn need(dep: &Dep, state: &State, needed_for: &str) -> Value {
 /// quen_doctor's fields: each dependency's state, then whether everything a session needs is there.
 fn report(cx: &Cx) -> Map<String, Value> {
     let mut missing = Vec::new();
+    // Who installed quen's package and the Native Bridge (`owner`): a Vortex mod, else none (quen's installer or the
+    // user). A note on one Vortex owns that isn't found says to update it in Vortex.
+    let owned = [
+        (PACKAGE.name, PACKAGE_OWNED),
+        (NATIVE_BRIDGE.name, BRIDGE_OWNED),
+    ];
+    let game = cx.game_dir.map(|g| {
+        let config = Config {
+            game_dir: Some(g.to_owned()),
+            ..cx.config.clone()
+        };
+        (g, crate::vortex::read(&config))
+    });
     let deps: Vec<Value> = DEPS
         .iter()
         .map(|dep| {
-            let s = (dep.check)(cx);
+            let mut s = (dep.check)(cx);
             if dep.required && s.status != "found" {
                 missing.push(dep.name);
             }
-            json!({
+            let owner = owned
+                .iter()
+                .find(|(name, _)| *name == dep.name)
+                .and_then(|(_, rels)| {
+                    let (g, inv) = game.as_ref()?;
+                    Some(vortex_owner(inv.as_ref(), g, rels))
+                });
+            if let Some(Some(m)) = &owner
+                && s.status != "found"
+            {
+                let note = s.note.take().map_or(String::new(), |n| format!("{n}; "));
+                s.note = Some(format!("{note}it is Vortex's ({m}): update it in Vortex"));
+            }
+            let mut entry = json!({
                 "name": dep.name,
                 "required": dep.required,
                 "status": s.status,
@@ -1598,7 +1649,11 @@ fn report(cx: &Cx) -> Map<String, Value> {
                 "note": s.note,
                 "enables": dep.enables,
                 "how_to_get": dep.how_to_get,
-            })
+            });
+            if let Some(owner) = owner {
+                entry["owner"] = json!(owner.map_or("none".into(), |m| format!("Vortex: {m}")));
+            }
+            entry
         })
         .collect();
     Map::from_iter([
@@ -2420,6 +2475,45 @@ mod tests {
         assert!(
             !names.contains("special k") && !names.contains("skiv"),
             "{names}"
+        );
+    }
+
+    /// quen's package and the Native Bridge name who installed them: the Vortex mod whose deployment manifest lists a
+    /// file of theirs, else none. A package Vortex owns that isn't found says to update it in Vortex.
+    #[test]
+    fn the_package_and_the_native_bridge_name_their_owner() {
+        let t = Temp::new("owner");
+        let config = config(&t.0);
+        let cx = cx(&t, &config, &[]);
+        let deps = || {
+            let fields = report(&cx);
+            let deps = fields["dependencies"].as_array().unwrap().clone();
+            let of = |dep: &Dep| deps.iter().find(|d| d["name"] == dep.name).unwrap().clone();
+            [of(&PACKAGE), of(&NATIVE_BRIDGE), of(&GAME)]
+        };
+        let [package, bridge, game] = deps();
+        assert_eq!([&package["owner"], &bridge["owner"]], ["none", "none"]);
+        assert!(game.get("owner").is_none(), "{game}");
+        // A synthetic Vortex deployed the package: its manifest and its staging folder's marker.
+        let source = "quen-w3 1 0.1.0 2026-10-22T00-00Z key";
+        let staging = t.put(r"staging\__vortex_staging_folder", r#"{"instance": "i"}"#);
+        let files: Vec<Value> = [PACKAGE_ASI, PACKAGE_SCRIPT]
+            .iter()
+            .map(|rel| json!({"relPath": rel, "source": source, "target": "", "time": 1}))
+            .collect();
+        let manifest = json!({"instance": "i", "deploymentMethod": "hardlink_activator",
+            "stagingPath": staging.parent().unwrap(), "files": files});
+        t.put(
+            r"game\vortex.deployment.witcher3tl.json",
+            manifest.to_string(),
+        );
+        let [package, bridge, _] = deps();
+        assert_eq!(package["owner"], "Vortex: quen-w3 0.1.0 (nexus 1)");
+        assert_eq!(bridge["owner"], "none");
+        let note = package["note"].as_str().unwrap();
+        assert!(
+            note.ends_with("it is Vortex's (quen-w3 0.1.0 (nexus 1)): update it in Vortex"),
+            "{note}"
         );
     }
 
