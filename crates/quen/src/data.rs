@@ -1191,7 +1191,7 @@ fn run_journaled(
     let ran = run_wcc(call, &config, &changes, argv, scratch, &mut stop);
     // Put back, whatever happened: the replay the session tools use.
     let replay = match session::journal_path(&config).exists() {
-        true => session.unwind(call, &scratch.join("journal.jsonl")),
+        true => session.unwind(call, &scratch.join("journal.jsonl"), None),
         false => Ok(Map::new()),
     };
     session.release_lock();

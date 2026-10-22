@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quen_core::bridge_log::MENU;
 use quen_core::build::Build;
-use quen_core::journal::{Fs, Journal, replay, sha256_file, sha256_hex};
+use quen_core::journal::{Fs, Journal, replay_with, sha256_file, sha256_hex};
 use quen_core::ledger::{BootEnd, BootStart, Ledger, Outcome, Save};
 use quen_core::mods::HashCache;
 use quen_core::saves::{self, Snapshot};
@@ -393,8 +393,9 @@ pub(crate) struct Live {
     pub(crate) status: status::Status,
     /// A run_plan is running: it set its own measuring state, so its steps set none (status.rs).
     pub(crate) in_plan: Cell<bool>,
-    /// With Vortex, the deployed files that weren't its links at the plan: the end's report lists them apart.
-    pub(crate) vortex: Option<Vec<String>>,
+    /// With Vortex, its records as the plan read them: the end's report lists the files broken then apart, and the
+    /// replay knows a parked file Vortex purged by them.
+    pub(crate) vortex: Option<quen_core::vortex::Inventory>,
     /// Keeps the PC and its display awake for exactly as long as the session lives.
     pub(crate) _awake: crate::win::Awake,
 }
@@ -1521,7 +1522,7 @@ impl<'a> Session<'a> {
             idled: Cell::new(None),
             status: Default::default(),
             in_plan: Cell::new(false),
-            vortex: spec.vortex.as_ref().map(|inv| inv.broken()),
+            vortex: spec.vortex.clone(),
             _awake: crate::win::Awake::hold(),
         });
         fields.insert("session".into(), json!(id));
@@ -1531,6 +1532,9 @@ impl<'a> Session<'a> {
         fields.insert("changes".into(), json!(spec.change_lines(&out)));
         if let Some(inv) = &spec.vortex {
             fields.insert("vortex".into(), vortex::fields(inv, &spec.changes));
+        }
+        if !spec.park.is_empty() {
+            fields.insert("park".into(), json!(spec.park));
         }
         let applied = w3::make_parking(&spec.changes).and_then(|()| {
             quen_core::boot::apply(&JournalFs, &mut journal, &spec.changes, &|| call.stopped())
@@ -1626,7 +1630,7 @@ impl<'a> Session<'a> {
         }
         if let Some(game_dir) = &config.game_dir {
             // The mods that loaded, now that the boot has parked its set.
-            let set = w3::mod_set(game_dir, &mut self.cache)
+            let set = w3::mod_set(game_dir, &mut self.cache, spec.vortex.as_ref())
                 .map_err(|e| format!("mod set: {e}"))
                 .and_then(|entries| {
                     if let Some(inv) = &spec.vortex {
@@ -2007,7 +2011,7 @@ impl<'a> Session<'a> {
             let kept = keep_game_logs(call, &bin, docs.as_deref(), live.launched, &live.logs);
             fields.insert("game_logs".into(), kept);
         }
-        let done = self.unwind(call, &live.logs.join("journal.jsonl"));
+        let done = self.unwind(call, &live.logs.join("journal.jsonl"), live.vortex.as_ref());
         // With Vortex, after the replay: the files that aren't Vortex's links any more, as its next deploy would list
         // them.
         if let (Some(before), Ok(config)) = (&live.vortex, self.config())
@@ -2147,7 +2151,7 @@ impl<'a> Session<'a> {
         };
         let mut done = fs::create_dir_all(&logs)
             .map_err(|e| (format!("{}: {e}", logs.display()), Map::new()))
-            .and_then(|()| self.unwind(call, &journal_to));
+            .and_then(|()| self.unwind(call, &journal_to, vortex::read(&config).as_ref()));
         if let (Some(kept), Ok(fields) | Err((_, fields))) = (kept_logs, &mut done) {
             fields.insert("game_logs".into(), kept);
         }
@@ -2189,6 +2193,7 @@ impl<'a> Session<'a> {
         &mut self,
         call: &mut Call,
         journal_to: &Path,
+        vortex: Option<&quen_core::vortex::Inventory>,
     ) -> Result<Map<String, Value>, (String, Map<String, Value>)> {
         let config = self.config().map_err(|why| (why, Map::new()))?.clone();
         let stays = "the journal stays for session_recover";
@@ -2206,7 +2211,7 @@ impl<'a> Session<'a> {
         let path = journal_path(&config);
         let bytes =
             fs::read(&path).map_err(|e| (format!("{}: {e}", path.display()), Map::new()))?;
-        let report = replay(&bytes, &JournalFs);
+        let report = replay_with(&bytes, &JournalFs, &vortex::purged(vortex));
         call.lap("replay");
         let mut fields = Map::new();
         let clean = report.clean();
@@ -3142,9 +3147,10 @@ mod tests {
                 park: "ALL",
                 keep: "",
                 never_park: &w3::never_park(false),
-                pairs: quen_core::park::W3_PAIRS,
+                pairs: &[["modW3GameStateBridge", "W3GameStateBridge.asi"]],
                 mods: &mods,
                 bin: &bin,
+                more: Default::default(),
                 renodx: None,
                 load_from_dll_main: None,
                 play: false,
@@ -3174,7 +3180,7 @@ mod tests {
                 writes: Cell::new(0),
                 limit: usize::MAX,
             };
-            let report = replay(&journal, &alive);
+            let report = quen_core::journal::replay(&journal, &alive);
             w3::tidy_parking(&game);
             let at = format!("killed before write {limit}");
             assert!(

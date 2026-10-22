@@ -614,9 +614,9 @@ fn every_enum_value_is_accepted_by_the_schema() {
     assert_eq!(
         stored,
         vec![vec![
-            json!(10),
-            json!(15),
-            json!("addon asi dlc mods reshade")
+            json!(14),
+            json!(21),
+            json!("addon asi bin dlc menu mods reshade")
         ]]
     );
 }

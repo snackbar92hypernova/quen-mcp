@@ -406,6 +406,9 @@ const BIN: &[(&str, &str)] = &[
     ("renodx-devkit.addon64", "file"),
 ];
 /// The harness's own names it never parks (W3_PARK_RENODX unset): what the adapter adds to `W3_NEVER_PARK` (park.rs).
+/// The W3 Game State Bridge's pair, as quen learns it from the files (park::learn): the harness never parks it.
+const GSB: &[[&str; 2]] = &[["W3GameStateBridge.asi", "modW3GameStateBridge"]];
+
 const HARNESS_OWN: &[&str] = &[
     "modRenoDXTest",
     "renodx-devkit.addon64",
@@ -484,7 +487,7 @@ fn park_plans() {
             "W3GameStateBridge.asi,modW3GameStateBridge",
             "",
             Some(
-                "quen parks W3GSB both halves together (park::W3_PAIRS); the harness never parks it",
+                "quen parks W3GSB both halves together (its pair, learned from the files); the harness never parks it",
             ),
         ),
         c(
@@ -662,7 +665,7 @@ fn park_plans() {
                 &text(input, "park"),
                 &text(input, "keep"),
                 &never,
-                park::W3_PAIRS,
+                GSB,
                 Listing {
                     dir: &mods_dir,
                     entries: &mods,
@@ -672,6 +675,7 @@ fn park_plans() {
                     entries: &bin,
                 },
                 &dir.join("parked"),
+                &park::More::default(),
             );
             match plan {
                 Ok(plan) => {
@@ -1652,9 +1656,10 @@ fn boot_rust(input: &Value) -> Value {
         park: &park_names,
         keep: &keep,
         never_park: &never,
-        pairs: park::W3_PAIRS,
+        pairs: GSB,
         mods: &mods,
         bin: &bin_entries,
+        more: park::More::default(),
         renodx: Some(RenoDx {
             addon: "renodx-thewitcher3remastered.addon64",
             preset: &preset,

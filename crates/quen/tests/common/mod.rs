@@ -88,6 +88,15 @@ pub const W3GSB: [&str; 2] = [
     r"Mods\modW3GameStateBridge\content\scripts\local\w3gsb.ws",
 ];
 
+/// What the W3 Game State Bridge's part `part` (of [`W3GSB`]) holds in a test, of the build `build`: its script imports
+/// a function its ASI holds the name of, as the real one does, so quen learns the pair from the files.
+pub fn w3gsb(part: &str, build: &str) -> String {
+    match part.ends_with(".ws") {
+        true => format!("import function GSB_State() : int; // {build}\n"),
+        false => format!("GSB_State\0{build}"),
+    }
+}
+
 /// `QUEN_TEST_PINS` for every quen these tests start: the synthetic package files are its one release.
 pub fn test_pins() -> String {
     let sha = quen_core::journal::sha256_hex(b"synthetic");

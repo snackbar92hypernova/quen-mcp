@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use quen_core::boot::{self, Change, Inputs, RenoDx};
 use quen_core::bridge_log;
 use quen_core::journal::sha256_hex;
-use quen_core::park::{self, Entry};
+use quen_core::park::{self, Entry, Learned, Listing};
 use quen_core::saves;
+use quen_core::vortex::Inventory;
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
@@ -88,7 +89,10 @@ pub(crate) struct Spec {
     /// Every file change, in order: quen-core's plan, then the profile's.
     pub(crate) changes: Vec<Change>,
     /// Vortex's records as the plan read them, its refusals passed; None without a Vortex manifest.
-    pub(crate) vortex: Option<quen_core::vortex::Inventory>,
+    pub(crate) vortex: Option<Inventory>,
+    /// session_plan's and session_launch's `park`: the pairs learned from the files, the folders they can't settle,
+    /// and each Script Merger folder parked with a mod it merged.
+    pub(crate) park: Map<String, Value>,
     /// The ReShade.log line that says the RenoDX add-on loaded, when the boot waits for it.
     mark: Option<&'static str>,
     extra: Map<String, Value>,
@@ -425,6 +429,55 @@ impl Spec {
             }
         }
         let never_park = w3::never_park(on("W3_PARK_RENODX"));
+        // What a park sees beyond Mods and bin: Vortex's mods with their menu and DLC units, the pairs the files settle,
+        // Script Merger's merges. All read here, so a refusal changes nothing.
+        let parking = !park.trim().is_empty();
+        let inv = crate::vortex::read(config);
+        let managed = inv.as_ref().map(Inventory::managed).unwrap_or_default();
+        let dlc_dir = boot::dlc_dir(&game_dir);
+        let read_if = |used: bool, dir: &Path| match used && dir.is_dir() {
+            true => listing(dir),
+            false => Ok(Vec::new()),
+        };
+        let menu = match menus {
+            true => listing(&menu_dir)?,
+            false => read_if(parking, &menu_dir)?,
+        };
+        let dlc = read_if(parking, &dlc_dir)?;
+        let learned = match parking {
+            true => w3::pairs(
+                &game_dir,
+                &config.game_exe,
+                &mods,
+                &bin_entries,
+                &never_park,
+                &managed,
+            )?,
+            false => Learned::default(),
+        };
+        let pairs: Vec<[&str; 2]> = learned
+            .pairs
+            .iter()
+            .map(|[a, b]| [a.as_str(), b.as_str()])
+            .collect();
+        let merges = match parking {
+            true => w3::merges(&game_dir),
+            false => Ok(Vec::new()),
+        };
+        let more = park::More {
+            menu: Some(Listing {
+                dir: &menu_dir,
+                entries: &menu,
+            }),
+            dlc: Some(Listing {
+                dir: &dlc_dir,
+                entries: &dlc,
+            }),
+            managed: &managed,
+            unsettled: &learned.unsettled,
+            merges: merges.as_deref().unwrap_or_default(),
+            merges_unread: merges.as_ref().err().map(String::as_str),
+        };
         let renodx = config.renodx_addon.as_deref().filter(|_| !play);
         let renodx = renodx.map(|addon| RenoDx {
             addon,
@@ -454,9 +507,10 @@ impl Spec {
                     park: &park,
                     keep,
                     never_park: &never_park,
-                    pairs: park::W3_PAIRS,
+                    pairs: &pairs,
                     mods: &mods,
                     bin: &bin_entries,
+                    more,
                     renodx,
                     load_from_dll_main: load,
                     play,
@@ -492,10 +546,6 @@ impl Spec {
             .copied()
             .chain([config.game_exe.as_str()])
             .collect();
-        let menu = match menus {
-            true => listing(&menu_dir)?,
-            false => Vec::new(),
-        };
         let staged = boot::stage(
             &JournalFs,
             &game_dir,
@@ -517,7 +567,29 @@ impl Spec {
         )?;
         changes.extend(staged);
         // With Vortex: what would undo the launch's parks, or a restore that breaks a link, refused (vortex.rs).
-        let vortex = crate::vortex::check(config, &changes)?;
+        let vortex = crate::vortex::check(inv, &changes)?;
+        let mut park = Map::new();
+        if !learned.pairs.is_empty() {
+            park.insert("pairs".into(), json!(learned.pairs));
+        }
+        if !learned.unsettled.is_empty() {
+            park.insert("unsettled".into(), json!(learned.unsettled));
+        }
+        let moved = |name: &str| {
+            changes.iter().any(|c| {
+                matches!(c, Change::Move { from, .. } if from.parent() == Some(mods_dir.as_path())
+                    && from.file_name().is_some_and(|f| f.eq_ignore_ascii_case(name)))
+            })
+        };
+        let merged: Vec<Value> = merges
+            .iter()
+            .flatten()
+            .filter(|m| moved(&m.merged) && m.included.iter().any(|i| moved(i)))
+            .map(|m| json!({"folder": format!(r"Mods\{}", m.merged), "merges": m.included}))
+            .collect();
+        if !merged.is_empty() {
+            park.insert("merged".into(), json!(merged));
+        }
         let mark = config.renodx_addon.as_ref().filter(|_| !play).map(|_| {
             if on("W3_FOREIGN_ADDON") {
                 "Registered add-on \"RenoDX\""
@@ -540,6 +612,7 @@ impl Spec {
             profile,
             changes,
             vortex,
+            park,
             mark,
             extra,
         })
@@ -1164,6 +1237,9 @@ pub(crate) fn plan_fields(config: &Config, spec: &Spec) -> Map<String, Value> {
     }
     if let Some(inv) = &spec.vortex {
         fields.insert("vortex".into(), crate::vortex::fields(inv, &spec.changes));
+    }
+    if !spec.park.is_empty() {
+        fields.insert("park".into(), json!(spec.park));
     }
     fields
 }

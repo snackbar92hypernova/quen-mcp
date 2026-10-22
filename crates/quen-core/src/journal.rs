@@ -267,6 +267,17 @@ pub struct Left {
 /// Undoes every started step of `journal`, newest first. A torn last line is ignored with a note: a step's line is on
 /// disk before its action starts, so that action never ran. Backups are recycled only when every step was undone.
 pub fn replay(journal: &[u8], fs: &dyn Fs) -> ReplayReport {
+    replay_with(journal, fs, &|_, _| None)
+}
+
+/// [`replay`], where `elsewhere` is asked about a parked file gone from both its names (`from`, the moved file's id):
+/// Some(note) says where its data is kept (a mod manager's purge unlinked it, its own copy stays), and the step counts as
+/// done with that note.
+pub fn replay_with(
+    journal: &[u8],
+    fs: &dyn Fs,
+    elsewhere: &dyn Fn(&Path, &str) -> Option<String>,
+) -> ReplayReport {
     let mut report = ReplayReport::default();
     let mut steps = Vec::new();
     let mut done = Vec::new();
@@ -293,7 +304,7 @@ pub fn replay(journal: &[u8], fs: &dyn Fs) -> ReplayReport {
             .push(format!("step {id} has no done line: it was interrupted"));
     }
     for (i, (id, action)) in steps.iter().enumerate().rev() {
-        if let Err(Why(why)) = undo(fs, &steps[..i], action, &mut report) {
+        if let Err(Why(why)) = undo(fs, &steps[..i], action, elsewhere, &mut report) {
             report.left.push(Left {
                 step: *id,
                 action: action.clone(),
@@ -359,11 +370,13 @@ impl From<io::Error> for Why {
     }
 }
 
-/// Undoes one action if its files still verify. `earlier` are the steps before it, where a patch finds its backup.
+/// Undoes one action if its files still verify. `earlier` are the steps before it, where a patch finds its backup;
+/// `elsewhere` is [`replay_with`]'s.
 fn undo(
     fs: &dyn Fs,
     earlier: &[(u64, Action)],
     action: &Action,
+    elsewhere: &dyn Fn(&Path, &str) -> Option<String>,
     report: &mut ReplayReport,
 ) -> Result<(), Why> {
     match action {
@@ -428,6 +441,19 @@ fn undo(
             file_id,
         } => {
             if verifies(fs, to, sha, file_id)? {
+                // The same file back at its place (a mod manager relinked it): the parked name goes, the data stays
+                // linked. ponytail: a folder's id is its own, so a relinked folder still counts as taken; compare its
+                // files' ids if a manager's deploy during a session comes up.
+                if verifies(fs, from, sha, file_id)? {
+                    fs.recycle(to)?;
+                    report.recycled.push(to.clone());
+                    report.undone.push(format!(
+                        "{} was back at {} (the same file, relinked): its parked name recycled",
+                        to.display(),
+                        from.display()
+                    ));
+                    return Ok(());
+                }
                 if fs.exists(from) {
                     return Err(format!(
                         "{} is taken again, the parked copy stays",
@@ -448,6 +474,10 @@ fn undo(
                     to.display()
                 )
                 .into());
+            } else if !fs.exists(from)
+                && let Some(note) = elsewhere(from, file_id)
+            {
+                report.notes.push(note);
             } else if !verifies(fs, from, sha, file_id)? {
                 let why = format!(
                     "neither {} nor {} is what was moved",
@@ -631,6 +661,14 @@ impl MemFs {
         state
             .files
             .insert(path.as_ref().to_owned(), (id, data.as_ref().to_vec(), id));
+    }
+
+    /// Gives the file at `from` the second name `to`, as a hardlink does: the same id and bytes.
+    pub fn link(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) {
+        let mut state = self.state.borrow_mut();
+        if let Some(file) = state.files.get(from.as_ref()).cloned() {
+            state.files.insert(to.as_ref().to_owned(), file);
+        }
     }
 
     /// Every file and its bytes.
@@ -833,6 +871,68 @@ mod tests {
         fs.put(path, "{\"rec\":\"done\",\"id\":1}\n{\"rec\":\"st");
         let err = Journal::open(&fs, path).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A parked hardlink a mod manager put back at its place (the same file): the parked name goes, the step is done.
+    /// One its purge unlinked from both names: done when `elsewhere` knows where its data is, else left.
+    #[test]
+    fn a_relinked_or_purged_parked_file_is_no_failed_undo() {
+        let park = |fs: &MemFs| {
+            let (from, to) = (
+                PathBuf::from("G/bin/a.dll"),
+                PathBuf::from("G/parked/a.dll"),
+            );
+            let mut journal = Journal::create(fs, Path::new("J")).unwrap();
+            let id = journal
+                .step(Action::Move {
+                    from: from.clone(),
+                    to: to.clone(),
+                    sha: fs.sha256(&from).unwrap(),
+                    file_id: fs.file_id(&from).unwrap(),
+                })
+                .unwrap();
+            fs.rename(&from, &to).unwrap();
+            journal.done(id).unwrap();
+            (from, to, fs.read(Path::new("J")).unwrap())
+        };
+        let fs = MemFs::default();
+        fs.put("S/a.dll", "dll");
+        fs.link("S/a.dll", "G/bin/a.dll");
+        let (from, to, journal) = park(&fs);
+        fs.link("S/a.dll", &from);
+        let report = replay(&journal, &fs);
+        assert!(report.clean(), "{report:#?}");
+        assert_eq!(fs.recycled(), std::slice::from_ref(&to));
+        assert!(fs.exists(&from) && !fs.exists(&to));
+        assert!(
+            report.undone[0].contains("the same file, relinked"),
+            "{report:#?}"
+        );
+        // Another file at the place: taken, as before.
+        let fs = MemFs::default();
+        fs.put("G/bin/a.dll", "dll");
+        let (from, _, journal) = park(&fs);
+        fs.put(&from, "dll");
+        assert!(replay(&journal, &fs).left[0].why.contains("is taken again"));
+        // Purged: both names gone.
+        let fs = MemFs::default();
+        fs.put("S/a.dll", "dll");
+        fs.link("S/a.dll", "G/bin/a.dll");
+        let (from, to, journal) = park(&fs);
+        let id = fs.file_id(&to).unwrap();
+        fs.recycle(&to).unwrap();
+        let left = replay(&journal, &fs);
+        assert!(left.left[0].why.starts_with("neither"), "{left:#?}");
+        let purged = |path: &Path, file: &str| {
+            (path == from && file == id)
+                .then(|| "Vortex purged it; deploy in Vortex to put it back".to_owned())
+        };
+        let report = replay_with(&journal, &fs, &purged);
+        assert!(report.clean(), "{report:#?}");
+        assert_eq!(
+            report.notes,
+            ["Vortex purged it; deploy in Vortex to put it back"]
+        );
     }
 
     #[test]

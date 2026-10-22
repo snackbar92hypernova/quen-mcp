@@ -112,8 +112,9 @@ parked flags, so two boots with the same `sha256` ran the same mods.
 ### mod_set_entries (table)
 
 One mod in a set. Key (`mod_set_id` → mod_sets, `kind`, `name`): the mod's identity, e.g. kind `asi`, name
-`W3ElementMap`. `kind` is `mods` (a Mods folder), `asi`, `addon`, `reshade` or `dlc` (rows imported from schema 1 may
-keep an older free-text kind). `parked` 1: the mod was moved out for the boot, so it didn't load. `home`: where it
+`W3ElementMap`. `kind` is `mods` (a Mods folder), `asi`, `addon`, `reshade`, `dlc` (a folder in the game's `DLC`), and
+from schema 15 `bin` (another file in bin a Vortex mod deployed, e.g. `dsound.dll`; its name is the file name) or `menu`
+(a Vortex mod's menu XML; its name is the file's stem) (rows imported from schema 1 may keep an older free-text kind). `parked` 1: the mod was moved out for the boot, so it didn't load. `home`: where it
 lives, relative to the game folder (rows written before 2026-10-18 hold the absolute path). `content_hash`: its build (a file's sha256, or a folder's tree hash). `file_count`, `bytes`.
 `config_hash`: the hash of its config files; `config_values` (JSON object): the parsed config keys that change its
 behaviour. `version_label` and `provenance` (`git_commit`, `nexus_file` or `unknown`): the label from mod_versions, if
@@ -121,7 +122,7 @@ the build has one.
 
 ### mod_versions (table)
 
-Labels for builds. `content_hash` (key); `kind`, `name`: the mod; `version`; `provenance` (`git_commit` for our own
+Labels for builds. `content_hash` (key); `kind` (as in mod_set_entries), `name`: the mod; `version`; `provenance` (`git_commit` for our own
 reproducible builds, `nexus_file` for downloads); `source`: the commit or the Nexus file name. A launch labels each
 entry one Vortex mod deployed: its version, `nexus_file`, and as `source` its Vortex folder (the download's name).
 
@@ -156,7 +157,8 @@ record of the earlier tool, for boots it ran or that were imported from its hist
 
 ### boot_mod_status (table)
 
-What each mod did at load in a boot, from its log or state export. Key (`boot_id` → boots, `kind`, `name`); `status`:
+What each mod did at load in a boot, from its log or state export. Key (`boot_id` → boots, `kind` as in mod_set_entries,
+`name`); `status`:
 `loaded`, `refused` (e.g. the game code differs; `reason` says why) or `not_present` (parked or missing); `reason`.
 
 ### poses (table)

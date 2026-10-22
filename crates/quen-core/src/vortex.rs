@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::park::{self, Entry};
+use crate::park::{self, Entry, Home, Managed, Tie};
 
 /// What Vortex leaves in every folder it creates in the game: never a mod's content (mods.rs ignores it).
 pub const FOLDER_MARKER: &str = "__folder_managed_by_vortex";
@@ -275,6 +275,13 @@ pub struct Unit {
     pub kind: Kind,
     pub path: String,
     pub files: usize,
+    /// In a Mods folder: its files no live manifest lists (not counting Vortex's marker, logs and backups).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub outside: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A Vortex mod with deployed files.
@@ -335,6 +342,8 @@ struct File {
     unit: String,
     source: String,
     link: Link,
+    /// Its staging copy.
+    staged: PathBuf,
 }
 
 /// What Vortex deployed, from its records.
@@ -467,6 +476,7 @@ pub fn inventory(
                     unit,
                     source: d.source.clone(),
                     link: link(files.stat(&deployed).as_ref(), files.stat(&staged).as_ref()),
+                    staged,
                 });
                 if !inv.mods.iter().any(|m| m.id.vortex == d.source) {
                     inv.mods.push(Mod {
@@ -486,6 +496,27 @@ pub fn inventory(
     if inv.manifests.is_empty() {
         return None;
     }
+    let listed: BTreeSet<&str> = inv.files.iter().map(|f| f.key.as_str()).collect();
+    let ignored = |rel: &str| {
+        rel.split('\\').any(|segment| {
+            let segment = segment.to_ascii_lowercase();
+            let mut patterns = crate::mods::IGNORED.iter();
+            patterns.any(|p| crate::ledger::glob(&p.to_ascii_lowercase(), &segment))
+        })
+    };
+    let mut outside: BTreeMap<String, usize> = BTreeMap::new();
+    for f in inv.files.iter().filter(|f| f.kind == Kind::Mods) {
+        let unit = f.unit.to_lowercase();
+        if outside.contains_key(&unit) {
+            continue;
+        }
+        let (dir, mut rels) = (game_dir.join(&f.unit), Vec::new());
+        walk(files, &dir, "", &mut rels);
+        let theirs = rels
+            .iter()
+            .filter(|rel| !ignored(rel) && !listed.contains(key(&dir.join(rel)).as_str()));
+        outside.insert(unit, theirs.count());
+    }
     for m in &mut inv.mods {
         let mut units: BTreeMap<(Kind, String), Unit> = BTreeMap::new();
         for f in inv.files.iter().filter(|f| f.source == m.id.vortex) {
@@ -500,6 +531,7 @@ pub fn inventory(
                     kind: f.kind,
                     path: f.unit.clone(),
                     files: 0,
+                    outside: outside.get(&f.unit.to_lowercase()).copied().unwrap_or(0),
                 });
             unit.files += 1;
         }
@@ -594,40 +626,110 @@ impl Inventory {
         rel.to_string_lossy().replace('/', "\\")
     }
 
-    /// The deployed files the game may load that quen can't park (not a Mods folder, nor one of bin's kinds, nor the
-    /// `<stem>.ini` of one), by mod: what a boot leaves loaded whatever it parks.
-    pub fn left_loaded(&self) -> BTreeMap<String, Vec<String>> {
-        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    /// By mod, what a launch that parks `parked` (the moves' sources) leaves loaded: a mod it parks part of keeps its
+    /// other units, and any mod keeps the files quen can't park (`other`).
+    pub fn left_loaded(&self, parked: &[&Path]) -> BTreeMap<String, Vec<String>> {
+        let parked: BTreeSet<String> = parked.iter().map(|p| key(p)).collect();
+        let mut out = BTreeMap::new();
         for m in &self.mods {
-            let files = self.files.iter().filter(|f| f.source == m.id.vortex);
-            let file = |f: &File| f.rel.rsplit('\\').next().unwrap_or_default().to_lowercase();
-            let stems: BTreeSet<String> = files
-                .clone()
-                .filter(|f| f.kind == Kind::Bin && park::bin_kind(&file(f)))
-                .map(|f| {
-                    let name = file(f);
-                    name.rsplit_once('.')
-                        .map_or(name.clone(), |s| s.0.to_owned())
-                })
-                .collect();
-            let config = |f: &File| {
-                let name = file(f);
-                name.strip_suffix(".ini")
-                    .is_some_and(|stem| stems.contains(stem))
-            };
-            let left: Vec<String> = files
-                .filter(|f| match f.kind {
-                    Kind::Mods | Kind::Inert => false,
-                    Kind::Bin => !park::bin_kind(&file(f)) && !config(f),
-                    Kind::Menu | Kind::Dlc | Kind::Other => true,
-                })
-                .map(|f| f.rel.clone())
+            let moved = |u: &Unit| parked.contains(&key(&self.game_dir.join(&u.path)));
+            let some = m.units.iter().any(moved);
+            let left: Vec<String> = m
+                .units
+                .iter()
+                .filter(|u| !moved(u) && (some || u.kind == Kind::Other))
+                .map(|u| u.path.clone())
                 .collect();
             if !left.is_empty() {
                 out.insert(m.id.display(), left);
             }
         }
         out
+    }
+
+    /// Each deployed mod as the park planner names and parks it: by `nexus:<id>`, its name or its Vortex folder, as
+    /// its Mods, bin, menu and DLC units. Tied (not parked as a unit): a file elsewhere (`other`: under content or bin's
+    /// other folders, in documents), a Mods folder holding files outside Vortex, and a unit another mod deployed files
+    /// into too, unless that mod is parked as a unit beside it.
+    pub fn managed(&self) -> Vec<Managed> {
+        let label = |vortex: &str| {
+            let m = self.mods.iter().find(|m| m.id.vortex == vortex);
+            m.map_or(vortex.to_owned(), |m| m.id.display())
+        };
+        let mut out = Vec::new();
+        for m in &self.mods {
+            let mut names = vec![m.id.vortex.clone()];
+            names.extend(m.id.name.clone());
+            names.extend(m.id.nexus_id.map(|id| format!("nexus:{id}")));
+            let (mut units, mut ties) = (Vec::new(), Vec::new());
+            for u in &m.units {
+                let home = match u.kind {
+                    Kind::Mods => Home::Mods,
+                    Kind::Bin => Home::Bin,
+                    Kind::Menu => Home::Menu,
+                    Kind::Dlc => Home::Dlc,
+                    Kind::Other | Kind::Inert => {
+                        ties.push(Tie {
+                            why: format!("it deploys {}, which quen doesn't park", u.path),
+                            with: Vec::new(),
+                        });
+                        continue;
+                    }
+                };
+                if u.outside > 0 {
+                    ties.push(Tie {
+                        why: format!(
+                            "{} holds {} files outside Vortex too: name the folder to park all of it",
+                            u.path, u.outside
+                        ),
+                        with: Vec::new(),
+                    });
+                }
+                let name = u.path.rsplit('\\').next().unwrap_or_default();
+                units.push((home, name.to_owned()));
+            }
+            let mine = |path: &str| m.units.iter().any(|u| u.path.eq_ignore_ascii_case(path));
+            for s in self
+                .shared
+                .iter()
+                .filter(|s| s.mods.contains(&m.id.vortex) && mine(&s.path))
+            {
+                let all: Vec<String> = s.mods.iter().map(|v| label(v)).collect();
+                ties.push(Tie {
+                    why: format!(
+                        "{} holds files of {}: park both or neither",
+                        s.path,
+                        all.join(" and ")
+                    ),
+                    with: s
+                        .mods
+                        .iter()
+                        .filter(|v| **v != m.id.vortex)
+                        .map(|v| label(v))
+                        .collect(),
+                });
+            }
+            out.push(Managed {
+                label: m.id.display(),
+                names,
+                units,
+                ties,
+            });
+        }
+        out
+    }
+
+    /// A note when the deployed file `path`, gone from the game, is a file Vortex purged: its staging copy is the file
+    /// `id` names (a hardlink of it, before the purge unlinked the deployed and parked names).
+    pub fn purged(&self, files: &dyn Files, path: &Path, id: &str) -> Option<String> {
+        let k = key(path);
+        let f = self.files.iter().find(|f| f.key == k)?;
+        (files.stat(&f.staged)?.id == id).then(|| {
+            format!(
+                "{}: Vortex purged it, its staging copy keeps the file; deploy in Vortex to put it back",
+                f.rel
+            )
+        })
     }
 
     /// Why a launch that parks (renames) `parked` and rewrites or rebuilds `rewritten` is refused with Vortex here, or
@@ -1149,7 +1251,8 @@ mod tests {
             Unit {
                 kind: Kind::Mods,
                 path: r"Mods\modNativeBridge".into(),
-                files: 1
+                files: 1,
+                outside: 0
             }
         );
         assert_eq!(bridge.units.len(), 3);
@@ -1159,7 +1262,8 @@ mod tests {
             [Unit {
                 kind: Kind::Mods,
                 path: r"Mods\modMeadows".into(),
-                files: 2
+                files: 2,
+                outside: 0
             }]
         );
         // The readme two mods claim; the staging folder no manifest lists; mods.settings.
@@ -1305,32 +1409,126 @@ mod tests {
         assert_eq!(inv.rel(&game.join("Mods").join("modA")), r"Mods\modA");
     }
 
-    #[test]
-    fn what_a_boot_leaves_loaded_is_what_quen_cant_park() {
-        let (fs, ..) = game();
-        let left = inv(&fs).left_loaded();
-        assert_eq!(
-            left,
-            BTreeMap::from([
-                (
-                    "Immersive World - 2.2.4 2.2.4 (nexus 14126)".to_owned(),
-                    vec![r"bin\x64_dx12\BIW_edges_0.bin".to_owned()]
-                ),
-                (
-                    "Native Bridge - Remastered 2.0 (nexus 13743)".to_owned(),
-                    vec![r"bin\x64_dx12\dinput8.dll".to_owned()]
-                ),
-                (
-                    "W3LoadFix 1.0.8 (nexus 13881)".to_owned(),
-                    vec![
-                        r"bin\x64_dx12\dsound.dll".to_owned(),
-                        r"bin\x64_dx12\w3loadfix.dll".to_owned(),
-                        r"bin\x64_dx12\w3loadfix.ini".to_owned(),
-                        r"bin\config\r4game\user_config_matrix\pc\w3loadfix.xml".to_owned(),
-                    ]
-                ),
-            ])
+    /// [`game`] with Immersive World also deploying a vanilla override (`content\`), and a file outside Vortex in
+    /// Meadows' Mods folder.
+    fn game_with_others() -> Fake {
+        let (mut fs, game, _) = game();
+        let staging = Path::new("S");
+        let rel = r"content\content0\x.bundle";
+        fs.put(
+            &game.join("vortex.deployment.witcher3content.json"),
+            &manifest(staging, HARDLINK, &[(rel, WORLD)]),
+            "x",
+            1,
         );
+        fs.linked(&game.join(rel), &staging.join(WORLD).join(rel), "c");
+        fs.put(
+            &game.join(r"Mods\modMeadows\content\extra.txt"),
+            "e",
+            "e",
+            1,
+        );
+        fs.put(&game.join(r"Mods\modMeadows\content\game.log"), "l", "l", 1);
+        fs
+    }
+
+    #[test]
+    fn what_a_boot_leaves_loaded_is_the_rest_of_a_mod_it_parks_part_of() {
+        let fs = game_with_others();
+        let inv = inv(&fs);
+        let world = "Immersive World - 2.2.4 2.2.4 (nexus 14126)".to_owned();
+        let asi = Path::new(r"G\bin\x64_dx12\ImmersiveWorld.asi");
+        assert_eq!(
+            inv.left_loaded(&[asi]),
+            BTreeMap::from([(
+                world.clone(),
+                vec![
+                    r"Mods\modImmersiveWorld".to_owned(),
+                    r"bin\x64_dx12\BIW_edges_0.bin".to_owned(),
+                    r"bin\x64_dx12\ImmersiveWorld.ini".to_owned(),
+                    r"content\content0\x.bundle".to_owned(),
+                ]
+            )])
+        );
+        // A mod parked whole leaves nothing; what quen can't park stays listed with any park.
+        let own = Path::new(r"G\Mods\modOwn");
+        assert_eq!(
+            inv.left_loaded(&[own]),
+            BTreeMap::from([(world, vec![r"content\content0\x.bundle".to_owned()])])
+        );
+        let fix: Vec<PathBuf> = inv
+            .find("nexus:13881")
+            .unwrap()
+            .units
+            .iter()
+            .map(|u| Path::new("G").join(&u.path))
+            .collect();
+        let fix: Vec<&Path> = fix.iter().map(PathBuf::as_path).collect();
+        assert!(
+            !inv.left_loaded(&fix)
+                .contains_key("W3LoadFix 1.0.8 (nexus 13881)")
+        );
+    }
+
+    #[test]
+    fn each_mod_parks_by_its_names_as_its_units_unless_tied() {
+        let fs = game_with_others();
+        let inv = inv(&fs);
+        let managed = inv.managed();
+        let find = |label: &str| managed.iter().find(|m| m.label == label).unwrap();
+        let fix = find("W3LoadFix 1.0.8 (nexus 13881)");
+        assert_eq!(fix.names, [W3LOADFIX, "W3LoadFix", "nexus:13881"]);
+        assert_eq!(
+            fix.units,
+            [
+                (Home::Bin, "dsound.dll".to_owned()),
+                (Home::Bin, "w3loadfix.dll".to_owned()),
+                (Home::Bin, "w3loadfix.ini".to_owned()),
+                (Home::Menu, "w3loadfix.xml".to_owned()),
+            ]
+        );
+        assert!(fix.ties.is_empty(), "{:?}", fix.ties);
+        // The readme two mods claim is no unit, so no tie; the vanilla override and the outside file are.
+        assert!(find("Bushy Beards 1.0 1 (nexus 14605)").ties.is_empty());
+        let world = find("Immersive World - 2.2.4 2.2.4 (nexus 14126)");
+        assert_eq!(
+            world.ties,
+            [Tie {
+                why: r"it deploys content\content0\x.bundle, which quen doesn't park".into(),
+                with: Vec::new()
+            }]
+        );
+        assert_eq!(world.units.len(), 4);
+        let meadows = inv.find("nexus:11762").unwrap();
+        assert_eq!(meadows.units[0].outside, 1, "the log isn't counted");
+        assert_eq!(
+            find("Meadows 1.1 (nexus 11762)").ties[0].why,
+            r"Mods\modMeadows holds 1 files outside Vortex too: name the folder to park all of it"
+        );
+        let json = serde_json::to_value(&inv.mods).unwrap();
+        assert!(json[0]["units"][0].get("outside").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_file_vortex_purged_is_known_by_its_staging_copy() {
+        let (mut fs, game, _) = game();
+        let inv = inv(&fs);
+        let dsound = game.join(r"bin\x64_dx12\dsound.dll");
+        fs.0.remove(&key(&dsound));
+        let note = inv.purged(&fs, &dsound, "f1-0").unwrap();
+        assert_eq!(
+            note,
+            r"bin\x64_dx12\dsound.dll: Vortex purged it, its staging copy keeps the file; deploy in Vortex to put it back"
+        );
+        assert_eq!(inv.purged(&fs, &dsound, "another"), None);
+        assert_eq!(
+            inv.purged(&fs, &game.join(r"bin\x64_dx12\Own.asi"), "f1-0"),
+            None
+        );
+        fs.0.remove(&key(&Path::new("S")
+            .join(W3LOADFIX)
+            .join(r"bin\x64_dx12\dsound.dll")));
+        assert_eq!(inv.purged(&fs, &dsound, "f1-0"), None);
     }
 
     #[test]
@@ -1442,6 +1640,21 @@ mod tests {
                 .any(|s| s.path == r"Mods\modShared" && s.mods.len() == 2),
             "{:?}",
             inv.shared
+        );
+        let managed = inv.managed();
+        let beard = managed
+            .iter()
+            .find(|m| m.label.starts_with("Bushy"))
+            .unwrap();
+        let world = "Immersive World - 2.2.4 2.2.4 (nexus 14126)".to_owned();
+        assert_eq!(
+            beard.ties,
+            [Tie {
+                why: format!(
+                    r"Mods\modShared holds files of Bushy Beards 1.0 1 (nexus 14605) and {world}: park both or neither"
+                ),
+                with: vec![world]
+            }]
         );
         assert!(inv.pair(&fs, "nexus:14605", "nexus:14605").is_err());
         assert!(
