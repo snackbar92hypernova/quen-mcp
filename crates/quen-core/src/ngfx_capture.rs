@@ -17,7 +17,7 @@ const CHUNK_MAX: u64 = 1 << 30;
 /// How much of an object's creation record its table row shows.
 const RECORD_SHOWN: usize = 2048;
 
-fn layout(what: impl std::fmt::Display) -> String {
+pub(crate) fn layout(what: impl std::fmt::Display) -> String {
     format!("{LAYOUT}: {what}")
 }
 
@@ -41,7 +41,7 @@ pub struct Ref {
 }
 
 impl Ref {
-    fn at(b: &[u8], at: usize) -> Option<Ref> {
+    pub(crate) fn at(b: &[u8], at: usize) -> Option<Ref> {
         Some(Ref {
             chunk: u64_at(b, at)?,
             offset: u64_at(b, at + 8)?,
@@ -842,6 +842,14 @@ pub(crate) mod tests {
             j.pipelines, j.with_shaders, j.links
         );
         std::fs::write(out.join("pipelines.tsv"), j.tsv).unwrap();
+        let text = std::fs::read_to_string(var("QUEN_NGFX_FUNCTIONS")).unwrap();
+        let events = crate::ngfx_calls::events(&text).unwrap();
+        let calls = crate::ngfx_calls::calls(&mut c, &events, &names).unwrap();
+        println!(
+            "calls {} decoded {} raw {} unfit {} {:?}",
+            calls.calls, calls.decoded, calls.raw, calls.unfit, calls.unfit_by
+        );
+        std::fs::write(out.join("calls.tsv"), calls.tsv).unwrap();
     }
 
     #[test]
