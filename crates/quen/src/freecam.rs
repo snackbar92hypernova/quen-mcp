@@ -1,10 +1,10 @@
 //! game_freecam: the game's own developer free camera (CR4Game's EnableFreeCamera, MoveFreeCamera,
 //! GetFreeCameraPosition, IsFreeCameraEnabled), quen-w3 0.1.17's `freecam`, `freecam.set` and `freecam.get` verbs
 //! (w3/README.md). Unlike photo mode it leaves the world running (the free-camera probe, boot 237: not paused, NPCs
-//! walking, the player still), and the rendered camera equals it, so world_frame and game_camera's read follow it. Every
-//! action reads the state back on the next tick. A camera only: no journal entry, no taint. quen keeps whether it last
-//! read it on (`Live::freecam`): session_end, and a run_plan that turned it on, turn it off; game_photo enter is refused
-//! while it is on.
+//! walking, the player still), and the rendered camera equals it, so world_frame and game_camera's read follow it.
+//! Every action reads the state back on the next tick. A camera only: no journal entry, no taint. quen keeps whether it last
+//! read it on (`Live::freecam`): session_end, hands_give, and a run_plan that turned it on, turn it off; game_photo
+//! enter is refused while it is on. quen knows only its own calls: one turned on through game_exec isn't seen.
 
 use quen_core::bridge_log::{VALID, in_photo};
 use quen_core::protocol::{MAX_ACTORS_RADIUS, Reply, Verb};
@@ -46,7 +46,7 @@ pub fn tool() -> Value {
             (GetFreeCameraPosition: kept while off), camera (the rendered view, the free camera's while on), player, \
             paused, near_camera and near_player (alive actors within radius), distance_to_player_m (from camera); \
             past 100 m a warning. world_frame and game_camera's read follow it. A camera only: not journaled, taints \
-            no save. session_end turns it off. Refused, nothing changed: the user's controls (but status), no loaded game, on, \
+            no save. session_end and hands_give turn it off. Refused, nothing changed: the user's controls (but status), no loaded game, on, \
             set or aim in photo mode, set or aim while off; with needs: an older package. Failed: no reply within \
             5 s, the read-back not on as asked, or off by over 0.01 m or 0.1 degrees.",
         "inputSchema": schema(json!({
@@ -332,8 +332,8 @@ fn fill(fields: &mut Fields, mut state: Value) {
     }
 }
 
-/// Turns the free camera off if quen last read it on: before session_end closes the game, and after a run_plan that
-/// turned it on. What happened, or why not; None when quen last read it off.
+/// Turns the free camera off if quen last read it on: before session_end closes the game, before hands_give hands over,
+/// and after a run_plan that turned it on. What happened, or why not; None when quen last read it off.
 pub(crate) fn off_if_on(cx: &Ctx) -> Option<Result<String, String>> {
     if !cx.live.freecam.get() {
         return None;
@@ -617,8 +617,8 @@ mod tests {
         }
     }
 
-    /// With the free camera on as quen last read it, game_photo enter is refused, nothing sent; session_end turns it off
-    /// before it closes the game, and says so.
+    /// With the free camera on as quen last read it, game_photo enter is refused, nothing sent; session_end turns it
+    /// off before it closes the game, and says so.
     #[test]
     fn photo_mode_waits_and_the_end_turns_it_off() {
         let fx = served("freecam-end");
