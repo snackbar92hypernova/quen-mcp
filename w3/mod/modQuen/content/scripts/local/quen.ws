@@ -32,7 +32,8 @@
 //   sphere sweeps (QUENRPC_Ray); nav.line, navmesh lanes (QUENRPC_Nav); and cam.noclip, the photo-mode camera's no-clip
 //   (put back as photo mode's menu has it when the menu closes). The exec verb (0.1.13) never reaches the script:
 //   W3Quen.asi runs it. From quen-w3 0.1.17 the game's own free camera, outside photo mode: freecam turns it on or
-//   off, freecam.set moves it, freecam.get reads its state (QUENRPC_FreeCam), which each of them reads back.
+//   off, freecam.set moves it, freecam.get reads its state (QUENRPC_FreeCam), which each of them reads back. From
+//   quen-w3 0.1.18 scene.frame projects from the free camera while it is on (QUEN_ToView).
 // - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
 //   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
 //   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
@@ -725,14 +726,37 @@ function QUEN_Groups() : array<name>
 	return g;
 }
 
+// A point's place in the frame, x and y from -1 to 1 (y down); false behind the camera. theCamera.WorldVectorToViewRatio,
+// unless `free`: with the free camera on it still projects from the gameplay camera's view (boot 238), so from 0.1.18
+// the same maths from the camera at `cam` with axes fwd, right and up, and `view` the tangents of the frame's half
+// width and half height. Boots 195 and 201 (gameplay, photo mode): WorldVectorToViewRatio equalled it within 0.0001,
+// with GetFov() as the vertical fov and 16:9.
+function QUEN_ToView(free : bool, p, cam, fwd, right, up, view : Vector, out x : float, out y : float) : bool
+{
+	var d : Vector;
+	var z : float;
+
+	if (!free)
+		return theCamera.WorldVectorToViewRatio(p, x, y);
+	d = p - cam;
+	d.W = 0;
+	z = VecDot(d, fwd);
+	if (z <= 0)
+		return false;
+	x = VecDot(d, right) / (z * view.X);
+	y = -VecDot(d, up) / (z * view.Y);
+	return true;
+}
+
 // scene.frame: the alive actors within radius of the rendered camera, or of `at` (FindGameplayEntitiesInSphere,
 // FLAG_OnlyAliveActors, the player added if missing), with an id only the one whose GetGuidHash it is, nearest that
 // centre first (SortNodesByDistance), at most max: "<found> <camera x y z> <pitch yaw roll> <fov>" (theCamera's), then per
 // entity "|<flags> <id> <x> <y> <share> <distance> <x y z> <heading> <head x y z> <torso x y z>|<display name>|<readable
 // name>" as W3Quen.cpp's FrameJson reads it. The box: with a head bone, the body's (from 0.14), from the feet to 0.15 m
 // above the head bone and 0.3 m each way along the camera's horizontal axes; else CalcBoundingBox's, which holds every
-// component (boot 190: 2 to 5 times the body). x, y: theCamera.WorldVectorToViewRatio of the box's centre (flag 1 when in
-// front). share: the box's 8 corners projected, those in front of the camera only (flag 2 when all 8), their
+// component (boot 190: 2 to 5 times the body). x, y: QUEN_ToView of the box's centre (flag 1 when in front): from 0.1.18
+// with the free camera on, from theCamera's pose and fov, the rendered view's, as freecam.get reads it. share: the box's
+// 8 corners projected, those in front of the camera only (flag 2 when all 8), their
 // rectangle clipped to the frame (-1 to 1), its area over the frame's (4). distance: from the camera. head and torso:
 // GetBoneWorldPositionByIndex of GetHeadBoneIndex and GetTorsoBoneIndex (flags 8, 16), actors only. The first `points`
 // of head, torso and origin each get a StaticTrace from the camera over QUEN_Groups (flags 256, 512, 1024), clear when
@@ -749,17 +773,33 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 	var world : CWorld;
 	var box : Box;
 	var rot : EulerAngles;
-	var cam, centre, pos, head, torso, mid, hit, normal, right, a, b : Vector;
-	var x, y, minX, minY, maxX, maxY, share, top : float;
-	var i, k, flags, front, bone, points : int;
+	var cam, centre, pos, head, torso, mid, hit, normal, right, a, b, fwd, up, view : Vector;
+	var x, y, minX, minY, maxX, maxY, share, top, yaw, pitch : float;
+	var i, k, flags, front, bone, points, w, h : int;
 	var text, entity : string;
+	var free : bool;
 
 	world = theGame.GetWorld();
 	groups = QUEN_Groups();
 	cam = theCamera.GetCameraPosition();
 	rot = theCamera.GetCameraRotation();
-	// The body box's half-widths, along the camera's horizontal right and forward.
 	right = VecNormalize2D(theCamera.GetCameraRight());
+	free = theGame.IsFreeCameraEnabled();
+	if (free)
+	{
+		// The free camera's axes from its rotation: forward (-sin yaw, cos yaw) in xy, pitch above the horizon.
+		// ponytail: its roll is left out (relative and aim set 0); turn right and up about fwd once a rolled pose is
+		// measured against a capture.
+		yaw = Deg2Rad(rot.Yaw);
+		pitch = Deg2Rad(rot.Pitch);
+		fwd = Vector(-SinF(yaw) * CosF(pitch), CosF(yaw) * CosF(pitch), SinF(pitch), 0);
+		right = Vector(CosF(yaw), SinF(yaw), 0, 0);
+		up = VecCross(right, fwd);
+		theGame.GetCurrentViewportResolution(w, h);
+		view.Y = TanF(Deg2Rad(theCamera.GetFov() / 2));
+		view.X = view.Y * (float)w / h;
+	}
+	// The body box's half-widths, along the camera's horizontal right and forward.
 	a = 0.3 * right;
 	b = Vector(-a.Y, a.X, 0, 0);
 	centre = cam;
@@ -839,7 +879,7 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 		maxY = -1000000;
 		for (k = 0; k < 8; k += 1)
 		{
-			if (theCamera.WorldVectorToViewRatio(corner[k], x, y))
+			if (QUEN_ToView(free, corner[k], cam, fwd, right, up, view, x, y))
 			{
 				front += 1;
 				minX = MinF(minX, x);
@@ -855,7 +895,7 @@ function QUENRPC_Frame(n : array<float>, id : int) : string
 			flags += 2;
 		x = 0;
 		y = 0;
-		if (theCamera.WorldVectorToViewRatio(mid, x, y))
+		if (QUEN_ToView(free, mid, cam, fwd, right, up, view, x, y))
 			flags += 1;
 		if (points > 0 && flags % 16 >= 8)
 		{

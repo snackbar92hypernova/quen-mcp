@@ -1,7 +1,8 @@
 //! game_freecam: the game's own developer free camera (CR4Game's EnableFreeCamera, MoveFreeCamera,
 //! GetFreeCameraPosition, IsFreeCameraEnabled), quen-w3 0.1.17's `freecam`, `freecam.set` and `freecam.get` verbs
 //! (w3/README.md). Unlike photo mode it leaves the world running (the free-camera probe, boot 237: not paused, NPCs
-//! walking, the player still), and the rendered camera equals it, so world_frame and game_camera's read follow it.
+//! walking, the player still), and the rendered camera equals it: game_camera's read follows it, and from quen-w3
+//! 0.1.18 world_frame projects from it (0.1.17 projected from the gameplay camera, boot 238).
 //! Every action reads the state back on the next tick. A camera only: no journal entry, no taint. quen keeps whether it last
 //! read it on (`Live::freecam`): session_end, hands_give, and a run_plan that turned it on, turn it off; game_photo
 //! enter is refused while it is on. quen knows only its own calls: one turned on through game_exec isn't seen.
@@ -40,12 +41,13 @@ pub fn tool() -> Value {
     json!({
         "name": "game_freecam",
         "description": "The game's own free camera, in gameplay, quen-w3 0.1.17 or later: the world keeps running \
-            (photo mode pauses it and has its own camera, game_camera's). on / off: EnableFreeCamera. set: pos and \
+            (photo mode pauses it and has its own camera). on / off: EnableFreeCamera. set: pos and \
             rot, or relative to the player, aimed at 1.7 m above him. aim: look at target from pos (default: where \
             it is). status: radius. Each reads the state back on the next tick: on (IsFreeCameraEnabled), pos \
             (GetFreeCameraPosition: kept while off), camera (the rendered view, the free camera's while on), player, \
             paused, near_camera and near_player (alive actors within radius), distance_to_player_m (from camera); \
-            past 100 m a warning. world_frame and game_camera's read follow it. A camera only: not journaled, taints \
+            past 100 m a warning. world_frame (quen-w3 0.1.18) and game_camera's read follow it. A camera only: not \
+            journaled, taints \
             no save. session_end and hands_give turn it off. Refused, nothing changed: the user's controls (but status), no loaded game, on, \
             set or aim in photo mode, set or aim while off; with needs: an older package. Failed: no reply within \
             5 s, the read-back not on as asked, or off by over 0.01 m or 0.1 degrees.",
@@ -145,6 +147,7 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
         }
         _ => None,
     };
+    let asked = asked.map(|(pos, rot)| (pos, rot.map(scene::wrap)));
     let verb = match (action, asked) {
         ("on" | "off", _) => Some(Verb::FreeCam { on: action == "on" }),
         (_, Some((pos, rot))) => Some(Verb::FreeCamSet {
@@ -287,7 +290,9 @@ fn get(cx: &Ctx, radius: f64, fields: &Fields) -> Result<Value, Done> {
         },
         fields,
     )?;
-    let state = reply.data.unwrap_or_default();
+    let mut state = reply.data.unwrap_or_default();
+    // The angles as world_frame gives them, in every result and refusal that carries the state.
+    crate::scene::wrap_rot(state.pointer_mut("/camera/rot"));
     let whole = state["on"].is_boolean()
         && [
             &state["pos"],
@@ -305,14 +310,9 @@ fn get(cx: &Ctx, radius: f64, fields: &Fields) -> Result<Value, Done> {
     Ok(state)
 }
 
-/// The state's fields into the result: the rendered camera's angles in (-180, 180] (as world_frame gives them), its
-/// distance to the player, and past [`REACH_M`] with the free camera on, the warning.
-fn fill(fields: &mut Fields, mut state: Value) {
-    for a in state["camera"]["rot"].as_array_mut().into_iter().flatten() {
-        if let Some(deg) = a.as_f64() {
-            *a = json!((scene::wrap(deg) * 1e4).round() / 1e4);
-        }
-    }
+/// The state's fields into the result: the rendered camera's distance to the player, and past [`REACH_M`] with the free
+/// camera on, the warning.
+fn fill(fields: &mut Fields, state: Value) {
     let (camera, player) = (
         three(&state["camera"]["pos"]).unwrap_or_default(),
         three(&state["player"]["pos"]).unwrap_or_default(),
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(status["near_camera"], 23, "{status}");
         let off = run(&mut session, json!({"token": "tok", "action": "off"}));
         assert_eq!(off["on"], false, "{off}");
-        // The view behind the player again, its yaw of 350 read as -10.
+        // The view behind the player again, its pitch of 350 read as -10.
         assert_eq!(off["camera"]["rot"], json!([-10.0, 0.0, 0.0]), "{off}");
         assert!(!session.live.as_ref().unwrap().freecam.get());
         assert_eq!(
@@ -514,6 +514,8 @@ mod tests {
             "{rel}"
         );
         assert_eq!(rel["on"], false, "{rel}");
+        // Boot 238: this refusal read pitch 350.0001 where status read -9.9999; one range everywhere now.
+        assert_eq!(rel["camera"]["rot"], json!([-10.0, 0.0, 0.0]), "{rel}");
         assert_eq!(
             fx.run("game_freecam", json!({"token": "tok", "action": "on"}))["ok"],
             true
@@ -535,8 +537,11 @@ mod tests {
         assert!(close(rot[0], -0.52) && close(rot[1], -127.7), "{near}");
         assert_eq!(near["ground"]["from"], "navmesh", "{near}");
         assert!(near.get("warning").is_none(), "{near}");
-        let far = fx.run("game_freecam", json!({"token": "tok", "action": "set", "pos": [668.99, 2025.87, 30], "rot": [-5, 180, 0]}));
+        // Angles asked outside -180 to 180 are sent, read back and compared in it.
+        let far = fx.run("game_freecam", json!({"token": "tok", "action": "set", "pos": [668.99, 2025.87, 30], "rot": [355, 540, 0]}));
         assert_eq!(far["ok"], true, "{far}");
+        assert_eq!(far["asked"]["rot"], json!([-5.0, 180.0, 0.0]), "{far}");
+        assert_eq!(far["camera"]["rot"], json!([-5.0, 180.0, 0.0]), "{far}");
         assert!(
             far["warning"].as_str().unwrap().contains("0 at 150 m"),
             "{far}"

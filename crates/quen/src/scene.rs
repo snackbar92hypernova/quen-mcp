@@ -95,11 +95,11 @@ pub fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "world_frame",
-            "description": format!("Read what the rendered camera sees: the alive actors within radius of it, the \
-                player among them, nearest first, at most max; found counts all; camera is its pose (rot as \
-                game_camera gives it). Each: id, name, \
-                entity, player, pos, heading, head, torso (null without the bone), in_front, in_view (IsInView(): its \
-                meaning unverified), x, y (the box's centre in the frame, -1 to 1; null behind it), share (its box's \
+            "description": format!("Read what the rendered camera sees (the free camera's from quen-w3 0.1.18): the \
+                alive actors within radius of it, the player among them, nearest first, at most max; found counts \
+                all; camera is its pose (rot as game_camera gives it). Each: id, name, \
+                entity, player, pos, heading, head, torso (null: no bone), in_front, in_view (IsInView(), \
+                unverified), x, y (the box's centre in the frame, -1 to 1; null behind it), share (its box's \
                 corners in front, clipped to the frame, over its area; which box: quen_guide), box_whole, \
                 distance, visible (head, torso, origin, as points asks: a ray from the camera hits no static geometry; \
                 null: not cast), visible_points. {reads}."),
@@ -370,6 +370,16 @@ fn flat(v: impl IntoIterator<Item = f64>) -> Vec<f32> {
     v.into_iter().map(|x| x as f32).collect()
 }
 
+/// A camera's [pitch, yaw, roll] in a read-back, each in (-180, 180] on a 0.0001 grid, as game_camera reads them
+/// (finding 91: the director's pitch read 350 for -10): world_frame's and game_freecam's.
+pub(crate) fn wrap_rot(rot: Option<&mut Value>) {
+    for a in rot.and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(deg) = a.as_f64() {
+            *a = json!((scene::wrap(deg) * 1e4).round() / 1e4);
+        }
+    }
+}
+
 fn frame_read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &["radius", "max", "points"])?;
     let radius = num(args, "radius", 30.0, 0.0..=f64::from(MAX_ACTORS_RADIUS))?;
@@ -384,6 +394,12 @@ fn frame_read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
         entity_id: None,
     };
     ready(&cx, "world_frame", false)?;
+    if cx.live.freecam.get() {
+        // quen-w3 0.1.17 projected x, y, in_front and share from the gameplay camera under the free camera (boot 238).
+        let before = [doctor::BEFORE_FREECAM, &["quen-w3 0.1.17"]].concat();
+        let tool = "world_frame with the free camera on";
+        doctor::package_at_least(cx.config, &before, tool, "0.1.18")?;
+    }
     call.lap("check");
     let mut fields = Map::new();
     let reply = send(&cx, verb, &fields)?;
@@ -395,13 +411,7 @@ fn frame_read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields
         ));
     };
     fields.extend(data);
-    // Finding 91: pitch, yaw and roll in (-180, 180], as game_camera reads them (the director's pitch read 350 for -10).
-    let rot = fields.get_mut("camera").and_then(|c| c.get_mut("rot"));
-    for a in rot.and_then(Value::as_array_mut).into_iter().flatten() {
-        if let Some(deg) = a.as_f64() {
-            *a = json!((scene::wrap(deg) * 1e4).round() / 1e4);
-        }
-    }
+    wrap_rot(fields.get_mut("camera").and_then(|c| c.get_mut("rot")));
     let entities = fields["entities"].as_array().cloned().unwrap_or_default();
     let rays = entities
         .iter()
