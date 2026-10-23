@@ -1,15 +1,13 @@
-//! Nsight Graphics frame captures (`.ngfx-capture`) read without Nsight's window: the shaders decoded from the file
-//! itself, ngfx-replay's metadata cleaned of the machine's identity, the counts of its function and object lists, its
-//! perf report's iteration times, GPU Trace's frame time, and whether Nsight asked its first-start question. Pure: quen's
-//! ngfx.rs runs ngfx-replay and writes the files and rows.
-
-use std::collections::BTreeSet;
-use std::io::{self, Read};
+//! Nsight Graphics frame captures (`.ngfx-capture`) read without Nsight's window: ngfx-replay's metadata cleaned of the
+//! machine's identity, the counts of its function and object lists, its perf report's iteration times, GPU Trace's
+//! frame time, and whether Nsight asked its first-start question; the shader containers and the LZ4 blocks they are
+//! stored in, for `ngfx_capture`'s reader. Pure: quen's ngfx.rs runs ngfx-replay and writes the files and rows.
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-/// The Nsight Graphics version the shader decoder was proven on: 733 of 733 shaders of one capture.
+/// The Nsight Graphics version quen's capture reader and shader decoder were proven on (one capture: 733 of 733
+/// shaders, every call and object lined up with ngfx-replay's lists).
 pub const DECODER_PROVEN_ON: &str = "2026.3.1";
 /// The largest shader container the decoder takes, as the RTX Hair session's script.
 pub const SHADER_MAX: usize = 8 << 20;
@@ -29,28 +27,34 @@ pub struct Shader {
     /// The part names in order (RDEF, ISGN, SHEX, DXIL, ...).
     pub parts: Vec<String>,
     pub bytes: Vec<u8>,
+    /// The capture's chunks that hold it, in id order.
+    pub chunks: Vec<u64>,
 }
 
-/// What [`scan_shaders`] found.
+/// What `ngfx_capture::Capture::shaders` found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShaderScan {
-    /// `DXBC` in the file with a plausible container size after it.
+    /// Chunks that start with `DXBC`.
     pub found: usize,
-    /// Found but no LZ4 block decoded into a valid container there.
+    /// Found but not a valid container.
     pub failed: usize,
-    /// Decoded again: a container already in `shaders`.
+    /// A container already in `shaders`, in another chunk.
     pub duplicates: usize,
-    /// Unique by hash, in file order.
+    /// Unique by hash, in chunk order.
     pub shaders: Vec<Shader>,
 }
 
-fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
+pub(crate) fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
 /// An LZ4 block decoded from `src[pos..]` until `want` bytes are out; None if it goes wrong (out of bounds, a match
-/// before the start). Nsight 2026.3 stores shader blobs as raw LZ4 blocks.
-fn lz4_block(src: &[u8], mut pos: usize, want: usize) -> Option<Vec<u8>> {
+/// before the start). Nsight 2026.3 stores its chunks as raw LZ4 blocks.
+pub(crate) fn lz4_block(src: &[u8], mut pos: usize, want: usize) -> Option<Vec<u8>> {
     // A length's 255-continued extension, read from `pos`.
     fn more(src: &[u8], pos: &mut usize, mut n: usize) -> Option<usize> {
         loop {
@@ -108,8 +112,13 @@ fn parts(b: &[u8]) -> Option<Vec<usize>> {
 }
 
 impl Shader {
-    /// `b`, a valid container ([`parts`]), with its stage and model from its DXIL (SM6) or SHEX / SHDR (SM5) part.
-    fn new(b: Vec<u8>, offsets: &[usize]) -> Shader {
+    /// `b` if it is a whole DXBC container (its magic, its own size, a part table of named parts), with its stage and
+    /// model from its DXIL (SM6) or SHEX / SHDR (SM5) part; `chunks` left empty.
+    pub(crate) fn decode(b: Vec<u8>) -> Option<Shader> {
+        if !b.starts_with(b"DXBC") || u32_at(&b, 24)? as usize != b.len() {
+            return None;
+        }
+        let offsets = parts(&b)?;
         let name = |o: usize| String::from_utf8_lossy(&b[o..o + 4]).into_owned();
         let version = offsets
             .iter()
@@ -127,86 +136,21 @@ impl Shader {
             Some(14) => "amplification",
             _ => "?",
         };
-        Shader {
+        Some(Shader {
             hash: b[4..20].iter().map(|x| format!("{x:02x}")).collect(),
             stage,
             model: version.map_or("?".into(), |v| format!("{}_{}", v >> 4 & 15, v & 15)),
             parts: offsets.iter().map(|&o| name(o)).collect(),
             bytes: b,
-        }
-    }
-}
-
-impl ShaderScan {
-    /// The `DXBC` at `buf[at..]`: its 28-byte header is the first literal run of an LZ4 block, so the block's token
-    /// sits 1 to 7 bytes before it (the token plus extra literal-length bytes).
-    fn hit(&mut self, buf: &[u8], at: usize, seen: &mut BTreeSet<Vec<u8>>) {
-        let size = u32_at(buf, at + 24).map_or(0, |s| s as usize);
-        if !(33..SHADER_MAX).contains(&size) {
-            return;
-        }
-        self.found += 1;
-        let decoded = (1..8).filter(|&back| back <= at).find_map(|back| {
-            let b = lz4_block(buf, at - back, size).filter(|b| b.starts_with(b"DXBC"))?;
-            let offsets = parts(&b)?;
-            Some((b, offsets))
-        });
-        match decoded {
-            None => self.failed += 1,
-            Some((b, _)) if !seen.insert(b[4..20].to_vec()) => self.duplicates += 1,
-            Some((b, offsets)) => self.shaders.push(Shader::new(b, &offsets)),
-        }
-    }
-}
-
-/// How much of a capture [`scan_shaders`] searches per read.
-const CHUNK: usize = 64 << 20;
-/// A blob's compressed bytes after its magic: at most its size, plus LZ4's worst case.
-const MARGIN: usize = SHADER_MAX + SHADER_MAX / 255 + 64;
-
-/// Every shader container stored in a capture, read through `file` once, in chunks (a capture is gigabytes).
-pub fn scan_shaders(mut file: impl Read) -> io::Result<ShaderScan> {
-    // The bytes kept before a hit for its token.
-    const BACK: usize = 7;
-    let (mut scan, mut seen) = (ShaderScan::default(), BTreeSet::new());
-    let (mut buf, mut from, mut eof) = (Vec::new(), 0, false);
-    loop {
-        while !eof && buf.len() < CHUNK + MARGIN {
-            let n = buf.len();
-            buf.resize(CHUNK + MARGIN, 0);
-            let got = loop {
-                match file.read(&mut buf[n..]) {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    got => break got,
-                }
-            };
-            let got = got.inspect_err(|_| buf.truncate(n))?;
-            buf.truncate(n + got);
-            eof = got == 0;
-        }
-        // Hits before `end` have their whole blob in the buffer.
-        let end = if eof { buf.len() } else { buf.len() - MARGIN };
-        let mut i = from;
-        while let Some(at) = buf
-            .get(i..(end + 3).min(buf.len()))
-            .and_then(|w| w.windows(4).position(|w| w == b"DXBC"))
-        {
-            scan.hit(&buf, i + at, &mut seen);
-            i += at + 4;
-        }
-        if eof {
-            return Ok(scan);
-        }
-        let keep = end - BACK;
-        buf.drain(..keep);
-        from = i.max(end) - keep;
+            chunks: Vec::new(),
+        })
     }
 }
 
 /// `text` from its first `open` on (`{` or `[`), past a byte-order mark or log lines before it. Without one, what
 /// ngfx-replay said instead (its first line, cut at 300 characters): `--metadata-functions` exits 0 after "ERROR: File
 /// does not exist".
-fn json_start(text: &str, open: char) -> Result<&str, String> {
+pub(crate) fn json_start(text: &str, open: char) -> Result<&str, String> {
     text.find(open).map(|i| &text[i..]).ok_or_else(|| {
         let said: String = text
             .trim_start_matches('\u{feff}')
@@ -221,7 +165,7 @@ fn json_start(text: &str, open: char) -> Result<&str, String> {
 }
 
 /// The first JSON value in `text`, ignoring what follows it (a log line).
-fn first<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
+pub(crate) fn first<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
     serde_json::Deserializer::from_str(text)
         .into_iter::<T>()
         .next()
@@ -322,13 +266,36 @@ fn scrub(text: &str, value: &str, placeholder: &str) -> String {
     out
 }
 
+/// The machine's identity to scrub, as `(%NAME%, value)`, longest value first: `local`'s (this machine's) and `env`'s
+/// (a capture's own environment) values of [`IDENTITY`].
+pub fn identity(local: &[(&str, &str)], env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut identity: Vec<(String, String)> = Vec::new();
+    for name in IDENTITY {
+        let ours = local.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
+        let theirs = env.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
+        for v in ours.map(|(_, v)| *v).chain(theirs.map(|(_, v)| v.as_str())) {
+            let v = v.trim_end_matches(['\\', '/']).trim_start_matches('\\');
+            if v.len() > 1 && !identity.iter().any(|(_, x)| x.eq_ignore_ascii_case(v)) {
+                identity.push((format!("%{name}%"), v.to_owned()));
+            }
+        }
+    }
+    identity.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    identity
+}
+
+/// `text` with each `(placeholder, value)` of `identity` scrubbed ([`scrub`]).
+pub fn scrub_identity(text: &str, identity: &[(String, String)]) -> String {
+    identity
+        .iter()
+        .fold(text.to_owned(), |text, (placeholder, v)| {
+            scrub(&text, v, placeholder)
+        })
+}
+
 /// `value` with each `(placeholder, value)` of `identity` scrubbed from its strings and keys.
 fn scrubbed(value: Value, identity: &[(String, String)]) -> Value {
-    let s = |text: String| {
-        identity
-            .iter()
-            .fold(text, |text, (placeholder, v)| scrub(&text, v, placeholder))
-    };
+    let s = |text: String| scrub_identity(&text, identity);
     match value {
         Value::String(text) => Value::String(s(text)),
         Value::Array(items) => {
@@ -362,18 +329,7 @@ pub fn clean_metadata(text: &str, local: &[(&str, &str)]) -> Result<Cleaned, Str
             None => (var.to_owned(), String::new()),
         })
         .collect();
-    let mut identity: Vec<(String, String)> = Vec::new();
-    for name in IDENTITY {
-        let ours = local.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
-        let theirs = env.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
-        for v in ours.map(|(_, v)| *v).chain(theirs.map(|(_, v)| v.as_str())) {
-            let v = v.trim_end_matches(['\\', '/']).trim_start_matches('\\');
-            if v.len() > 1 && !identity.iter().any(|(_, x)| x.eq_ignore_ascii_case(v)) {
-                identity.push((format!("%{name}%"), v.to_owned()));
-            }
-        }
-    }
-    identity.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    let identity = identity(local, &env);
     let mut out = Map::new();
     let mut unknown_fields = Vec::new();
     for (key, value) in raw {
@@ -580,11 +536,11 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A synthetic DXBC container: one SHEX part (compute, model 5_1) with `pad` zero bytes, and `seed` in its hash.
-    fn container(seed: u8, pad: usize) -> Vec<u8> {
+    pub(crate) fn container(seed: u8, pad: usize) -> Vec<u8> {
         let size = 28 + 4 + 4 + 8 + 4 + pad;
         let mut b = b"DXBC".to_vec();
         b.extend([seed; 16]);
@@ -640,50 +596,22 @@ mod tests {
         assert_eq!(lz4_block(&big, 0, 64).map(|o| o.len()), Some(64));
     }
 
-    /// Two containers stored in a file of noise, one twice, and a `DXBC` that isn't a block: two decode (stage, model,
-    /// parts read), the copy dedupes, the noise fails. Also across the scanner's chunk boundary.
     #[test]
-    fn shaders_decode_dedupe_and_fail_in_a_file() {
-        let (a, b) = (container(1, 64), container(2, 4000));
-        let mut file = vec![0x5Au8; 1000];
-        for blob in [&a, &b, &a] {
-            file.extend(lz4(blob, 48));
-            file.extend([0x33u8; 500]);
-        }
-        // Not a block: a plausible size after the magic, nothing that decodes before it.
-        let mut fake = b"\0\0\0\0\0\0\0\0DXBC".to_vec();
-        fake.extend([9u8; 20]);
-        fake.extend(100u32.to_le_bytes());
-        file.extend(fake);
-        file.extend([0u8; 64]);
-        let scan = scan_shaders(&file[..]).unwrap();
-        assert_eq!(
-            (scan.found, scan.failed, scan.duplicates),
-            (4, 1, 1),
-            "{scan:?}"
-        );
-        assert_eq!(scan.shaders.len(), 2);
-        let s = &scan.shaders[1];
+    fn containers_decode_and_others_fail() {
+        let b = container(2, 4000);
+        let s = Shader::decode(b.clone()).unwrap();
         assert_eq!(s.hash, "02".repeat(16));
         assert_eq!(
             (s.stage, s.model.as_str(), s.parts.clone()),
             ("compute", "5_1", vec!["SHEX".into()])
         );
         assert_eq!(s.bytes, b);
-
-        // Across the first read's end: one blob decoded in the first pass, one whose token is in the first pass and
-        // whose magic is in the second.
-        let mut far = vec![0u8; CHUNK + MARGIN + 1000];
-        for (at, blob) in [(CHUNK - 200, &a), (CHUNK - 1, &b)] {
-            let block = lz4(blob, 48);
-            far[at..at + block.len()].copy_from_slice(&block);
-        }
-        let scan = scan_shaders(&far[..]).unwrap();
-        assert_eq!(
-            (scan.found, scan.failed, scan.shaders.len()),
-            (2, 0, 2),
-            "{scan:?}"
-        );
+        // Cut short (its own size says more), not DXBC, a part table pointing past the end.
+        assert!(Shader::decode(b[..b.len() - 1].to_vec()).is_none());
+        assert!(Shader::decode(b"DXBX".iter().chain(&b[4..]).copied().collect()).is_none());
+        let mut bad = b.clone();
+        bad[32..36].copy_from_slice(&9000u32.to_le_bytes());
+        assert!(Shader::decode(bad).is_none());
     }
 
     #[test]

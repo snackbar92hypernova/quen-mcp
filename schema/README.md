@@ -295,8 +295,8 @@ recorded); `capture_id` → captures (the bundle file holding the whole record, 
 under the capture root); `t` (when imported). An exact hit is the same `key_sha256` with its file present
 (`captures.removed_at` NULL); a near hit is the same target, operation and params under another profile.
 `ngfx_extract`'s rows (an Nsight Graphics capture read headlessly): `tool` `ngfx_replay` (its version in
-`tool_version`) or `quen` (the shader decoder); `target_sha256` the capture's; `operation` the op (`metadata`,
-`screenshot`, `functions`, `objects`, `errors`, `shaders`); `params` `{}`; `evidence_id`, `confidence`, `rva` and
+`tool_version`) or `quen` (the shader decoder, the capture reader); `target_sha256` the capture's; `operation` the op
+(`metadata`, `screenshot`, `functions`, `objects`, `errors`, `shaders`, `object_table`, `pipelines`, `calls`, `raytracing`); `params` `{}`; `evidence_id`, `confidence`, `rva` and
 `entity_id` NULL; `result_sha256` and `capture_id` the output file's.
 
 ### links (table)
