@@ -538,6 +538,45 @@ static void Scene(HANDLE h) {
   }
 }
 
+// The free camera (0.1.17): freecam, freecam.set and freecam.get to the script and their state back as JSON; a state
+// that doesn't parse; the refusals.
+static void FreeCam(HANDLE h) {
+  const char* state = "1 0 661.08 1881.99 11.73 661.08 1881.99 11.73 -0.53 232.3 0 668.99 1875.87 9.94 52.3 30 23 47";
+  const std::string json =
+      R"({"on":true,"paused":false,"pos":[661.08,1881.99,11.73],"camera":{"pos":[661.08,1881.99,11.73],)"
+      R"("rot":[-0.53,232.3,0]},"player":{"pos":[668.99,1875.87,9.94],"heading":52.3},"radius":30,"near_camera":23,)"
+      R"("near_player":47})";
+  RoundTrip(h, R"({"id":80,"ttl_ms":5000,"verb":"freecam","on":true})", L"freecam 1", true, "EnableFreeCamera(1) called",
+            state, R"({"id":80,"ok":true,"text":"EnableFreeCamera(1) called","data":)" + json + "}");
+  RoundTrip(h, R"({"id":81,"ttl_ms":5000,"verb":"freecam.set","pos":[1.5,-2.25,30],"rot":[-10.5,90,0]})",
+            L"freecam.set 1.500000 -2.250000 30.000000 -10.500000 90.000000 0.000000", true, "MoveFreeCamera called", state,
+            R"({"id":81,"ok":true,"text":"MoveFreeCamera called","data":)" + json + "}");
+  RoundTrip(h, R"({"id":82,"ttl_ms":5000,"verb":"freecam.get","radius":100})", L"freecam.get 100.000000", true,
+            "the free camera's state", "0 1 0 0 0 1 2 3 350 90 0 4 5 6 0 100 0 1",
+            R"({"id":82,"ok":true,"text":"the free camera's state","data":{"on":false,"paused":true,"pos":[0,0,0],)"
+            R"("camera":{"pos":[1,2,3],"rot":[350,90,0]},"player":{"pos":[4,5,6],"heading":0},"radius":100,)"
+            R"("near_camera":0,"near_player":1}})");
+  RoundTrip(h, R"({"id":83,"ttl_ms":5000,"verb":"freecam","on":false})", L"freecam 0", false, "no player", "",
+            R"({"id":83,"ok":false,"text":"no player"})");
+  // 17 numbers, an on flag of 2, a count that isn't whole.
+  for (const char* bad : {"1 0 1 2 3 1 2 3 0 0 0 4 5 6 0 30 1", "2 0 1 2 3 1 2 3 0 0 0 4 5 6 0 30 1 1",
+                          "1 0 1 2 3 1 2 3 0 0 0 4 5 6 0 30 1.5 1"})
+    RoundTrip(h, R"({"id":84,"ttl_ms":5000,"verb":"freecam.get","radius":30})", L"freecam.get 30.000000", true, "state",
+              bad, R"({"id":84,"ok":false,"text":"modQuen's read-back did not parse: )" + std::string(bad) + "\"}");
+
+  const char* refused1 = R"({"id":1,"ok":false,"text":"refused: )";
+  for (const char* f : {"", R"(,"on":1)", R"(,"on":"true")"})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"freecam")") + f + "}", refused1, "invalid freecam");
+  for (const char* f : {R"(,"pos":[0,0],"rot":[0,0,0])", R"(,"pos":[0,0,0])", R"(,"pos":[1e39,0,0],"rot":[0,0,0])"})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"freecam.set")") + f + "}", refused1, "invalid freecam.set");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"freecam.set","pos":[0,0,0],"rot":[0,0,0],"fov":40})", refused1,
+          "unknown field");
+  for (const char* f : {"", R"(,"radius":0)", R"(,"radius":100.5)", R"(,"radius":-1)", R"(,"radius":"30")"})
+    Refused(h, std::string(R"({"id":1,"ttl_ms":1,"verb":"freecam.get")") + f + "}", refused1, "invalid freecam.get");
+  Refused(h, R"({"id":1,"ttl_ms":1,"verb":"freecam.get","radius":30,"on":true})", refused1, "unknown field");
+  CHECK(Next().empty());  // none of them reached the script
+}
+
 static void Channel() {
   Load();
   CHECK(Next().empty());
@@ -642,6 +681,7 @@ static void Channel() {
             R"({"id":18,"ok":true,"text":"loading caf)" "\xc3\xa9" R"(\u000a\u0009"})");
   Paths(h);
   Photo(h);
+  FreeCam(h);
   Scene(h);
   // exec (0.1.13) runs only once QUEN_State showed a game: none was sent yet.
   CHECK(ExecReply(h, R"({"id":70,"ttl_ms":5000,"verb":"exec","function":"npcavoid"})") ==

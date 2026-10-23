@@ -53,6 +53,7 @@ quen makes that the agent's job, with guard rails:
   - Keys, and loading a save by name.
   - Pause, time of day, weather, teleport, and placing the player on the navmesh at a free spot.
   - Engine variable (cvar) reads and writes, which last only for the session.
+  - The game's own free camera (`game_freecam`), placed by numbers or beside the player, with the world running: photo mode pauses it.
 - **Reading the game.**
   - The actors near the player: positions, headings, velocities and flags, filtered by tag or class.
   - The scene: what's in frame, ground height, line of sight and navmesh lines.

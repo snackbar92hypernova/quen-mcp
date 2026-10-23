@@ -31,7 +31,7 @@ const END_MARGIN: Duration = Duration::from_millis(500);
 const SETTLE_MAX_MS: u64 = 10_000;
 /// How far a set's read-back may be off what was asked (metres, degrees): beyond, the game kept the camera elsewhere.
 /// The f32 round trip costs under a millimetre (feature tests 2: sets read back off 0.0).
-const OFF_MAX: (f64, f64) = (0.01, 0.1);
+pub(crate) const OFF_MAX: (f64, f64) = (0.01, 0.1);
 
 pub fn tools() -> Vec<Value> {
     let vec3 = |what: &str| json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": what});

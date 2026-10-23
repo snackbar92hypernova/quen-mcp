@@ -392,6 +392,8 @@ pub(crate) struct Live {
     /// sweep's camera path may still be loaded (its stop failed): what hands_give undoes.
     pub(crate) paused: Cell<bool>,
     pub(crate) path: Cell<bool>,
+    /// The game's free camera, as quen last read it or turned it on (game_freecam): what session_end turns off.
+    pub(crate) freecam: Cell<bool>,
     /// The launching connection's client with a window (`Conn::client`), which quen brings forward when the agent
     /// waits; whether it brought the client forward itself, so the next game call brings the game back; the stretch
     /// without calls it last acted on (status.rs).
@@ -1527,6 +1529,7 @@ impl<'a> Session<'a> {
             handovers: hands::Handovers::new(saves_before),
             paused: Cell::new(false),
             path: Cell::new(false),
+            freecam: Cell::new(false),
             client: call.conn.client.clone(),
             away: Cell::new(false),
             idled: Cell::new(None),
@@ -1930,10 +1933,33 @@ impl<'a> Session<'a> {
     /// the saves the game wrote, takes the same replay path as a recovery, records the boot's end and releases the
     /// lock. `failed`: the session ends because of `why`, an error.
     fn finish(&mut self, call: &mut Call, why: &str, failed: bool) -> Done {
+        // The free camera quen last read on goes off while the game still runs: the end says so.
+        let freecam = self
+            .live
+            .as_ref()
+            .zip(self.config().ok())
+            .and_then(|(live, config)| {
+                let cx = game::Ctx {
+                    config,
+                    live,
+                    hands: None,
+                };
+                crate::freecam::off_if_on(&cx)
+            });
         let Some(live) = self.live.take() else {
             return Done::Refused("this quen has no live session".into());
         };
         let mut fields = Map::new();
+        match freecam {
+            Some(Ok(done)) => fields.insert("freecam".into(), json!(done)),
+            Some(Err(why)) => fields.insert(
+                "freecam".into(),
+                json!(format!(
+                    "the free camera was on; turning it off failed: {why}"
+                )),
+            ),
+            None => None,
+        };
         fields.insert("session".into(), json!(live.id));
         fields.insert("why".into(), json!(why));
         if let Some(wait) = saves_quiet(&live.job, Some(&live.saves)) {

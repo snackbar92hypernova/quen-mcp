@@ -34,7 +34,7 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.16";
+constexpr char kVersion[] = "0.1.17";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -927,7 +927,12 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     // ponytail: frames capped at the script's int range, as settime's day
     ok = whole("n", INT32_MAX, n);
     cmd.args = ' ' + std::to_string(n);
-  } else if (v == "cam.set" || v == "teleport") {
+  } else if (v == "freecam.get") {
+    // From 0.1.17: "<radius>", the alive actors counted within it of the rendered camera and of the player.
+    float radius = 0;
+    ok = number("radius", 0, kMaxActorsRadius, radius) && radius > 0;
+    cmd.args = ' ' + Fixed(radius);
+  } else if (v == "cam.set" || v == "teleport" || v == "freecam.set") {
     ok = vec3("pos") && vec3("rot");
     Value fov;
     float f = 0;
@@ -939,7 +944,7 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
     // ponytail: day capped at the script's int range, a stricter limit than protocol.rs's u32
     ok = whole("day", INT32_MAX, n) && whole("hour", 23, hour);
     cmd.args = ' ' + std::to_string(n) + ' ' + std::to_string(hour);
-  } else if (v == "pause" || v == "photo.mode" || v == "cam.noclip") {
+  } else if (v == "pause" || v == "photo.mode" || v == "cam.noclip" || v == "freecam") {
     Value on;
     ok = take("on", Value::kBool, on);
     cmd.args = on.flag ? " 1" : " 0";
@@ -957,8 +962,9 @@ static bool Decode(std::string_view line, Command& cmd, std::string& error) {
             "(excluded) to 100, max outside 1 to 16, points outside 0 to 3 or entity_id not a whole number in int's range, "
             "a scene.ground, scene.ray or nav.line without 1 to 16 points or segments of coordinates below 100000, a range "
             "outside 0 (excluded) to 100, a radius outside 0 to 10 (scene.ray's: 0 to 2), a search outside 0 to 50, a width "
-            "outside 0 to 5, or an exec function other than 1 to 64 letters, digits and _, over 8 args, an arg over 100 "
-            "bytes or with a quote or a byte outside printable ASCII, or a line over 512 bytes)";
+            "outside 0 to 5, a freecam.get radius outside 0 (excluded) to 100, or an exec function other than 1 to 64 "
+            "letters, digits and _, over 8 args, an arg over 100 bytes or with a quote or a byte outside printable ASCII, "
+            "or a line over 512 bytes)";
     return false;
   }
   if (!fields.empty()) {
@@ -1206,7 +1212,11 @@ static bool FrameJson(std::string_view data, std::string& json) {
 // QUENRPC_Ground, QUENRPC_Ray, QUENRPC_Nav) "<n>" then per point or segment "|<flags> <numbers>" -> an array, null where
 // the flags say none: [{"nav_z":..,"ground":{"pos":[..],"normal":[..]},"water_level":..,"water_depth":..,"free":..,
 // "safe":[..]}] (flags 1 nav_z, 2 ground, 4 free, 8 circle tested, 16 safe), [{"hit":..,"pos":[..],"normal":[..],
-// "distance":..}] (1 hit), [{"clear":..,"clear_in_direction":..,"reach":[..],"edge_m":..}] (1 clear, 2 in direction).
+// "distance":..}] (1 hit), [{"clear":..,"clear_in_direction":..,"reach":[..],"edge_m":..}] (1 clear, 2 in direction);
+// freecam, freecam.set and freecam.get (from 0.1.17; modQuen's QUENRPC_FreeCam) "<on 0|1> <paused 0|1> <free camera x y
+// z> <rendered camera x y z pitch yaw roll> <player x y z heading> <radius> <near camera> <near player>" ->
+// {"on":..,"paused":..,"pos":[..],"camera":{"pos":[..],"rot":[..]},"player":{"pos":[..],"heading":..},"radius":..,
+// "near_camera":..,"near_player":..}.
 static bool DataJson(const std::string& verb, std::string_view data, std::string& json) {
   if (verb == "listsaves" || verb == "photo.list") {
     json = "[";
@@ -1281,6 +1291,20 @@ static bool DataJson(const std::string& verb, std::string_view data, std::string
       if (!ParseFloat(t[k + 1], v[k])) return false;
     json = "{\"camera\":" + Quote(t[0]) + ",\"pos\":[" + Number(v[0]) + ',' + Number(v[1]) + ',' + Number(v[2]) +
            "],\"rot\":[" + Number(v[3]) + ',' + Number(v[4]) + ',' + Number(v[5]) + "],\"fov\":" + Number(v[6]) + '}';
+    return true;
+  }
+  if (verb.starts_with("freecam") && t.size() == 18) {
+    const auto bit = [](std::string_view b) { return b == "1" ? "true" : b == "0" ? "false" : ""; };
+    float f[14];
+    uint64_t near_camera = 0, near_player = 0;
+    if (!*bit(t[0]) || !*bit(t[1]) || !Whole(t[16], INT32_MAX, near_camera) || !Whole(t[17], INT32_MAX, near_player))
+      return false;
+    for (int k = 0; k < 14; ++k)
+      if (!ParseFloat(t[k + 2], f[k])) return false;
+    json = std::string("{\"on\":") + bit(t[0]) + ",\"paused\":" + bit(t[1]) + ",\"pos\":" + Vec3(f) +
+           ",\"camera\":{\"pos\":" + Vec3(f + 3) + ",\"rot\":" + Vec3(f + 6) + "},\"player\":{\"pos\":" + Vec3(f + 9) +
+           ",\"heading\":" + Number(f[12]) + "},\"radius\":" + Number(f[13]) +
+           ",\"near_camera\":" + std::to_string(near_camera) + ",\"near_player\":" + std::to_string(near_player) + '}';
     return true;
   }
   uint64_t before = 0, after = 0;

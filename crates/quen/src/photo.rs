@@ -58,7 +58,7 @@ pub fn tool() -> Value {
             the grading at open. tick (tick_s, cloth_s): one world tick and the cloth simulation; no read-back. list \
             (what, filter): names. All but enter need photo mode. env is journaled and taints later saves. \
             Refused, nothing sent: wrong token, a value out of range, no loaded game, not in photo mode (enter: in \
-            it); with needs: quen-w3 0.1.8 or older. Failed: no reply within 5 s.",
+            it, or game_freecam's free camera on); with needs: quen-w3 0.1.8 or older. Failed: no reply within 5 s.",
         "inputSchema": schema(json!({
             "action": one_of(&["enter", "exit", "get", "weather", "env", "time", "grade", "reset", "tick", "list"], "what to do"),
             "name": string("weather: a name of the area's list (list weathers), e.g. WT_Clear"),
@@ -99,6 +99,11 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
             game::shown(last)
         );
         return Err(why.into());
+    }
+    if enter && cx.live.freecam.get() {
+        let why = "the game's free camera is on, as game_freecam last read it: game_freecam off first (photo mode has \
+                   its own camera). Nothing sent";
+        return Err(why.to_string().into());
     }
     let channel = cx.channel()?;
     call.lap("check");

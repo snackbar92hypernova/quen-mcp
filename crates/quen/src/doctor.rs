@@ -71,6 +71,32 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.17: the free-camera verbs (freecam, freecam.set, freecam.get: game_freecam, freecam.rs) in both files; its
+    // HUD bundle is 0.1.16's, byte for byte.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.17",
+        sha256: "dd115de7c36ae6f540342e6436a077385f23de232fb55bff1e42c7c40cfd57a1",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.17",
+        sha256: "5042fbf01d281f3d4daafe70483c542eed945e743e93ca75dae217df559e5db5",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[0],
+        version: "quen-w3 0.1.17",
+        sha256: "7592bfafef3c54ff258940f0c732a47e90903b3c4e5e74537a858d7269a1f2c1",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[1],
+        version: "quen-w3 0.1.17",
+        sha256: "7d05a5ee2297d231e71afe10a567a499ff23d78a769d5fa2df01804d120dab7c",
+        exact: true,
+    },
     // 0.1.16: the lasting line on quen's own HUD movie in gameplay (modQuen's bundle, w3\hud.py), in quen.ws; the ASI
     // differs from 0.1.15's only in its version.
     Pin {
@@ -419,6 +445,26 @@ pub(crate) const BEFORE_STATUS: &[&str] = &[
     "quen-w3 0.1.14",
 ];
 
+/// The package releases from before the free-camera verbs (quen-w3 0.1.17): game_freecam refuses them with needs.
+pub(crate) const BEFORE_FREECAM: &[&str] = &[
+    "quen-w3 0.1.1",
+    "quen-w3 0.1.2",
+    "quen-w3 0.1.3",
+    "quen-w3 0.1.4",
+    "quen-w3 0.1.5",
+    "quen-w3 0.1.6",
+    "quen-w3 0.1.7",
+    "quen-w3 0.1.8",
+    "quen-w3 0.1.9",
+    "quen-w3 0.1.10",
+    "quen-w3 0.1.11",
+    "quen-w3 0.1.12",
+    "quen-w3 0.1.13",
+    "quen-w3 0.1.14",
+    "quen-w3 0.1.15",
+    "quen-w3 0.1.16",
+];
+
 /// Whether measure_ab's console actions go as exec verbs: only for a pinned package with the verb (an unpinned dev
 /// build may lack it, so its lines are typed, as before).
 pub(crate) fn has_exec(version: Option<&str>) -> bool {
@@ -550,7 +596,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         0.1.13, world_frame, world_ground, world_ray, world_nav, world_map, game_frame, game_place and game_exec (and \
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
         x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
-        its 0.5 s hide before captures and windows; from quen-w3 0.1.16, that line in the game's HUD where it is drawn",
+        its 0.5 s hide before captures and windows; from quen-w3 0.1.16, that line in the game's HUD where it is drawn; \
+        from quen-w3 0.1.17, game_freecam",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
@@ -2547,6 +2594,24 @@ mod tests {
         // SAFETY: plain queries; `owner` outlives the call.
         unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut owner)) };
         assert_ne!(owner, std::process::id(), "a probe took the focus");
+    }
+
+    /// game_freecam refuses every pinned package release but the newest, 0.1.17, which brought its verbs.
+    #[test]
+    fn the_free_camera_needs_the_newest_package() {
+        let mut older: Vec<&str> = PINS
+            .iter()
+            .filter(|p| p.file == PACKAGE_ASI && p.version != "quen-w3 0.1.17")
+            .map(|p| p.version)
+            .collect();
+        older.sort();
+        let mut before = BEFORE_FREECAM.to_vec();
+        before.sort();
+        assert_eq!(older, before);
+        assert!(
+            PINS.iter()
+                .any(|p| p.file == PACKAGE_ASI && p.version == "quen-w3 0.1.17")
+        );
     }
 
     #[test]

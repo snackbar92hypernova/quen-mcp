@@ -21,6 +21,8 @@ mod doctor;
 #[cfg(windows)]
 mod focus;
 #[cfg(windows)]
+mod freecam;
+#[cfg(windows)]
 mod game;
 #[cfg(windows)]
 mod hands;

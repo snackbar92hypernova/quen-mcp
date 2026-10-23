@@ -218,6 +218,17 @@ pub enum Verb {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
     },
+    /// Turn the game's free camera on or off (quen-w3 0.1.17: `EnableFreeCamera`); the reply's data is the free-camera
+    /// state, as `freecam.get`'s with a radius of 30.
+    #[serde(rename = "freecam")]
+    FreeCam { on: bool },
+    /// Move the free camera, which must be on, to `pos` facing `rot` (`MoveFreeCamera`); data as `freecam`'s.
+    #[serde(rename = "freecam.set")]
+    FreeCamSet { pos: [f32; 3], rot: [f32; 3] },
+    /// Read the free camera's state: on, its position, the rendered camera's pose, the player's, the pause, and the
+    /// alive actors within `radius` (above 0 to [`MAX_ACTORS_RADIUS`]) of the rendered camera and of the player.
+    #[serde(rename = "freecam.get")]
+    FreeCamGet { radius: f32 },
 }
 
 /// What `photo.reset` puts back.
@@ -430,8 +441,15 @@ impl Verb {
             {
                 Err(Error::Invalid("cam.set with a non-finite number".into()))
             }
-            Verb::Teleport { pos, rot } if !finite(pos) || !finite(rot) => {
-                Err(Error::Invalid("teleport with a non-finite number".into()))
+            Verb::Teleport { pos, rot } | Verb::FreeCamSet { pos, rot }
+                if !finite(pos) || !finite(rot) =>
+            {
+                Err(Error::Invalid("a pose with a non-finite number".into()))
+            }
+            Verb::FreeCamGet { radius } if !(*radius > 0.0 && *radius <= MAX_ACTORS_RADIUS) => {
+                Err(Error::Invalid(format!(
+                    "freecam.get: a radius above 0 to {MAX_ACTORS_RADIUS}"
+                )))
             }
             Verb::SetTime { hour, .. } if *hour > 23 => {
                 Err(Error::Invalid(format!("settime hour {hour}, past 23")))
@@ -822,6 +840,12 @@ mod tests {
                     String::new(),
                 ],
             },
+            Verb::FreeCam { on: true },
+            Verb::FreeCamSet {
+                pos: [661.08, 1881.99, 11.73],
+                rot: [-0.53, -127.7, 0.0],
+            },
+            Verb::FreeCamGet { radius: 30.0 },
         ]
     }
 
@@ -1399,6 +1423,30 @@ mod tests {
             assert!(
                 matches!(notice(text.clone(), ms), Err(Error::Invalid(_))),
                 "{text:?} {ms:?}"
+            );
+        }
+        // The free camera (quen-w3 0.1.17): a finite pose, a radius above 0 to 100, on given.
+        let set = request(Verb::FreeCamSet {
+            pos: [0.0, f32::NAN, 0.0],
+            rot: [0.0; 3],
+        });
+        assert!(matches!(encode_request(&set), Err(Error::Invalid(_))));
+        for radius in [0.0, -1.0, MAX_ACTORS_RADIUS + 0.5, f32::NAN] {
+            let get = request(Verb::FreeCamGet { radius });
+            assert!(
+                matches!(encode_request(&get), Err(Error::Invalid(_))),
+                "{radius}"
+            );
+        }
+        for line in [
+            r#"{"id":1,"ttl_ms":1,"verb":"freecam"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"freecam.get"}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"freecam.set","pos":[0,0,0]}"#,
+            r#"{"id":1,"ttl_ms":1,"verb":"freecam.set","pos":[0,0,0],"rot":[0,0,0],"fov":40}"#,
+        ] {
+            assert!(
+                matches!(decode_request(line), Err(Error::Malformed(_))),
+                "{line}"
             );
         }
         for event in ["", "a b", "gui-x", &"x".repeat(65)] {

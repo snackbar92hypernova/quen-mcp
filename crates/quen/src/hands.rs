@@ -76,8 +76,7 @@ pub(crate) fn tools() -> Vec<Value> {
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
                 moves the focus (game_keys, game_console, game_exec, game_load, game_pause, game_settime, \
                 game_weather, game_teleport, game_place, game_items, game_save, game_camera with a pose, game_frame, \
-                game_cvar set or restore, mem_patch, \
-                mem_unpatch, mem_patch_instances, mem_unpatch_instances, \
+                game_freecam but status, game_cvar set or restore, mem_patch, mem_unpatch and their _instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
                 are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
                 Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
@@ -117,6 +116,7 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_photo" => matches!(args["action"].as_str(), Some("get" | "list")),
+        "game_freecam" => args["action"] == "status",
         "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
         | "world_ground" | "world_ray" | "world_nav" | "world_map" | "game_scriptlog"
         | "measure_presentmon" | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk"
@@ -441,6 +441,8 @@ mod tests {
             ("game_cvar", json!({"name": "X", "restore": true})),
             ("game_camera", json!({"pos": [0, 0, 0], "rot": [0, 0, 0]})),
             ("game_camera", json!({"fov": 40})),
+            ("game_freecam", json!({"action": "on"})),
+            ("game_freecam", json!({"action": "set", "relative": {}})),
         ] {
             assert!(!user_may(tool, &args), "{tool} {args}");
         }
@@ -448,6 +450,7 @@ mod tests {
             ("game_cvar", json!({"name": "X"})),
             ("game_cvar", json!({"name": "X", "restore": false})),
             ("game_camera", none.clone()),
+            ("game_freecam", json!({"action": "status"})),
         ] {
             assert!(user_may(tool, &args), "{tool} {args}");
         }

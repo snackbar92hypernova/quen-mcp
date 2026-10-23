@@ -20,7 +20,7 @@ use crate::{doctor, measure, status};
 
 /// The tools a step may call: what a test session's agent calls without the client's prompt (the owner's Q7), sweeps
 /// aside. Never a launch, a save, a hand-over, a cleanup, a memory patch, a focus move or a ledger write.
-const TOOLS: [&str; 28] = [
+const TOOLS: [&str; 29] = [
     "game_console",
     "game_exec",
     "game_cvar",
@@ -31,6 +31,7 @@ const TOOLS: [&str; 28] = [
     "game_weather",
     "game_photo",
     "game_camera",
+    "game_freecam",
     "game_frame",
     "game_screenshot",
     "game_load",
@@ -84,7 +85,8 @@ pub fn tool() -> Value {
             token}} or {\"wait\": seconds}. Tools: the game_, world_ and measure_ tools a test session calls without \
             the client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Every step is checked \
             against its tool's schema before any runs. Setup steps that succeed are replayed by session_launch again. \
-            A step that doesn't succeed ends the run (aborted); teardown then runs, also after a cancel. estimate_s: \
+            A step that doesn't succeed ends the run (aborted); teardown then runs, also after a cancel. A free camera \
+            the plan turned on goes off after it (freecam). estimate_s: \
             from measured costs, fade waits left out; refused over max_s (default 600, at most 3600), and over 300 \
             unless wait: false. check: the checks and estimate, nothing run. Files: <tag>-plan.json and <tag>-result.json (every step's \
             envelope), each with a captures row. Refused, nothing run: a bad plan or step, a tag taken, the user's \
@@ -543,7 +545,7 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
     }
     let start = Instant::now();
     let mut aborted = None;
-    {
+    let freecam_before = {
         let cx = ctx(session, &token, &[])?;
         // The checks before every step that need no change, before the plan's file is written.
         before(&cx, call, "wait", start, plan.max_s)
@@ -563,7 +565,8 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             fields.insert("status".into(), json!(shown));
         }
         cx.live.in_plan.set(true);
-    }
+        cx.live.freecam.get()
+    };
     let (mut table, mut envelopes, mut ran) = (Vec::new(), Vec::new(), false);
     'run: for (phase, steps) in plan.phases[..2].iter() {
         for (i, step) in steps.iter().enumerate() {
@@ -657,6 +660,19 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
     if ran {
         call.lap("teardown");
     }
+    // A free camera the plan turned on (as quen last read it) goes off after the teardown, and the result says so.
+    let mut freecam_left = None;
+    if !freecam_before
+        && let Ok(cx) = ctx(session, &token, &[])
+        && let Some(off) = crate::freecam::off_if_on(&cx)
+    {
+        let said = off.unwrap_or_else(|why| {
+            let why = format!("the plan left the free camera on; turning it off failed: {why}");
+            freecam_left = Some(why.clone());
+            why
+        });
+        fields.insert("freecam".into(), json!(said));
+    }
     if let Some(live) = &session.live {
         live.in_plan.set(false);
     }
@@ -693,7 +709,11 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             r["reason"].as_str().unwrap_or_default()
         )
     });
-    let failed: Vec<String> = aborted.into_iter().chain(torn_failed).collect();
+    let failed: Vec<String> = aborted
+        .into_iter()
+        .chain(torn_failed)
+        .chain(freecam_left)
+        .collect();
     match failed.is_empty() {
         true => Ok(fields),
         false => Err(Done::Failed(failed.join("; "), fields)),
