@@ -10,7 +10,7 @@ use std::io::{Read, Seek};
 use serde::Deserialize;
 
 use crate::ngfx::{self, u32_at, u64_at};
-use crate::ngfx_capture::{Capture, Listed, Ref, layout, object_name, raw};
+use crate::ngfx_capture::{Capture, Listed, Object, Ref, layout, object_name, raw};
 
 /// How much of an undecoded call's arguments its row shows.
 const RAW_SHOWN: usize = 4096;
@@ -664,7 +664,7 @@ impl Build {
 }
 
 /// A command's build, if `b` is a BuildRaytracingAccelerationStructure command's arguments that decode whole.
-pub fn decode_build(b: &[u8]) -> Option<Build> {
+fn decode_build(b: &[u8]) -> Option<Build> {
     let mut c = Cur { b, p: 0 };
     let lead = c.u64()?;
     build(&mut c, lead).filter(|_| c.done())
@@ -956,6 +956,262 @@ pub fn calls<R: Read + Seek>(
     Ok(out)
 }
 
+/// Each resource's GPU address during the capture, from its creation record: Nsight's string tag `0xFB000000` at 56,
+/// the name's u64 byte count at 60 and the name at 68, then a null pointer tag and, 36 bytes after it, the address.
+/// Checked against every GetGPUVirtualAddress of the frame; a resource whose record has another shape has none.
+fn resource_vas<R: Read + Seek>(
+    capture: &Capture<R>,
+    resources: &[&Object],
+    events: &[Event],
+    frame: &Frame,
+) -> Result<HashMap<u64, u64>, String> {
+    let mut vas = HashMap::new();
+    for o in resources {
+        let Some(b) = capture.bytes(o.record) else {
+            continue;
+        };
+        let name = u64_at(b, 60).and_then(|n| usize::try_from(n).ok());
+        let end = name.and_then(|n| n.checked_add(68));
+        let at = end
+            .filter(|&e| u32_at(b, 56) == Some(0xFB00_0000) && u32_at(b, e) == Some(0xFA00_0002));
+        if let Some(va) = at.and_then(|e| u64_at(b, e + 36)) {
+            vas.insert(o.uid, va);
+        }
+    }
+    for (e, s) in events.iter().zip(&frame.sources) {
+        let Source::Call(r) = *s else { continue };
+        if e.function_name != "ID3D12Resource_GetGPUVirtualAddress" {
+            continue;
+        }
+        let rec = frame.records[r];
+        let called = capture.bytes(rec.args).and_then(|b| u64_at(b, 0));
+        match (vas.get(&rec.this), called) {
+            (Some(va), Some(c)) if *va != c => {
+                return Err(layout(format!(
+                    "resource {}'s address in its record isn't GetGPUVirtualAddress's",
+                    rec.this
+                )));
+            }
+            (None, Some(c)) => {
+                vas.insert(rec.this, c);
+            }
+            _ => {}
+        }
+    }
+    Ok(vas)
+}
+
+/// One top-level build's instance table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tlas {
+    /// The build's event.
+    pub event: usize,
+    pub instances: u32,
+    /// `tlas_<n>.tsv`; None when the file doesn't hold the instances (written by the GPU, or not found).
+    pub tsv: Option<String>,
+    /// Instances whose BLAS address is an acceleration structure's.
+    pub named: usize,
+}
+
+/// What [`raytracing`] read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Raytracing {
+    /// `blas_builds.tsv`.
+    pub blas: String,
+    pub blas_builds: usize,
+    pub geometries: usize,
+    /// Builds whose arguments didn't decode.
+    pub undecoded: usize,
+    pub tlas: Vec<Tlas>,
+}
+
+/// The frame's ray-tracing builds (headless research §3.6):
+/// - acceleration structures by address: each one's resource (its record's u64 at 40) at its offset (u64 at 48),
+///   a resource's address from [`resource_vas`];
+/// - `blas_builds.tsv`, one row per geometry of each bottom-level build: event, list, destination (address and the
+///   acceleration structure there), build flags, geometry index, kind, its flags, transform, index format, count and
+///   buffer, vertex format, count, buffer and stride (an AABB geometry: its count, start and stride in the vertex
+///   columns), source, scratch;
+/// - each top-level build's instance array, found in its list's state as the u64 size (64 per instance) followed by
+///   the u64 id of a chunk of that size (the list's k-th build of that size, its k-th such pair): `tlas_<n>.tsv` in
+///   build order, one row per D3D12_RAYTRACING_INSTANCE_DESC: instance, id, mask, hit group offset, flags, BLAS
+///   address and name, the 3x4 transform by rows.
+pub fn raytracing<R: Read + Seek>(
+    capture: &mut Capture<R>,
+    events: &[Event],
+    objects: &[Object],
+    names: &HashMap<u64, &Listed>,
+) -> Result<Raytracing, String> {
+    let frame = frame(capture, events)?;
+    let typed = |t: &str| -> Vec<&Object> {
+        objects
+            .iter()
+            .filter(|o| names.get(&o.uid).is_some_and(|l| l.type_name == t))
+            .collect()
+    };
+    let (resources, structures, lists) = (
+        typed("Resource"),
+        typed("AccelerationStructure"),
+        typed("GraphicsCommandList"),
+    );
+    capture.load(resources.iter().chain(&structures).map(|o| o.record))?;
+    capture.load(lists.iter().map(|o| o.state))?;
+    let resource_va = resource_vas(capture, &resources, events, &frame)?;
+    let mut at: HashMap<u64, u64> = HashMap::new();
+    for o in &structures {
+        let Some(b) = capture.bytes(o.record) else {
+            continue;
+        };
+        let header = u32_at(b, 0) == Some(16) && u32_at(b, 8) == Some(20);
+        let (res, offset) = (u64_at(b, 40), u64_at(b, 48));
+        if let (true, Some(res), Some(offset)) = (header, res, offset)
+            && let Some(base) = resource_va.get(&res)
+        {
+            at.insert(base + offset, o.uid);
+        }
+    }
+    let n = |uid: u64| object_name(names, uid);
+    let named = |va: u64| at.get(&va).map_or("-".into(), |uid| n(*uid));
+    let state: HashMap<u64, Ref> = lists.iter().map(|o| (o.uid, o.state)).collect();
+    let mut out = Raytracing {
+        blas: "event\tlist\tdest\tdest_name\tflags\tgeometry\tkind\tgeometry_flags\ttransform\tindex_format\t\
+               index_count\tindex_buffer\tvertex_format\tvertex_count\tvertex_buffer\tvertex_stride\tsource\tscratch\n"
+            .into(),
+        ..Raytracing::default()
+    };
+    // Per list and instance array size, the top-level builds seen so far.
+    let mut seen: HashMap<(u64, u64), usize> = HashMap::new();
+    for (i, (e, s)) in events.iter().zip(&frame.sources).enumerate() {
+        let Source::Command {
+            list,
+            recording,
+            start,
+            end,
+            ..
+        } = *s
+        else {
+            continue;
+        };
+        if e.function_name.strip_prefix(LIST) != Some("BuildRaytracingAccelerationStructure") {
+            continue;
+        }
+        let args = capture
+            .bytes(frame.records[recording].args)
+            .unwrap_or_default();
+        let Some(b) = decode_build(&args[start..end]) else {
+            out.undecoded += 1;
+            continue;
+        };
+        if b.top {
+            let size = 64 * u64::from(b.count);
+            let k = seen.entry((list, size)).or_default();
+            let chunk = state
+                .get(&list)
+                .and_then(|r| capture.bytes(*r))
+                .and_then(|st| instance_chunks(st, size, |id| capture.size(id)).nth(*k));
+            *k += 1;
+            let rows = match chunk {
+                Some(id) => Some(capture.chunk(id)?),
+                None => None,
+            };
+            let mut tlas = Tlas {
+                event: i,
+                instances: b.count,
+                ..Tlas::default()
+            };
+            if let Some(rows) = rows {
+                let mut tsv = String::from(
+                    "instance\tid\tmask\thit_group\tflags\tblas\tblas_name\ttransform\n",
+                );
+                for (k, row) in rows.chunks_exact(64).enumerate() {
+                    let t: Vec<String> = (0..12)
+                        .map(|j| {
+                            f32::from_le_bytes(row[4 * j..4 * j + 4].try_into().unwrap())
+                                .to_string()
+                        })
+                        .collect();
+                    let (id, hit, blas) = (
+                        u32_at(row, 48).unwrap(),
+                        u32_at(row, 52).unwrap(),
+                        u64_at(row, 56).unwrap(),
+                    );
+                    tlas.named += usize::from(at.contains_key(&blas));
+                    tsv += &format!(
+                        "{k}\t{}\t0x{:02x}\t{}\t0x{:02x}\t{}\t{}\t{}\n",
+                        id & 0xff_ffff,
+                        id >> 24,
+                        hit & 0xff_ffff,
+                        hit >> 24,
+                        va(blas),
+                        named(blas),
+                        t.join(",")
+                    );
+                }
+                tlas.tsv = Some(tsv);
+            }
+            out.tlas.push(tlas);
+            continue;
+        }
+        out.blas_builds += 1;
+        for (g, geometry) in b.geometry.iter().enumerate() {
+            out.geometries += 1;
+            let cells = match *geometry {
+                Geometry::Triangles {
+                    flags,
+                    transform,
+                    index_format,
+                    vertex_format,
+                    index_count,
+                    vertex_count,
+                    index_buffer,
+                    vertex_buffer,
+                    vertex_stride,
+                } => format!(
+                    "triangles\t0x{flags:x}\t{}\t{index_format}\t{index_count}\t{}\t{vertex_format}\t{vertex_count}\t{}\t\
+                     {vertex_stride}",
+                    va(transform),
+                    va(index_buffer),
+                    va(vertex_buffer)
+                ),
+                Geometry::Aabbs {
+                    flags,
+                    count,
+                    start,
+                    stride,
+                } => {
+                    format!(
+                        "aabbs\t0x{flags:x}\t-\t-\t-\t-\t-\t{count}\t{}\t{stride}",
+                        va(start)
+                    )
+                }
+            };
+            out.blas += &format!(
+                "{i}\t{}\t{}\t{}\t0x{:x}\t{g}\t{cells}\t{}\t{}\n",
+                n(list),
+                va(b.dest),
+                named(b.dest),
+                b.flags,
+                va(b.source),
+                va(b.scratch)
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The chunks a list's state names as `size` bytes: each u64 `size` (at any offset) followed by a u64 that is the id
+/// of a chunk of exactly that size, in order.
+fn instance_chunks(
+    state: &[u8],
+    size: u64,
+    chunk_size: impl Fn(u64) -> Option<u64>,
+) -> impl Iterator<Item = u64> {
+    (0..state.len().saturating_sub(15)).filter_map(move |k| {
+        let id = u64_at(state, k + 8)?;
+        (size > 0 && u64_at(state, k)? == size && chunk_size(id) == Some(size)).then_some(id)
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -977,12 +1233,12 @@ pub(crate) mod tests {
     }
 
     /// A recording's payload: the count, then each (code, arguments after the leading u64) with the end marker.
-    pub(crate) fn recording(cmds: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    pub(crate) fn recording(cmds: &[(u32, u64, Vec<u8>)]) -> Vec<u8> {
         let mut out = (cmds.len() as u64).to_le_bytes().to_vec();
-        for (code, args) in cmds {
+        for (code, lead, args) in cmds {
             out.extend(3u32.to_le_bytes());
             out.extend(code.to_le_bytes());
-            out.extend(0u64.to_le_bytes());
+            out.extend(lead.to_le_bytes());
             out.extend(args);
             out.extend(END);
         }
@@ -1067,13 +1323,14 @@ pub(crate) mod tests {
         let l1 = recording(&[
             (
                 40,
+                0,
                 [2u32, 1, 1].iter().flat_map(|v| v.to_le_bytes()).collect(),
             ),
-            (51, 61u64.to_le_bytes().to_vec()),
-            (85, ei),
-            (35, 0u32.to_le_bytes().to_vec()),
+            (51, 0, 61u64.to_le_bytes().to_vec()),
+            (85, 0, ei),
+            (35, 0, 0u32.to_le_bytes().to_vec()),
         ]);
-        let l3 = recording(&[(35, 0u32.to_le_bytes().to_vec())]);
+        let l3 = recording(&[(35, 0, 0u32.to_le_bytes().to_vec())]);
         let signal = [
             &0u32.to_le_bytes()[..],
             &70u64.to_le_bytes(),
@@ -1215,5 +1472,176 @@ pub(crate) mod tests {
         assert_eq!(decode(name, &more, true, &n), Some(None));
         let close = "ID3D12GraphicsCommandList_Close";
         assert_eq!(decode(close, &lead(&[0; 4]), true, &n), None);
+    }
+
+    fn le(values: &[u64], widths: &[usize]) -> Vec<u8> {
+        values
+            .iter()
+            .zip(widths)
+            .flat_map(|(v, w)| v.to_le_bytes()[..*w].to_vec())
+            .collect()
+    }
+
+    /// A build command's arguments after its leading u64 4: the description (`inputs` its type, flags, count,
+    /// layout and then the instance address or the geometry pointer), no postbuild, Nsight's trailer.
+    fn build_args(dest: u64, inputs: Vec<u8>, scratch: u64, top: bool) -> Vec<u8> {
+        let ptr = |b: Vec<u8>| [&0xFA00_0004u32.to_le_bytes()[..], &b].concat();
+        let null = 0xFA00_0002u32.to_le_bytes().to_vec();
+        let desc = [
+            dest.to_le_bytes().to_vec(),
+            inputs,
+            le(&[0, scratch], &[8, 8]),
+        ]
+        .concat();
+        let entry = if top { null.clone() } else { ptr(vec![0; 20]) };
+        [
+            ptr(desc),
+            le(&[0], &[4]),
+            null.clone(),
+            le(&[4, 0], &[8, 4]),
+            entry,
+            ptr(vec![0; 24]),
+            null,
+        ]
+        .concat()
+    }
+
+    /// Resource 40 (a buffer at 0x2500000000, named in its record) holds BLAS 41 at 0x100; list 101 builds it, then a
+    /// TLAS of its two instances, whose array is chunk 9, named in the list's state.
+    fn raytracing_capture(called_va: u64) -> (Vec<u8>, Vec<serde_json::Value>) {
+        let base = 0x25_0000_0000u64;
+        let name: Vec<u8> = "BlasBuffer\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let mut resource = vec![0u8; 56];
+        resource.extend(le(&[0xFB00_0000, name.len() as u64], &[4, 8]));
+        resource.extend(&name);
+        resource.extend(le(&[0xFA00_0002], &[4]));
+        resource.extend([0u8; 32]);
+        resource.extend(base.to_le_bytes());
+        let mut blas = le(
+            &[16, 2, 20, 0, 0x900, 0x900, 0x900, 40, 0x100],
+            &[4, 4, 4, 4, 8, 8, 8, 8, 8],
+        );
+        blas.extend([0u8; 16]);
+        let state = [vec![7u8; 5], le(&[128, 9], &[8, 8]), vec![0; 3]].concat();
+        let records = [resource.clone(), blas.clone(), state.clone()].concat();
+        let r = |offset: usize, len: usize| Ref {
+            chunk: 5,
+            offset: offset as u64,
+            len: len as u64,
+        };
+        let (ro, bo, so) = (0, resource.len(), resource.len() + blas.len());
+        let table = [
+            crate::ngfx_capture::tests::object(40, 3, 6, r(ro, resource.len())),
+            crate::ngfx_capture::tests::object(41, 3, 0x86d1_6224, r(bo, blas.len())),
+            [
+                &101u64.to_le_bytes()[..],
+                &[0u8; 8],
+                &3u32.to_le_bytes(),
+                &14u32.to_le_bytes(),
+                &[0u8; 24],
+                &le(&[5, so as u64, state.len() as u64], &[8, 8, 8]),
+            ]
+            .concat(),
+        ]
+        .concat();
+        let geometry = [
+            vec![0x04, 0, 0, 0xFA],
+            le(
+                &[0, 2, 0x1020, 57, 6, 48, 32, 0x2400, 0x2500, 64],
+                &[4, 4, 8, 4, 4, 4, 4, 8, 8, 8],
+            ),
+        ]
+        .concat();
+        let bottom = build_args(
+            base + 0x100,
+            [le(&[1, 8, 1, 0], &[4, 4, 4, 4]), geometry].concat(),
+            0x99,
+            false,
+        );
+        let top = build_args(
+            0x7000,
+            le(&[0, 4, 2, 0, 0x8000], &[4, 4, 4, 4, 8]),
+            0x98,
+            true,
+        );
+        let l1 = recording(&[(98, 4, bottom), (98, 4, top), (35, 0, vec![0; 4])]);
+        let mut instances = Vec::new();
+        for (id, hit, blas) in [(5u64, 3u64, base + 0x100), (6, 0, 0x1234)] {
+            let t: Vec<u8> = (0..12).flat_map(|j| (j as f32).to_le_bytes()).collect();
+            instances.extend(t);
+            instances.extend(le(&[id | 0xff << 24, hit | 1 << 24, blas], &[4, 4, 8]));
+        }
+        let calls = capture(
+            &[
+                ((3, 19), 40, called_va.to_le_bytes().to_vec()),
+                ((1, 2), 101, l1),
+                (ECL, 900, submit(101)),
+            ],
+            table,
+            &[(5, records, true), (9, instances, false)],
+        );
+        let build = "ID3D12GraphicsCommandList_BuildRaytracingAccelerationStructure";
+        let list = vec![
+            event("ID3D12Resource_GetGPUVirtualAddress", Some(0), false),
+            event(RECORDING, Some(1), false),
+            event(SUBMIT, Some(2), false),
+            event(build, None, false),
+            event(build, None, false),
+            event("ID3D12GraphicsCommandList_Close", None, false),
+        ];
+        (calls, list)
+    }
+
+    #[test]
+    fn ray_tracing_tables_read_from_the_frame() {
+        let base = 0x25_0000_0000u64;
+        let (bytes, list) = raytracing_capture(base);
+        let mut c = Capture::open(Cursor::new(bytes)).unwrap();
+        let objs = c.objects().unwrap();
+        let named = listed(&listed_json(&[
+            (40, "Resource", "BlasBuffer"),
+            (41, "AccelerationStructure", "BLAS_41"),
+            (101, "GraphicsCommandList", "GraphicsCommandList_101"),
+        ]))
+        .unwrap();
+        let names = crate::ngfx_capture::check_objects(&objs, &named).unwrap();
+        let rt = raytracing(&mut c, &functions(&list), &objs, &names).unwrap();
+        assert_eq!(
+            (rt.blas_builds, rt.geometries, rt.undecoded),
+            (1, 1, 0),
+            "{}",
+            rt.blas
+        );
+        let row = rt.blas.lines().nth(1).unwrap();
+        assert_eq!(
+            row,
+            "3\tGraphicsCommandList_101\t0x2500000100\tBLAS_41\t0x8\t0\ttriangles\t0x2\t0x1020\t57\t48\t0x2400\t6\t32\t\
+             0x2500\t64\t0x0\t0x99"
+        );
+        assert_eq!(rt.tlas.len(), 1);
+        let t = &rt.tlas[0];
+        assert_eq!((t.event, t.instances, t.named), (4, 2, 1));
+        let tsv = t.tsv.as_deref().unwrap();
+        let rows: Vec<&str> = tsv.lines().collect();
+        assert_eq!(
+            rows[1],
+            "0\t5\t0xff\t3\t0x01\t0x2500000100\tBLAS_41\t0,1,2,3,4,5,6,7,8,9,10,11"
+        );
+        assert_eq!(
+            rows[2],
+            "1\t6\t0xff\t0\t0x01\t0x1234\t-\t0,1,2,3,4,5,6,7,8,9,10,11"
+        );
+
+        // GetGPUVirtualAddress says another address than the resource's record: refused.
+        let (bytes, list) = raytracing_capture(base + 0x10);
+        let mut c = Capture::open(Cursor::new(bytes)).unwrap();
+        let err = raytracing(&mut c, &functions(&list), &objs, &names).unwrap_err();
+        assert!(
+            err.starts_with(LAYOUT) && err.contains("GetGPUVirtualAddress"),
+            "{err}"
+        );
     }
 }

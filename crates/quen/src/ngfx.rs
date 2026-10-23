@@ -29,7 +29,7 @@ use crate::win::{self, Child, Job};
 use crate::{doctor, profile};
 
 /// The file-only operations, in their default order: the output file and ngfx-replay's option (none: quen's reader).
-const OPS: [(&str, &str, Option<&str>); 9] = [
+const OPS: [(&str, &str, Option<&str>); 10] = [
     ("metadata", "metadata.json", Some("--metadata")),
     ("screenshot", "final.png", Some("--metadata-screenshot")),
     ("functions", "functions.json", Some("--metadata-functions")),
@@ -39,13 +39,14 @@ const OPS: [(&str, &str, Option<&str>); 9] = [
     ("object_table", "object_table.tsv", None),
     ("pipelines", "pipelines.tsv", None),
     ("calls", "calls.tsv", None),
+    ("raytracing", "blas_builds.tsv", None),
 ];
 /// The ops a reader op checks against or reads from (ngfx-replay's lists of the same capture, the metadata's Nsight
 /// version): run first, in the same call.
 fn inputs(op: &str) -> &'static [&'static str] {
     match op {
         "object_table" | "pipelines" => &["metadata", "objects"],
-        "calls" => &["metadata", "functions", "objects"],
+        "calls" | "raytracing" => &["metadata", "functions", "objects"],
         _ => &[],
     }
 }
@@ -87,7 +88,7 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "capture_id": capture_id,
                 "path": {"type": "string", "description": "instead of capture_id: an absolute path to a .ngfx-capture (under the capture root, or imported by a hard link)"},
-                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all. metadata: metadata.json, cleaned (variable names, Nsight's own knobs, user paths as %USERPROFILE%, no computer or user name); facts: frame, resolution, API, features, Nsight version. screenshot: final.png, the frame as presented. functions: functions.json; counts of events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches. objects: objects.json; counts by type. errors: errors.txt, logged errors. shaders: shaders\\<hash>.dxbc, shaders.tsv (the shader chunks); found, decoded, failed. quen's reader: object_table: object_table.tsv, every object with its type, creator and creation record. pipelines: pipelines.tsv, each pipeline state and state object with the shaders its creation record names (stage, chunk, hash). calls: calls.tsv, every event of functions with its this, CPU time, a draw's or dispatch's pipeline and its arguments (decoded for the draws, dispatches, pipeline and root bindings, barriers, render targets, copies, ray-tracing builds and dispatches, submits, signals and waits; raw hex for the rest)."},
+                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all. metadata: metadata.json, cleaned (variable names, Nsight's own knobs, user paths as %USERPROFILE%, no computer or user name); facts: frame, resolution, API, features, Nsight version. screenshot: final.png, the frame as presented. functions: functions.json; counts of events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches. objects: objects.json; counts by type. errors: errors.txt, logged errors. shaders: shaders\\<hash>.dxbc, shaders.tsv (the shader chunks); found, decoded, failed. quen's reader: object_table: object_table.tsv, every object with its type, creator and creation record. pipelines: pipelines.tsv, each pipeline state and state object with the shaders its creation record names (stage, chunk, hash). calls: calls.tsv, every event of functions with its this, CPU time, a draw's or dispatch's pipeline and its arguments (decoded for the draws, dispatches, pipeline and root bindings, barriers, render targets, copies, ray-tracing builds and dispatches, submits, signals and waits; raw hex for the rest). raytracing: blas_builds.tsv (each bottom-level build's geometry) and tlas_<n>.tsv (each top-level build's instances: id, mask, hit group, flags, BLAS, transform), when the file holds them."},
             }, "additionalProperties": false},
         }),
         json!({
@@ -756,7 +757,7 @@ fn run(
             write(&raw)?;
             Ok((json!({}), Vec::new()))
         }
-        "object_table" | "pipelines" | "calls" => {
+        "object_table" | "pipelines" | "calls" | "raytracing" => {
             call.progress(&format!("reading the capture's {op}"));
             let mut capture = capture(t)?;
             let objects = capture.objects()?;
@@ -781,6 +782,40 @@ fn run(
                         ("capture_pipeline_shader_links", j.links as u64),
                     ];
                     Ok((json!({}), counts))
+                }
+                "raytracing" => {
+                    let events = ngfx_calls::events(&input(earlier, "functions")?)?;
+                    let rt = ngfx_calls::raytracing(&mut capture, &events, &objects, &names)?;
+                    write(scrubbed(&rt.blas).as_bytes())?;
+                    let mut tables = Vec::new();
+                    for (k, tlas) in rt.tlas.iter().enumerate() {
+                        let path = match &tlas.tsv {
+                            Some(tsv) => {
+                                let path = t.out.join(format!("tlas_{}.tsv", k + 1));
+                                fs::write(&path, scrubbed(tsv))
+                                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                                Some(path)
+                            }
+                            None => None,
+                        };
+                        tables.push(
+                            json!({"tlas": k + 1, "event": tlas.event, "instances": tlas.instances,
+                                           "named": tlas.named, "file": path}),
+                        );
+                    }
+                    let instances: u32 = rt.tlas.iter().map(|t| t.instances).sum();
+                    let named: usize = rt.tlas.iter().map(|t| t.named).sum();
+                    let unread = rt.tlas.iter().filter(|t| t.tsv.is_none()).count();
+                    let counts = vec![
+                        ("capture_blas_builds", rt.blas_builds as u64),
+                        ("capture_blas_geometries", rt.geometries as u64),
+                        ("capture_tlas_builds", rt.tlas.len() as u64),
+                        ("capture_tlas_instances", u64::from(instances)),
+                        ("capture_tlas_instances_named", named as u64),
+                        ("capture_tlas_builds_unread", unread as u64),
+                        ("capture_as_builds_undecoded", rt.undecoded as u64),
+                    ];
+                    Ok((json!({"tlas": tables}), counts))
                 }
                 _ => {
                     let events = ngfx_calls::events(&input(earlier, "functions")?)?;
@@ -1274,5 +1309,51 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
+    }
+
+    /// A hand check of quen's reader on a real capture, read-only: `QUEN_NGFX_CAPTURE` (the file),
+    /// `QUEN_NGFX_FUNCTIONS` and `QUEN_NGFX_OBJECTS` (ngfx-replay's `--metadata-functions` and `--metadata-objects`
+    /// of it), `QUEN_NGFX_OUT` (a folder outside the repo for the tables). Prints counts only:
+    /// `cargo test --release -p quen reader_hand_check -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn reader_hand_check() {
+        let var = |k: &str| PathBuf::from(std::env::var(k).unwrap_or_else(|_| panic!("set {k}")));
+        let out = var("QUEN_NGFX_OUT");
+        let earlier = HashMap::from([
+            ("functions", var("QUEN_NGFX_FUNCTIONS")),
+            ("objects", var("QUEN_NGFX_OBJECTS")),
+        ]);
+        let row = CaptureRef {
+            id: 0,
+            boot_id: None,
+            path: String::new(),
+            sha256: String::new(),
+            bytes: 0,
+            kind: "ngfx-capture".into(),
+            removed: false,
+        };
+        let t = Target {
+            row,
+            file: var("QUEN_NGFX_CAPTURE"),
+            out: out.clone(),
+            imported: false,
+        };
+        let shared = Shared::new(Ok(Config::default()));
+        let session = Session::new(&shared, None);
+        let mut call = session.call(Conn::nobody(), Value::Null, None);
+        for (op, name, _) in OPS.iter().filter(|(.., flag)| flag.is_none()) {
+            let started = Instant::now();
+            let (json, counts) = run(op, &out.join(name), &t, None, &earlier, &mut call).unwrap();
+            let secs = started.elapsed().as_secs_f64();
+            println!("{op} {secs:.1} s {counts:?}");
+            for tlas in json["tlas"].as_array().into_iter().flatten() {
+                let file = tlas["file"].is_string();
+                println!(
+                    "  tlas {} instances {} named {} file {file}",
+                    tlas["tlas"], tlas["instances"], tlas["named"]
+                );
+            }
+        }
     }
 }

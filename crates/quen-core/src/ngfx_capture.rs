@@ -127,6 +127,11 @@ impl<R: Read + Seek> Capture<R> {
             .ok_or_else(|| layout(format!("no chunk {id}")))
     }
 
+    /// Chunk `id`'s size, decompressed.
+    pub fn size(&self, id: u64) -> Option<u64> {
+        self.index.get(&id).map(|e| e.size)
+    }
+
     /// Chunk `id`, decompressed, after its header in place agrees with the index.
     pub fn chunk(&mut self, id: u64) -> Result<Vec<u8>, String> {
         let e = self.entry(id)?;
@@ -802,54 +807,6 @@ pub(crate) mod tests {
                 "400\tRt\tStateObject\t-\t-\t-\t-\t-".into(),
             ]
         );
-    }
-
-    /// A hand check on a real capture, read-only: `QUEN_NGFX_CAPTURE` (the file), `QUEN_NGFX_FUNCTIONS` and
-    /// `QUEN_NGFX_OBJECTS` (ngfx-replay's `--metadata-functions` and `--metadata-objects` of it), `QUEN_NGFX_OUT` (a
-    /// folder outside the repo for the tables). Prints counts only. `cargo test -p quen-core --lib hand_check --
-    /// --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn hand_check() {
-        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
-        let out = std::path::PathBuf::from(var("QUEN_NGFX_OUT"));
-        let file = std::fs::File::open(var("QUEN_NGFX_CAPTURE")).unwrap();
-        let mut c = Capture::open(io::BufReader::new(file)).unwrap();
-        let objs = c.objects().unwrap();
-        let text = std::fs::read_to_string(var("QUEN_NGFX_OBJECTS")).unwrap();
-        let list = listed(&text).unwrap();
-        let names = check_objects(&objs, &list).unwrap();
-        println!(
-            "chunks {} objects {} (listed {})",
-            c.index.len(),
-            objs.len(),
-            list.len()
-        );
-        let table = object_table(&mut c, &objs, &names).unwrap();
-        println!("object_table rows {}", table.lines().count() - 1);
-        std::fs::write(out.join("object_table.tsv"), table).unwrap();
-        let scan = c.shaders().unwrap();
-        println!(
-            "shaders found {} decoded {} failed {} duplicates {}",
-            scan.found,
-            scan.shaders.len(),
-            scan.failed,
-            scan.duplicates
-        );
-        let j = pipelines(&mut c, &objs, &names, &scan).unwrap();
-        println!(
-            "pipelines {} with shaders {} links {}",
-            j.pipelines, j.with_shaders, j.links
-        );
-        std::fs::write(out.join("pipelines.tsv"), j.tsv).unwrap();
-        let text = std::fs::read_to_string(var("QUEN_NGFX_FUNCTIONS")).unwrap();
-        let events = crate::ngfx_calls::events(&text).unwrap();
-        let calls = crate::ngfx_calls::calls(&mut c, &events, &names).unwrap();
-        println!(
-            "calls {} decoded {} raw {} unfit {} {:?}",
-            calls.calls, calls.decoded, calls.raw, calls.unfit, calls.unfit_by
-        );
-        std::fs::write(out.join("calls.tsv"), calls.tsv).unwrap();
     }
 
     #[test]
