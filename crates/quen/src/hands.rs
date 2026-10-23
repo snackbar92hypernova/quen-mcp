@@ -76,8 +76,7 @@ pub(crate) fn tools() -> Vec<Value> {
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
                 moves the focus (game_keys, game_console, game_exec, game_load, game_pause, game_settime, \
                 game_weather, game_teleport, game_place, game_items, game_save, game_camera with a pose, game_frame, \
-                game_cvar set or restore, mem_patch, \
-                mem_unpatch, mem_patch_instances, mem_unpatch_instances, \
+                game_freecam but status, game_cvar set or restore, mem_patch, mem_unpatch and their _instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
                 are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
                 Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
@@ -93,14 +92,15 @@ pub(crate) fn tools() -> Vec<Value> {
             "description": "Give the controls of the game to the user: back in a play session, or in a test session \
                 for the user to do something in the game. No prompt. applied: memory patches and cvar writes still \
                 applied (in a play session, this hand-over's). A play session refuses while there is one, unless \
-                keep_writes with the user's OK; a test session gives the controls with them applied. Then quen's pause \
-                goes off and a camera path stops (pause, path: the game's replies), the game shows that the user has \
+                keep_writes with the user's OK; a test session gives the controls with them applied. Then the free \
+                camera, quen's pause and a camera path end (freecam, pause, path: the game's replies), the game shows \
+                that the user has \
                 the controls (status: its reply, or why not): until hands_take with quen-w3 0.1.15+ and the \
                 config's indicator on, else 8 s. Then the controls go to the user. kept: this hand-over's teleports, settime, \
                 weather and items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
                 front at the end (game, client or other). Refused: the user has them already, a wrong token, \
-                to_client with no client window found at connect. Failed: the pause or the path wasn't undone \
-                (left); the controls went to the user.",
+                to_client with no client window found at connect. Failed: one wasn't undone (left); the \
+                controls went to the user.",
             "inputSchema": schema(json!({
                 "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches and cvar writes still applied, the user having agreed. Default false: refused while any is"},
                 "to_client": {"type": "boolean", "description": "true: bring this client's window to the front last, as focus to client does, so the user sees the chat (to_client in the result: why it didn't). Default false: the focus stays where it is"},
@@ -117,6 +117,7 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
         "game_photo" => matches!(args["action"].as_str(), Some("get" | "list")),
+        "game_freecam" => args["action"] == "status",
         "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
         | "world_ground" | "world_ray" | "world_nav" | "world_map" | "game_scriptlog"
         | "measure_presentmon" | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk"
@@ -224,8 +225,15 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         }
     }
     fields.insert("kept".into(), json!(kept));
-    // quen's pause and a camera path a sweep left end with the hand-over.
+    // quen's pause, a camera path a sweep left and the free camera quen read on end with the hand-over.
     let mut left = Vec::new();
+    match crate::freecam::off_if_on(&cx) {
+        Some(Ok(done)) => {
+            fields.insert("freecam".into(), json!(done));
+        }
+        Some(Err(why)) => left.push(format!("freecam: {why}")),
+        None => {}
+    }
     let undo = [
         (cx.live.path.get(), "path", Verb::CamStop {}),
         (cx.live.paused.get(), "pause", Verb::Pause { on: false }),
@@ -261,7 +269,8 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     fields.insert("in_front".into(), json!(in_front(&cx, call)));
     if !left.is_empty() {
         fields.insert("left".into(), json!(left));
-        let why = "the controls went to the user, but quen's pause or the camera path wasn't undone (left)";
+        let why = "the controls went to the user, but quen's pause, the camera path or the free camera wasn't \
+                   undone (left)";
         return Err(Done::Failed(why.into(), fields));
     }
     Ok(fields)
@@ -441,6 +450,8 @@ mod tests {
             ("game_cvar", json!({"name": "X", "restore": true})),
             ("game_camera", json!({"pos": [0, 0, 0], "rot": [0, 0, 0]})),
             ("game_camera", json!({"fov": 40})),
+            ("game_freecam", json!({"action": "on"})),
+            ("game_freecam", json!({"action": "set", "relative": {}})),
         ] {
             assert!(!user_may(tool, &args), "{tool} {args}");
         }
@@ -448,6 +459,7 @@ mod tests {
             ("game_cvar", json!({"name": "X"})),
             ("game_cvar", json!({"name": "X", "restore": false})),
             ("game_camera", none.clone()),
+            ("game_freecam", json!({"action": "status"})),
         ] {
             assert!(user_may(tool, &args), "{tool} {args}");
         }
@@ -599,6 +611,59 @@ mod tests {
         assert_eq!(out["applied"], json!(["mem_patch cull at 0x20"]), "{out}");
         // No window here is the dummy game's or a client's.
         assert_eq!(out["in_front"], "other", "{out}");
+        assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// The free camera quen last read on goes off before the controls go to the user, and the result says so; when it
+    /// can't (no channel), the controls go anyway and the call fails with it in left.
+    #[test]
+    fn hands_give_turns_the_free_camera_off_first() {
+        use crate::channel::tests::{fake_game_until, reply, served, token};
+        use quen_core::protocol::Request;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fx = served("give-freecam");
+        let stop = Arc::new(AtomicBool::new(false));
+        let answer = Box::new(|r: &Request| {
+            let text = match r.verb {
+                Verb::FreeCam { on: false } => "EnableFreeCamera(0) called",
+                Verb::Notice { .. } | Verb::NoticeHide {} => "notice shown",
+                ref v => panic!("{v:?}"),
+            };
+            vec![reply(r.id, true, text, None)]
+        });
+        let server = fake_game_until(&token(&fx), answer, stop.clone());
+        let session = handed_over(&fx, false);
+        let live = session.live.as_ref().unwrap();
+        live.freecam.set(true);
+        let out = run(&session, "hands_give", json!({"token": "tok"}));
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(out["ok"], true, "{out}");
+        assert!(
+            out["freecam"]
+                .as_str()
+                .unwrap()
+                .contains("quen turned it off"),
+            "{out}"
+        );
+        assert!(!live.freecam.get());
+        assert_eq!(fx.shared.hands(), Some(Hands::User));
+        let sent: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        assert_eq!(sent[0], Verb::FreeCam { on: false }, "{sent:?}");
+        // No channel: the controls go to the user, and the free camera is left.
+        let fx = Fake::new("give-freecam-down");
+        let session = handed_over(&fx, false);
+        session.live.as_ref().unwrap().freecam.set(true);
+        let out = run(&session, "hands_give", json!({"token": "tok"}));
+        assert_eq!(
+            (&out["ok"], &out["refused"]),
+            (&json!(false), &json!(false)),
+            "{out}"
+        );
+        assert!(
+            out["left"][0].as_str().unwrap().starts_with("freecam: "),
+            "{out}"
+        );
         assert_eq!(fx.shared.hands(), Some(Hands::User));
     }
 

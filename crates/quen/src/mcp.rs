@@ -24,8 +24,8 @@ use serde_json::{Map, Value, json};
 use crate::session::{self, Done, Shared};
 use crate::win::{self, NamedMutex, Pipe};
 use crate::{
-    camera, capture, channel, config, data, disk, doctor, focus, game, hands, image, ledger,
-    measure, mem, ngfx, photo, plan, save, scene, setup, vortex,
+    camera, capture, channel, config, data, disk, doctor, focus, freecam, game, hands, image,
+    ledger, measure, mem, ngfx, photo, plan, save, scene, setup, vortex,
 };
 
 /// The protocol versions quen speaks, newest first. It answers with the client's if listed, else the newest.
@@ -877,7 +877,8 @@ pub(crate) fn tools() -> Value {
         },
         {
             "name": "session_end",
-            "description": "End the session: wait until the gamesaves folder stops changing, kill the game through \
+            "description": "End the session: turn off a free camera quen read on (freecam), wait until the gamesaves \
+                folder stops changing, kill the game through \
                 its job, replay the journal (restore every file it changed, unpark the mods, recycle the staged \
                 files and their new logs once game_logs copied them: only what still is as \
                 quen left it; a file the game rewrote is kept beside as .quen-current), release the lock. saves lists what the game wrote in gamesaves since the launch: tainted ones (written after a \
@@ -957,6 +958,7 @@ pub(crate) fn tools() -> Value {
     list.extend(camera::tools());
     list.extend(scene::tools());
     list.push(photo::tool());
+    list.push(freecam::tool());
     list.extend(measure::tools());
     list.push(image::tool());
     list.push(plan::tool());

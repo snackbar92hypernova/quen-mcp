@@ -195,6 +195,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "game_screenshot" => capture::screenshot(session, call, args),
         "game_camera" => crate::camera::camera(session, call, args),
         "game_photo" => crate::photo::call(session, call, args),
+        "game_freecam" => crate::freecam::call(session, call, args),
         _ => channel::call(session, call, name, args),
     };
     out.map_or_else(|done| done, Done::Ok)
@@ -1924,6 +1925,7 @@ if os.path.exists(act): exec(open(act).read())
                 handovers: crate::hands::Handovers::new(Default::default()),
                 paused: Default::default(),
                 path: Default::default(),
+                freecam: Default::default(),
                 client: Err("a test session has no client".into()),
                 away: Default::default(),
                 idled: Default::default(),

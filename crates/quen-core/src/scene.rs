@@ -36,6 +36,14 @@ pub fn facing(from: [f64; 2], to: [f64; 2]) -> Option<f64> {
     (dx.hypot(dy) >= 1e-3).then(|| wrap((-dx).atan2(dy).to_degrees()))
 }
 
+/// The rotation `[pitch, yaw, 0]` that looks from `from` at `to` (pitch negative looking down); none when they are within
+/// a millimetre in xy.
+pub fn aim(from: [f64; 3], to: [f64; 3]) -> Option<[f64; 3]> {
+    let yaw = facing([from[0], from[1]], [to[0], to[1]])?;
+    let flat = (to[0] - from[0]).hypot(to[1] - from[1]);
+    Some([(to[2] - from[2]).atan2(flat).to_degrees(), yaw, 0.0])
+}
+
 /// How a subject is framed: from `side` degrees off its forward, `distance` metres away from the aim point in xy,
 /// `height` metres above it, with `fov` degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -179,5 +187,26 @@ mod tests {
         assert_eq!(wrap(540.0), 180.0);
         assert!(close(wrap(-190.0), 170.0));
         assert_eq!(side("up"), None);
+    }
+
+    /// Boot 237's qfcrel(10, 0, 2): from (661.08, 1881.99, 11.73) at 1.7 m above Geralt (668.99, 1875.87, 9.94), sent
+    /// rot (-0.53, -127.70, 0), which put him at the frame's centre. A pose aimed so looks at its target.
+    #[test]
+    fn aim_looks_from_a_point_at_a_target() {
+        let rot = aim([661.08, 1881.99, 11.73], [668.99, 1875.87, 11.64]).unwrap();
+        assert!(
+            (rot[0] - -0.52).abs() < 0.01 && (rot[1] - -127.73).abs() < 0.01,
+            "{rot:?}"
+        );
+        assert_eq!(rot[2], 0.0);
+        let (from, to) = ([1.0, 2.0, 10.0], [4.0, 6.0, 5.0]);
+        let p = Pose {
+            pos: from,
+            rot: aim(from, to).unwrap(),
+            fov: 40.0,
+        };
+        let (look, want) = (look(&p), towards(&p, to));
+        assert!((0..3).all(|c| close(look[c], want[c])), "{look:?} {want:?}");
+        assert_eq!(aim(from, [1.0, 2.0005, 0.0]), None);
     }
 }

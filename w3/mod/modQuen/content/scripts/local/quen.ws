@@ -31,7 +31,8 @@
 //   rendered camera sees (QUENRPC_Frame); scene.ground, the ground at points (QUENRPC_Ground); scene.ray, rays and
 //   sphere sweeps (QUENRPC_Ray); nav.line, navmesh lanes (QUENRPC_Nav); and cam.noclip, the photo-mode camera's no-clip
 //   (put back as photo mode's menu has it when the menu closes). The exec verb (0.1.13) never reaches the script:
-//   W3Quen.asi runs it.
+//   W3Quen.asi runs it. From quen-w3 0.1.17 the game's own free camera, outside photo mode: freecam turns it on or
+//   off, freecam.set moves it, freecam.get reads its state (QUENRPC_FreeCam), which each of them reads back.
 // - Photo mode (from quen-w3 0.1.9): photo.mode opens it by PhotomodeManager's own EnablePhotomode and closes it by its
 //   menu's own exit; photo.get, photo.weather, photo.env, photo.time, photo.grade, photo.reset, photo.tick and photo.list
 //   call CR4PhotomodeEffects as photo mode's menu does (photomodeMenu.ws OnParameterChanged), only while that menu is
@@ -1003,6 +1004,39 @@ function QUENRPC_Nav(n : array<float>) : string
 	return text;
 }
 
+// The free camera's state (quen-w3 0.1.17): "<on 0|1> <paused 0|1> <free camera x y z> <rendered camera x y z pitch yaw
+// roll> <player x y z heading> <radius> <near camera> <near player>", as the free-camera probe's qfcstatus read it (boot
+// 237): IsFreeCameraEnabled, GetFreeCameraPosition (it keeps its last pose while off), theCamera (the rendered view,
+// equal to the free camera while it is on; nothing reads the free camera's own rotation), IsPaused, and the alive
+// actors within radius of the rendered camera and of the player, the player among them when in range
+// (FindGameplayEntitiesInSphere with FLAG_OnlyAliveActors).
+function QUENRPC_FreeCam(radius : float) : string
+{
+	var ents : array<CGameplayEntity>;
+	var cam, p : Vector;
+	var r : EulerAngles;
+	var text : string;
+
+	cam = theCamera.GetCameraPosition();
+	r = theCamera.GetCameraRotation();
+	p = thePlayer.GetWorldPosition();
+	text = "0";
+	if (theGame.IsFreeCameraEnabled())
+		text = "1";
+	if (theGame.IsPaused())
+		text += " 1";
+	else
+		text += " 0";
+	text += " " + QUEN_V(theGame.GetFreeCameraPosition()) + " " + QUEN_V(cam) + " " + FloatToStringPrec(r.Pitch, 4) + " "
+		+ FloatToStringPrec(r.Yaw, 4) + " " + FloatToStringPrec(r.Roll, 4) + " " + QUEN_V(p) + " "
+		+ FloatToStringPrec(thePlayer.GetHeading(), 4) + " " + FloatToStringPrec(radius, 4);
+	FindGameplayEntitiesInSphere(ents, cam, radius, 1000, '', FLAG_OnlyAliveActors);
+	text += " " + IntToString(ents.Size());
+	ents.Clear();
+	FindGameplayEntitiesInSphere(ents, p, radius, 1000, '', FLAG_OnlyAliveActors);
+	return text + " " + IntToString(ents.Size());
+}
+
 // The photo-mode camera's own pose: the read-back of a set.
 function QUENRPC_PhotoPose() : string
 {
@@ -1533,6 +1567,54 @@ function QUENRPC_PhotoPose() : string
 				QUEN_Reply(handle, true, "added " + IntToString(after - before) + " of " + text, rest);
 			else
 				QUEN_Reply(handle, false, "nothing added: no item is named " + text + " (the item's own name, as additem takes it)", rest);
+			return;
+
+		case "freecam":
+		case "freecam.set":
+		case "freecam.get":
+			// From quen-w3 0.1.17: the game's own free camera, CR4Game's developer natives (engine\game.ws), with the
+			// world running (the free-camera probe, boot 237). freecam: EnableFreeCamera, "1" or "0"; freecam.set:
+			// MoveFreeCamera to "x y z pitch yaw roll", only while it is on; freecam.get: "<radius>", nothing changed. Each
+			// replies with the state (QUENRPC_FreeCam). Photo mode has its own camera: freecam on and freecam.set are
+			// refused there.
+			if (!thePlayer)
+			{
+				QUEN_Reply(handle, false, "no player (not in a game session)", "");
+				return;
+			}
+			if (photo && (args == "1" || verb == "freecam.set"))
+			{
+				QUEN_Reply(handle, false, "photo mode has its own camera (cam.set): the free camera is for gameplay", "");
+				return;
+			}
+			text = "the free camera's state";
+			if (verb == "freecam")
+			{
+				theGame.EnableFreeCamera(args == "1");
+				text = "EnableFreeCamera(" + args + ") called";
+			}
+			if (verb == "freecam.set")
+			{
+				if (!theGame.IsFreeCameraEnabled())
+				{
+					QUEN_Reply(handle, false, "the free camera is off: freecam on first", "");
+					return;
+				}
+				QUENRPC_Numbers(args, n);
+				pos.X = n[0];
+				pos.Y = n[1];
+				pos.Z = n[2];
+				pos.W = 1.0;
+				rot.Pitch = n[3];
+				rot.Yaw = n[4];
+				rot.Roll = n[5];
+				theGame.MoveFreeCamera(pos, rot);
+				text = "MoveFreeCamera called";
+			}
+			if (verb == "freecam.get")
+				QUEN_Reply(handle, true, text, QUENRPC_FreeCam(StringToFloat(args)));
+			else
+				QUEN_Reply(handle, true, text + "; data is the state in the same tick", QUENRPC_FreeCam(30));
 			return;
 
 		case "pause":
