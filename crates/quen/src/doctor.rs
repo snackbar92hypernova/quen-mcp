@@ -71,6 +71,32 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.18: scene.frame projects from the free camera while it is on (world_frame, boot 238), in quen.ws; the ASI
+    // differs from 0.1.17's only in its version, the HUD bundle is 0.1.16's, byte for byte.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.18",
+        sha256: "65bdf7da5d58953e2748c97ff1b73fee7043b2cf5da8983b3a8ed9567e250519",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.18",
+        sha256: "5e13694065b6c00fc4fa49a190116480a540569bc611c3ac419e1c7cf5196997",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[0],
+        version: "quen-w3 0.1.18",
+        sha256: "7592bfafef3c54ff258940f0c732a47e90903b3c4e5e74537a858d7269a1f2c1",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[1],
+        version: "quen-w3 0.1.18",
+        sha256: "7d05a5ee2297d231e71afe10a567a499ff23d78a769d5fa2df01804d120dab7c",
+        exact: true,
+    },
     // 0.1.17: the free-camera verbs (freecam, freecam.set, freecam.get: game_freecam, freecam.rs) in both files; its
     // HUD bundle is 0.1.16's, byte for byte.
     Pin {
@@ -597,7 +623,7 @@ pub(crate) const PACKAGE: Dep = Dep {
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
         x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
         its 0.5 s hide before captures and windows; from quen-w3 0.1.16, that line in the game's HUD where it is drawn; \
-        from quen-w3 0.1.17, game_freecam",
+        from quen-w3 0.1.17, game_freecam; from quen-w3 0.1.18, world_frame under the free camera",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
@@ -2596,12 +2622,14 @@ mod tests {
         assert_ne!(owner, std::process::id(), "a probe took the focus");
     }
 
-    /// game_freecam refuses every pinned package release but the newest, 0.1.17, which brought its verbs.
+    /// game_freecam refuses every pinned package release before 0.1.17, which brought its verbs.
     #[test]
-    fn the_free_camera_needs_the_newest_package() {
+    fn the_free_camera_needs_0_1_17_or_later() {
         let mut older: Vec<&str> = PINS
             .iter()
-            .filter(|p| p.file == PACKAGE_ASI && p.version != "quen-w3 0.1.17")
+            .filter(|p| {
+                p.file == PACKAGE_ASI && !["quen-w3 0.1.17", "quen-w3 0.1.18"].contains(&p.version)
+            })
             .map(|p| p.version)
             .collect();
         older.sort();
