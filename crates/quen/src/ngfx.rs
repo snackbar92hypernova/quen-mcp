@@ -1,5 +1,6 @@
 //! Nsight Graphics frame captures without Nsight's window (nsight-capture design §4, phase 1). `ngfx_extract` reads a
-//! capture file only: ngfx-replay's print-and-exit options and quen's shader decoder (quen-core's `ngfx`).
+//! capture file only: ngfx-replay's print-and-exit options, and quen's reader of the file itself (quen-core's
+//! `ngfx_capture`), checked against ngfx-replay's lists of the same capture.
 //! `ngfx_replay` replays it on the GPU (a perf report, or GPU Trace around the replay), which the client asks the user
 //! about on every call. Only the configured Nsight install's ngfx-replay runs, never the replayer a capture bundles,
 //! each in a job of its own, without a window. A capture made outside quen is imported by a hard link into
@@ -7,8 +8,9 @@
 //! Each output file is a captures row; each file-only answer an extraction, read back instead of run again; counts
 //! and replay times are measurements.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::OwnedHandle;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::journal::sha256_file;
 use quen_core::ledger::{Capture, CaptureRef, Extraction, Ledger, Measurement, Tag};
-use quen_core::ngfx;
+use quen_core::{ngfx, ngfx_capture};
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
@@ -26,20 +28,30 @@ use crate::session::{self, Call, Done, Session};
 use crate::win::{self, Child, Job};
 use crate::{doctor, profile};
 
-/// The file-only operations, in their default order: the output file and ngfx-replay's option (none: quen's decoder).
-const OPS: [(&str, &str, Option<&str>); 6] = [
+/// The file-only operations, in their default order: the output file and ngfx-replay's option (none: quen's reader).
+const OPS: [(&str, &str, Option<&str>); 7] = [
     ("metadata", "metadata.json", Some("--metadata")),
     ("screenshot", "final.png", Some("--metadata-screenshot")),
     ("functions", "functions.json", Some("--metadata-functions")),
     ("objects", "objects.json", Some("--metadata-objects")),
     ("errors", "errors.txt", Some("--metadata-logs-errors")),
     ("shaders", "shaders.tsv", None),
+    ("object_table", "object_table.tsv", None),
 ];
+/// The ops a reader op checks against or reads from (ngfx-replay's lists of the same capture, the metadata's Nsight
+/// version): run first, in the same call.
+fn inputs(op: &str) -> &'static [&'static str] {
+    match op {
+        "object_table" => &["metadata", "objects"],
+        _ => &[],
+    }
+}
 /// How long one print-and-exit run of ngfx-replay may take, and a replay.
 const PRINT_LIMIT: Duration = Duration::from_secs(600);
 const REPLAY_LIMIT: Duration = Duration::from_secs(900);
-/// quen's shader decoder: its revision is part of its profile, so a fix misses the cache.
-const DECODER_REVISION: u32 = 1;
+/// quen's shader decoder and capture reader: their revisions are part of their profiles, so a fix misses the cache.
+const DECODER_REVISION: u32 = 2;
+const READER_REVISION: u32 = 1;
 /// The longest capture path ngfx-replay opens: Windows' MAX_PATH less its NUL. At 263 characters it printed "File does
 /// not exist" (2026-10-23).
 const MAX_PATH: usize = 259;
@@ -62,20 +74,17 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "ngfx_extract",
             "description": "Reads an Nsight Graphics frame capture (.ngfx-capture), the file only: no GPU, no window, \
-                no prompt. ops (default all): metadata (metadata.json, cleaned: variable names, Nsight's own knobs, \
-                user paths as %USERPROFILE%, no computer or user name; facts: frame, resolution, API, features, \
-                Nsight version), screenshot (final.png, the frame as presented), functions (functions.json; counts of \
-                events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches), objects \
-                (objects.json; counts by type), errors (errors.txt, logged errors), shaders \
-                (shaders\\<hash>.dxbc, shaders.tsv; found, decoded, failed). Outputs go beside the capture in a \
-                folder named by its stem, each a captures row; an op answered before for the same file is read back \
-                (cached). path: a capture outside the capture root is hard-linked into imports\\ (same volume only), \
-                never moved or changed. Results: counts, paths, no raw metadata. Refused: another quen holds \
-                the game lock; with needs: no ngfx-replay beside ngfx in the config.",
+                no prompt. ops (default all, each in ops' description): ngfx-replay's print-and-exit lists, and quen's \
+                reader of the file itself, checked against those lists (added to ops when missing); a file that \
+                doesn't line up fails that op: layout not recognised. Outputs go beside the capture in a folder named \
+                by its stem, each a captures row; an op answered before for the same file is read back (cached). \
+                path: a capture outside the capture root is hard-linked into imports\\ (same volume only), never \
+                moved or changed. Results: counts, paths, no raw metadata. Refused: another quen holds the game lock; \
+                with needs: no ngfx-replay beside ngfx in the config.",
             "inputSchema": {"type": "object", "properties": {
                 "capture_id": capture_id,
                 "path": {"type": "string", "description": "instead of capture_id: an absolute path to a .ngfx-capture (under the capture root, or imported by a hard link)"},
-                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all six"},
+                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all. metadata: metadata.json, cleaned (variable names, Nsight's own knobs, user paths as %USERPROFILE%, no computer or user name); facts: frame, resolution, API, features, Nsight version. screenshot: final.png, the frame as presented. functions: functions.json; counts of events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches. objects: objects.json; counts by type. errors: errors.txt, logged errors. shaders: shaders\\<hash>.dxbc, shaders.tsv (the shader chunks); found, decoded, failed. quen's reader: object_table: object_table.tsv, every object with its type, creator and creation record."},
             }, "additionalProperties": false},
         }),
         json!({
@@ -390,7 +399,7 @@ fn locked<T>(
 fn extract(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     crate::ledger::object(args, &["capture_id", "path", "ops"])?;
     let config = session.config()?.clone();
-    let ops: Vec<&str> = match args.get("ops") {
+    let asked: Vec<&str> = match args.get("ops") {
         None => OPS.iter().map(|(op, ..)| *op).collect(),
         Some(Value::Array(asked)) => {
             let mut ops = Vec::new();
@@ -402,15 +411,21 @@ fn extract(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
                         "ops: {op} is not one of {}",
                         OPS.map(|(o, ..)| o).join(", ")
                     ))?;
-                if !ops.contains(&op.0) {
-                    ops.push(op.0);
-                }
+                ops.push(op.0);
             }
             ops
         }
         Some(_) => return Err("ops must be a list".to_string().into()),
     };
-    let needs_replayer = ops.iter().any(|op| op != &"shaders");
+    // In OPS' order, each op's inputs before it.
+    let ops: Vec<&str> = OPS
+        .iter()
+        .map(|(op, ..)| *op)
+        .filter(|op| asked.contains(op) || asked.iter().any(|a| inputs(a).contains(op)))
+        .collect();
+    let needs_replayer = ops
+        .iter()
+        .any(|op| OPS.iter().any(|(o, _, flag)| o == op && flag.is_some()));
     let replay = needs_replayer
         .then(|| replayer(&config, "ngfx_extract"))
         .transpose()?;
@@ -423,13 +438,33 @@ fn extract(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
         call.lap("capture");
         fs::create_dir_all(&t.out).map_err(|e| format!("{}: {e}", t.out.display()))?;
         let (mut results, mut failed) = (Vec::new(), Vec::new());
+        // The outputs so far, for the ops that read them, and the capture's Nsight version from its metadata.
+        let (mut files, mut nsight) = (HashMap::new(), None);
         for op in ops {
-            let result = match call.stopped() {
-                true => Err(call.stop_cause().to_owned()),
-                false => one(&config, &mut ledger, call, &t, op, replay.as_ref()),
+            let missing = inputs(op).iter().find(|i| !files.contains_key(*i));
+            let result = match (call.stopped(), missing) {
+                (true, _) => Err(call.stop_cause().to_owned()),
+                (_, Some(i)) => Err(format!("needs op {i}, which failed")),
+                _ => one(
+                    &config,
+                    &mut ledger,
+                    call,
+                    &t,
+                    op,
+                    replay.as_ref(),
+                    (&files, nsight.as_deref()),
+                ),
             };
             match result {
-                Ok(v) => results.push(v),
+                Ok(v) => {
+                    if let Some(file) = v["file"].as_str() {
+                        files.insert(op, PathBuf::from(file));
+                    }
+                    if let Some(v) = v["facts"]["nsight_version"].as_str() {
+                        nsight = Some(v.to_owned());
+                    }
+                    results.push(v);
+                }
                 Err(why) => {
                     failed.push(op);
                     results.push(json!({"op": op, "error": why}));
@@ -460,12 +495,14 @@ fn extract(session: &mut Session, call: &mut Call, args: &Value) -> Result<Field
     })
 }
 
-/// The extraction `op` of a capture whose sha256 is `target`: under ngfx-replay `version`'s flags, or quen's decoder.
+/// The extraction `op` of a capture whose sha256 is `target`: under ngfx-replay `version`'s flags, or quen's decoder,
+/// or quen's reader (checked against that ngfx-replay's lists).
 fn extraction<'a>(op: &'a str, version: Option<&'a str>, target: &'a str) -> Extraction<'a> {
     let flag = OPS
         .iter()
         .find(|(o, ..)| *o == op)
         .and_then(|(.., flag)| *flag);
+    let quen = Some(env!("CARGO_PKG_VERSION"));
     let (tool, tool_version, provider, parameters) = match flag {
         Some(flag) => (
             "ngfx_replay",
@@ -473,11 +510,17 @@ fn extraction<'a>(op: &'a str, version: Option<&'a str>, target: &'a str) -> Ext
             json!({"id": "ngfx_replay", "name": "NVIDIA Nsight Graphics ngfx-replay"}),
             json!({"args": [flag]}),
         ),
-        None => (
+        None if op == "shaders" => (
             "quen",
-            Some(env!("CARGO_PKG_VERSION")),
+            quen,
             json!({"id": "quen", "name": "quen's shader decoder"}),
             json!({"decoder": "lz4_dxbc", "revision": DECODER_REVISION}),
+        ),
+        None => (
+            "quen",
+            quen,
+            json!({"id": "quen", "name": "quen's capture reader"}),
+            json!({"reader": "ngfx_capture", "revision": READER_REVISION, "ngfx_replay": version}),
         ),
     };
     Extraction {
@@ -492,8 +535,17 @@ fn extraction<'a>(op: &'a str, version: Option<&'a str>, target: &'a str) -> Ext
     }
 }
 
+/// The family of an op's counts: facts read from decoded bytecode are static_re (playbook §2), the rest nsight's.
+fn family(op: &str) -> (&'static str, Tag) {
+    match op {
+        "shaders" => ("static_re", Tag::StaticRe),
+        _ => ("nsight", Tag::M),
+    }
+}
+
 /// One file-only op on `t`: read back when answered before for the same file, else run and recorded (its output's
-/// captures row, the extraction, its counts). What the result says of it.
+/// captures row, the extraction, its counts). What the result says of it. `earlier`: the outputs of this call's
+/// earlier ops, and the capture's Nsight version.
 fn one(
     config: &Config,
     ledger: &mut Ledger,
@@ -501,8 +553,9 @@ fn one(
     t: &Target,
     op: &str,
     replay: Option<&(PathBuf, Option<String>)>,
+    earlier: (&HashMap<&str, PathBuf>, Option<&str>),
 ) -> Result<Value, String> {
-    let (_, name, _) = OPS
+    let (_, name, flag) = OPS
         .into_iter()
         .find(|(o, ..)| *o == op)
         .ok_or("unknown op")?;
@@ -516,7 +569,8 @@ fn one(
         }
         _ => {
             let file = free(ledger, &root, &t.out, name)?;
-            let (out, counts) = run(op, &file, t, replay.map(|r| r.0.as_path()), call)?;
+            let replay_exe = replay.map(|r| r.0.as_path());
+            let (out, counts) = run(op, &file, t, replay_exe, earlier.0, call)?;
             let output = row(
                 &root,
                 &file,
@@ -535,11 +589,7 @@ fn one(
                         ..x.clone()
                     };
                     let extraction = l.add_extraction(&x)?;
-                    // Facts read from decoded bytecode are static_re (playbook §2); the call and object lists nsight's.
-                    let (family, tag) = match op {
-                        "shaders" => ("static_re", Tag::StaticRe),
-                        _ => ("nsight", Tag::M),
-                    };
+                    let (family, tag) = family(op);
                     let mut measured = Vec::new();
                     for (metric, value) in &counts {
                         measured.push(l.add_measurement(&Measurement {
@@ -553,7 +603,7 @@ fn one(
                             tag,
                             run_id: None,
                             note: Some(note.clone()),
-                            extraction_id: (op == "shaders").then_some(extraction),
+                            extraction_id: (family == "static_re").then_some(extraction),
                             world: None,
                         })?);
                     }
@@ -585,7 +635,7 @@ fn one(
                 .map_err(|e| e.to_string())?;
             out["facts"] = json!(facts);
         }
-        "functions" | "objects" | "shaders" => {
+        _ => {
             let sql = "SELECT metric, value FROM measurements WHERE capture_id = ?1 ORDER BY id";
             let rows = ledger
                 .query(sql, &[json!(output)], Duration::from_secs(10))
@@ -595,14 +645,49 @@ fn one(
                 .into_iter()
                 .filter_map(|r| Some((r.first()?.as_str()?.to_owned(), r.get(1)?.clone())))
                 .collect();
-            out["counts"] = json!(counts);
+            if !counts.is_empty() {
+                out["counts"] = json!(counts);
+            }
         }
-        _ => {}
     }
-    if op == "shaders" {
+    if flag.is_none() {
         out["decoder_proven_on"] = json!(ngfx::DECODER_PROVEN_ON);
+        if earlier.1.is_some_and(|v| v != ngfx::DECODER_PROVEN_ON) {
+            out["note"] = json!(format!(
+                "decoder proven on Nsight {} only",
+                ngfx::DECODER_PROVEN_ON
+            ));
+        }
     }
     Ok(out)
+}
+
+/// The capture's own file, open for quen's reader.
+fn capture(t: &Target) -> Result<ngfx_capture::Capture<BufReader<File>>, String> {
+    let file = File::open(&t.file).map_err(|e| format!("{}: {e}", t.file.display()))?;
+    ngfx_capture::Capture::open(BufReader::new(file))
+}
+
+/// The text of an earlier op's output.
+fn input(earlier: &HashMap<&str, PathBuf>, op: &str) -> Result<String, String> {
+    let file = earlier.get(op).ok_or(format!("no {op} output"))?;
+    fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))
+}
+
+/// This machine's values of quen-core's `IDENTITY` (a quen launch's allow-list leaves some out of a game's
+/// environment, so a capture's own environment can't name them all).
+fn local() -> Vec<(&'static str, String)> {
+    ngfx::IDENTITY
+        .iter()
+        .filter_map(|k| Some((*k, std::env::var(k).ok()?)))
+        .collect()
+}
+
+/// `text` with this machine's identity scrubbed, as `%USERPROFILE%`, ...
+fn scrubbed(text: &str) -> String {
+    let local = local();
+    let local: Vec<(&str, &str)> = local.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    ngfx::scrub_identity(text, &ngfx::identity(&local, &[]))
 }
 
 /// Runs `op` on `t`'s capture into `file`: the result's own fields and the counts to record.
@@ -611,6 +696,7 @@ fn run(
     file: &Path,
     t: &Target,
     replay: Option<&Path>,
+    earlier: &HashMap<&str, PathBuf>,
     call: &mut Call,
 ) -> Result<(Value, ngfx::Counts), String> {
     let write =
@@ -624,10 +710,7 @@ fn run(
     match op {
         "metadata" => {
             let raw = printed(&["--metadata".into()], call)?;
-            let local: Vec<(&str, String)> = ngfx::IDENTITY
-                .iter()
-                .filter_map(|k| Some((*k, std::env::var(k).ok()?)))
-                .collect();
+            let local = local();
             let local: Vec<(&str, &str)> = local.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let cleaned = ngfx::clean_metadata(&String::from_utf8_lossy(&raw), &local)?;
             drop(raw);
@@ -670,26 +753,37 @@ fn run(
             write(&raw)?;
             Ok((json!({}), Vec::new()))
         }
+        "object_table" => {
+            call.progress("reading the capture's object table");
+            let mut capture = capture(t)?;
+            let objects = capture.objects()?;
+            let listed = ngfx_capture::listed(&input(earlier, "objects")?)?;
+            let names = ngfx_capture::check_objects(&objects, &listed)?;
+            let table = ngfx_capture::object_table(&mut capture, &objects, &names)?;
+            write(scrubbed(&table).as_bytes())?;
+            let counts = vec![("capture_object_records", objects.len() as u64)];
+            Ok((json!({}), counts))
+        }
         _ => {
             call.progress("decoding the capture's shaders");
-            let capture = File::open(&t.file).map_err(|e| format!("{}: {e}", t.file.display()))?;
-            let scan =
-                ngfx::scan_shaders(capture).map_err(|e| format!("{}: {e}", t.file.display()))?;
+            let scan = capture(t)?.shaders()?;
             let dir = t.out.join("shaders");
             fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            let mut tsv = String::from("hash\tstage\tmodel\tbytes\tparts\n");
+            let mut tsv = String::from("hash\tstage\tmodel\tbytes\tparts\tchunks\n");
             for s in &scan.shaders {
                 let path = dir.join(format!("{}.dxbc", s.hash));
                 if fs::metadata(&path).map(|m| m.len()).ok() != Some(s.bytes.len() as u64) {
                     fs::write(&path, &s.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
                 }
                 let parts = s.parts.join(",");
+                let chunks: Vec<String> = s.chunks.iter().map(u64::to_string).collect();
                 tsv += &format!(
-                    "{}\t{}\t{}\t{}\t{parts}\n",
+                    "{}\t{}\t{}\t{}\t{parts}\t{}\n",
                     s.hash,
                     s.stage,
                     s.model,
-                    s.bytes.len()
+                    s.bytes.len(),
+                    chunks.join(",")
                 );
             }
             write(tsv.as_bytes())?;
@@ -1009,7 +1103,8 @@ mod tests {
             game_exe: "quen-test-no-such-game.exe".into(),
             ..Config::default()
         };
-        // One SHEX container (compute 5_1), stored as an LZ4 block of literals only, in noise.
+        // One SHEX container (compute 5_1), stored as chunk 7 of a container: `nlyp`, the chunk after its header, the
+        // footer repeating the header, the trailer.
         let mut c = b"DXBC".to_vec();
         c.extend([3u8; 16]);
         c.extend(1u32.to_le_bytes());
@@ -1020,10 +1115,22 @@ mod tests {
         c.extend(8u32.to_le_bytes());
         c.extend(0x0005_0051u32.to_le_bytes());
         c.extend([0u8; 4]);
-        let mut file = vec![0x5Au8; 100];
-        file.extend([0xF0, 52 - 15]);
+        let mut header = b"elif".to_vec();
+        for v in [1u32, 0, 0] {
+            header.extend(v.to_le_bytes());
+        }
+        for v in [0u64, 52, 7, 4] {
+            header.extend(v.to_le_bytes());
+        }
+        let mut file = b"nlyp".to_vec();
+        file.extend(&header);
         file.extend(&c);
-        file.extend([0x5Au8; 100]);
+        let footer = file.len() as u64;
+        file.extend(&header);
+        file.extend(b"enod");
+        file.extend(41u32.to_le_bytes());
+        file.extend(1u64.to_le_bytes());
+        file.extend(footer.to_le_bytes());
         let source = dir.join(r"elsewhere\synthetic frame.ngfx-capture");
         fs::write(&source, &file).unwrap();
 
@@ -1051,7 +1158,7 @@ mod tests {
         assert_eq!(fs::read(shader).unwrap(), c);
         let tsv = fs::read_to_string(out.join("shaders.tsv")).unwrap();
         assert!(
-            tsv.ends_with(&format!("{}\tcompute\t5_1\t52\tSHEX\n", "03".repeat(16))),
+            tsv.ends_with(&format!("{}\tcompute\t5_1\t52\tSHEX\t7\n", "03".repeat(16))),
             "{tsv}"
         );
         assert_eq!(fs::read(&source).unwrap(), file, "the original unchanged");
@@ -1120,16 +1227,16 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(imports, 1, "no second import folder");
-        // Without ngfx in the config, the replayer's ops are refused with needs.
-        let out = run(
-            "ngfx_extract",
-            json!({"capture_id": 1, "ops": ["metadata"]}),
-        );
-        assert_eq!(
-            out["needs"][0]["dependency"],
-            doctor::NGFX_REPLAY.name,
-            "{out}"
-        );
+        // Without ngfx in the config, the replayer's ops are refused with needs, and a reader op that checks against
+        // them too.
+        for ops in [json!(["metadata"]), json!(["object_table"])] {
+            let out = run("ngfx_extract", json!({"capture_id": 1, "ops": ops}));
+            assert_eq!(
+                out["needs"][0]["dependency"],
+                doctor::NGFX_REPLAY.name,
+                "{out}"
+            );
+        }
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
     }
 }

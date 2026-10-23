@@ -337,15 +337,17 @@ Only M, O and static_re count towards proven. Never tag an inference M.
   - `functions`: `functions.json` (index, name, thread per call); counts of events, draws, indexed draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches;
   - `objects`: `objects.json` (uid, type, creator, name per object); counts of objects, resources, acceleration structures, pipeline states, state objects;
   - `errors`: `errors.txt`, the capture's logged errors;
-  - `shaders`: `shaders\<hash>.dxbc` and `shaders.tsv` (hash, stage, model, bytes, parts), decoded by quen from the file; `found`, `decoded`, `failed` (DXBC hits that didn't decode); proven on Nsight 2026.3.1 captures only.
+  - `shaders`: `shaders\<hash>.dxbc` and `shaders.tsv` (hash, stage, model, bytes, parts, chunks: the capture's chunks that hold it), read by quen from the capture's shader chunks; `found`, `decoded`, `failed` (chunks starting with `DXBC` that aren't a valid container);
+  - `object_table`: `object_table.tsv`, the file's own object table (uid, name, type, api and type codes, creator, `chunk:offset:bytes` of the creation record and of the state, the record's first 2,048 bytes as hex with text runs in quotes).
 
   An op answered before for the same file returns `cached: true`, without running ngfx-replay.
-- **Not in any output:** the calls' arguments, per-call GPU times, the objects' properties (e.g. a pipeline's shader byte length) and the ray-tracing instance tables. quen has no step in Nsight's window.
+- **quen's reader** (`object_table`) reads the capture file itself and checks it against ngfx-replay's lists of the same capture (`objects`: the same objects, one type code per type name). Those ops are added to `ops` when missing. A file that doesn't line up fails with `layout not recognised`. Proven on Nsight 2026.3.1 captures only: for another version the op's result has a `note`.
+- **Not in any output:** the calls' arguments, per-call GPU times, the pipelines' shaders and the ray-tracing instance tables. quen has no step in Nsight's window.
 - **`ngfx_replay`** replays a capture on the GPU, about a minute. Tell the user first and pass `user_ok`; the client asks them on every call. It needs `ngfx_extract` `metadata` first, and is refused while a session is live or the game runs.
   - `perf`: 20 replays, hidden; `replay_image_error` (iteration 0's error against the captured frame: how complete the capture is), `replay_gpu_frame_ms` and `replay_cpu_frame_ms` (medians of the later replays).
   - `gputrace`: GPU Trace around 10 replays (`ngfx_args` from the config), may show a window; `gpu_frame_ms` from `FRAME.xls`, clocks locked to base: relative only.
   - A replay is not the game: compare replays of one capture only, never with PresentMon or a boot.
-- **Rows:** each output file is a captures row (method `ngfx_extract`, on the capture's boot; `ngfx_replay`'s with no boot); each `ngfx_extract` op an extraction (tool `ngfx_replay`, or `quen` for the shaders); counts `capture_*` as measurements (unit `count`): calls and objects `nsight` M, shaders `static_re` with `extraction_id`; replay numbers `nsight` M, no boot.
+- **Rows:** each output file is a captures row (method `ngfx_extract`, on the capture's boot; `ngfx_replay`'s with no boot); each `ngfx_extract` op an extraction (tool `ngfx_replay`, or `quen` for the shaders and the reader's tables); counts `capture_*` as measurements (unit `count`): calls, objects and `object_table` `nsight` M, shaders `static_re` with `extraction_id`; replay numbers `nsight` M, no boot.
 
 ### RenoDX devkit MCP
 
