@@ -29,7 +29,7 @@ use crate::win::{self, Child, Job};
 use crate::{doctor, profile};
 
 /// The file-only operations, in their default order: the output file and ngfx-replay's option (none: quen's reader).
-const OPS: [(&str, &str, Option<&str>); 7] = [
+const OPS: [(&str, &str, Option<&str>); 8] = [
     ("metadata", "metadata.json", Some("--metadata")),
     ("screenshot", "final.png", Some("--metadata-screenshot")),
     ("functions", "functions.json", Some("--metadata-functions")),
@@ -37,12 +37,13 @@ const OPS: [(&str, &str, Option<&str>); 7] = [
     ("errors", "errors.txt", Some("--metadata-logs-errors")),
     ("shaders", "shaders.tsv", None),
     ("object_table", "object_table.tsv", None),
+    ("pipelines", "pipelines.tsv", None),
 ];
 /// The ops a reader op checks against or reads from (ngfx-replay's lists of the same capture, the metadata's Nsight
 /// version): run first, in the same call.
 fn inputs(op: &str) -> &'static [&'static str] {
     match op {
-        "object_table" => &["metadata", "objects"],
+        "object_table" | "pipelines" => &["metadata", "objects"],
         _ => &[],
     }
 }
@@ -84,7 +85,7 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "capture_id": capture_id,
                 "path": {"type": "string", "description": "instead of capture_id: an absolute path to a .ngfx-capture (under the capture root, or imported by a hard link)"},
-                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all. metadata: metadata.json, cleaned (variable names, Nsight's own knobs, user paths as %USERPROFILE%, no computer or user name); facts: frame, resolution, API, features, Nsight version. screenshot: final.png, the frame as presented. functions: functions.json; counts of events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches. objects: objects.json; counts by type. errors: errors.txt, logged errors. shaders: shaders\\<hash>.dxbc, shaders.tsv (the shader chunks); found, decoded, failed. quen's reader: object_table: object_table.tsv, every object with its type, creator and creation record."},
+                "ops": {"type": "array", "items": {"type": "string", "enum": OPS.map(|(op, ..)| op)}, "description": "default all. metadata: metadata.json, cleaned (variable names, Nsight's own knobs, user paths as %USERPROFILE%, no computer or user name); facts: frame, resolution, API, features, Nsight version. screenshot: final.png, the frame as presented. functions: functions.json; counts of events, draws, indirect calls, dispatches, acceleration-structure builds, ray dispatches. objects: objects.json; counts by type. errors: errors.txt, logged errors. shaders: shaders\\<hash>.dxbc, shaders.tsv (the shader chunks); found, decoded, failed. quen's reader: object_table: object_table.tsv, every object with its type, creator and creation record. pipelines: pipelines.tsv, each pipeline state and state object with the shaders its creation record names (stage, chunk, hash)."},
             }, "additionalProperties": false},
         }),
         json!({
@@ -538,7 +539,7 @@ fn extraction<'a>(op: &'a str, version: Option<&'a str>, target: &'a str) -> Ext
 /// The family of an op's counts: facts read from decoded bytecode are static_re (playbook §2), the rest nsight's.
 fn family(op: &str) -> (&'static str, Tag) {
     match op {
-        "shaders" => ("static_re", Tag::StaticRe),
+        "shaders" | "pipelines" => ("static_re", Tag::StaticRe),
         _ => ("nsight", Tag::M),
     }
 }
@@ -753,15 +754,28 @@ fn run(
             write(&raw)?;
             Ok((json!({}), Vec::new()))
         }
-        "object_table" => {
-            call.progress("reading the capture's object table");
+        "object_table" | "pipelines" => {
+            call.progress(&format!("reading the capture's {op}"));
             let mut capture = capture(t)?;
             let objects = capture.objects()?;
             let listed = ngfx_capture::listed(&input(earlier, "objects")?)?;
             let names = ngfx_capture::check_objects(&objects, &listed)?;
-            let table = ngfx_capture::object_table(&mut capture, &objects, &names)?;
-            write(scrubbed(&table).as_bytes())?;
-            let counts = vec![("capture_object_records", objects.len() as u64)];
+            if op == "object_table" {
+                let table = ngfx_capture::object_table(&mut capture, &objects, &names)?;
+                write(scrubbed(&table).as_bytes())?;
+                return Ok((
+                    json!({}),
+                    vec![("capture_object_records", objects.len() as u64)],
+                ));
+            }
+            let shaders = capture.shaders()?;
+            let j = ngfx_capture::pipelines(&mut capture, &objects, &names, &shaders)?;
+            write(scrubbed(&j.tsv).as_bytes())?;
+            let counts = vec![
+                ("capture_pipelines", j.pipelines as u64),
+                ("capture_pipelines_with_shaders", j.with_shaders as u64),
+                ("capture_pipeline_shader_links", j.links as u64),
+            ];
             Ok((json!({}), counts))
         }
         _ => {

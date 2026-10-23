@@ -143,12 +143,12 @@ impl<R: Read + Seek> Capture<R> {
             .ok_or_else(|| layout(format!("chunk {id} doesn't decode")))
     }
 
-    /// The chunks `ids` read into memory once, for [`Capture::bytes`].
-    pub fn load(&mut self, ids: impl IntoIterator<Item = u64>) -> Result<(), String> {
-        for id in ids {
-            if !self.loaded.contains_key(&id) {
-                let b = self.chunk(id)?;
-                self.loaded.insert(id, b);
+    /// The chunks `refs` name read into memory once, for [`Capture::bytes`].
+    pub fn load(&mut self, refs: impl IntoIterator<Item = Ref>) -> Result<(), String> {
+        for r in refs {
+            if r.len > 0 && !self.loaded.contains_key(&r.chunk) {
+                let b = self.chunk(r.chunk)?;
+                self.loaded.insert(r.chunk, b);
             }
         }
         Ok(())
@@ -156,6 +156,9 @@ impl<R: Read + Seek> Capture<R> {
 
     /// The bytes `r` names, in a chunk [`Capture::load`] read; None outside it.
     pub fn bytes(&self, r: Ref) -> Option<&[u8]> {
+        if r.len == 0 {
+            return Some(&[]);
+        }
         let end = r.offset.checked_add(r.len)?;
         self.loaded
             .get(&r.chunk)?
@@ -414,12 +417,7 @@ pub fn object_table<R: Read + Seek>(
     objects: &[Object],
     names: &HashMap<u64, &Listed>,
 ) -> Result<String, String> {
-    capture.load(
-        objects
-            .iter()
-            .map(|o| o.record.chunk)
-            .collect::<HashSet<_>>(),
-    )?;
+    capture.load(objects.iter().map(|o| o.record))?;
     let mut rows: Vec<&Object> = objects.iter().collect();
     rows.sort_by_key(|o| o.uid);
     let mut out =
@@ -446,6 +444,76 @@ pub fn object_table<R: Read + Seek>(
         );
     }
     Ok(out)
+}
+
+/// What [`pipelines`] joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Joined {
+    /// `pipelines.tsv`.
+    pub tsv: String,
+    /// PipelineStates and StateObjects, those that name a shader, and the shaders named in all.
+    pub pipelines: usize,
+    pub with_shaders: usize,
+    pub links: usize,
+}
+
+/// Each pipeline's shaders (headless research §3.4): a PipelineState's or StateObject's creation record names each of
+/// its shaders by its chunk's id, a u64, so every u64 in the record (at any offset) that is the id of a chunk holding a
+/// shader is one of its shaders. `pipelines.tsv` by uid, in the record's order: the pipeline's uid, name and type, and
+/// each shader's stage, model, chunk, hash (its file `shaders\<hash>.dxbc`) and bytes; `-` for a pipeline that names
+/// none.
+pub fn pipelines<R: Read + Seek>(
+    capture: &mut Capture<R>,
+    objects: &[Object],
+    names: &HashMap<u64, &Listed>,
+    shaders: &ShaderScan,
+) -> Result<Joined, String> {
+    let by_chunk: HashMap<u64, &Shader> = shaders
+        .shaders
+        .iter()
+        .flat_map(|s| s.chunks.iter().map(move |c| (*c, s)))
+        .collect();
+    let mut rows: Vec<(&Object, &Listed)> = objects
+        .iter()
+        .filter_map(|o| Some((o, *names.get(&o.uid)?)))
+        .filter(|(_, l)| matches!(l.type_name.as_str(), "PipelineState" | "StateObject"))
+        .collect();
+    rows.sort_by_key(|(o, _)| o.uid);
+    capture.load(rows.iter().map(|(o, _)| o.record))?;
+    let mut joined = Joined {
+        tsv: "uid\tname\ttype\tstage\tmodel\tchunk\thash\tbytes\n".into(),
+        pipelines: rows.len(),
+        ..Joined::default()
+    };
+    for (o, l) in rows {
+        let record = capture
+            .bytes(o.record)
+            .ok_or_else(|| layout(format!("object {}'s creation record", o.uid)))?;
+        let mut named: Vec<u64> = Vec::new();
+        for k in 0..record.len().saturating_sub(7) {
+            let id = u64_at(record, k).unwrap();
+            if by_chunk.contains_key(&id) && !named.contains(&id) {
+                named.push(id);
+            }
+        }
+        let head = format!("{}\t{}\t{}", o.uid, l.object_name, l.type_name);
+        if named.is_empty() {
+            joined.tsv += &format!("{head}\t-\t-\t-\t-\t-\n");
+        }
+        joined.with_shaders += usize::from(!named.is_empty());
+        joined.links += named.len();
+        for id in named {
+            let s = by_chunk[&id];
+            joined.tsv += &format!(
+                "{head}\t{}\t{}\t{id}\t{}\t{}\n",
+                s.stage,
+                s.model,
+                s.hash,
+                s.bytes.len()
+            );
+        }
+    }
+    Ok(joined)
 }
 
 #[cfg(test)]
@@ -678,6 +746,64 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn pipelines_name_their_shaders_by_chunk() {
+        let (a, b) = (dxbc(1, 64), dxbc(2, 100));
+        // PipelineState 311: chunk 8 at an odd offset, then 7 twice; StateObject 400: none; a resource naming 7.
+        let mut pso = vec![0xfa, 3];
+        for id in [8u64, 7, 7] {
+            pso.extend(id.to_le_bytes());
+            pso.push(0);
+        }
+        let records = [pso.clone(), vec![0; 16], 7u64.to_le_bytes().to_vec()].concat();
+        let r = |offset: usize, len: usize| Ref {
+            chunk: 3,
+            offset: offset as u64,
+            len: len as u64,
+        };
+        let n = pso.len();
+        let table = [
+            object(400, 3, 24, r(n, 16)),
+            object(311, 3, 9, r(0, n)),
+            object(5, 3, 6, r(n + 16, 8)),
+        ]
+        .concat();
+        let f = file(&[
+            (1, root(2, 9), true),
+            (2, table, false),
+            (3, records, true),
+            (7, a, true),
+            (8, b, false),
+        ]);
+        let mut c = Capture::open(Cursor::new(f)).unwrap();
+        let objs = c.objects().unwrap();
+        let list = listed(&listed_json(&[
+            (5, "Resource", "Resource_5"),
+            (311, "PipelineState", "PipelineState_311"),
+            (400, "StateObject", "Rt"),
+        ]))
+        .unwrap();
+        let names = check_objects(&objs, &list).unwrap();
+        let scan = c.shaders().unwrap();
+        let j = pipelines(&mut c, &objs, &names, &scan).unwrap();
+        assert_eq!(
+            (j.pipelines, j.with_shaders, j.links),
+            (2, 1, 2),
+            "{}",
+            j.tsv
+        );
+        let lines: Vec<&str> = j.tsv.lines().skip(1).collect();
+        let (h1, h2) = ("01".repeat(16), "02".repeat(16));
+        assert_eq!(
+            lines,
+            [
+                format!("311\tPipelineState_311\tPipelineState\tcompute\t5_1\t8\t{h2}\t148"),
+                format!("311\tPipelineState_311\tPipelineState\tcompute\t5_1\t7\t{h1}\t112"),
+                "400\tRt\tStateObject\t-\t-\t-\t-\t-".into(),
+            ]
+        );
+    }
+
     /// A hand check on a real capture, read-only: `QUEN_NGFX_CAPTURE` (the file), `QUEN_NGFX_FUNCTIONS` and
     /// `QUEN_NGFX_OBJECTS` (ngfx-replay's `--metadata-functions` and `--metadata-objects` of it), `QUEN_NGFX_OUT` (a
     /// folder outside the repo for the tables). Prints counts only. `cargo test -p quen-core --lib hand_check --
@@ -710,6 +836,12 @@ pub(crate) mod tests {
             scan.failed,
             scan.duplicates
         );
+        let j = pipelines(&mut c, &objs, &names, &scan).unwrap();
+        println!(
+            "pipelines {} with shaders {} links {}",
+            j.pipelines, j.with_shaders, j.links
+        );
+        std::fs::write(out.join("pipelines.tsv"), j.tsv).unwrap();
     }
 
     #[test]
