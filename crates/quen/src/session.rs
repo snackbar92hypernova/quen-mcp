@@ -1646,8 +1646,7 @@ impl<'a> Session<'a> {
         if let Some(game_dir) = &config.game_dir {
             // The mods that loaded, now that the boot has parked its set, the devkit among them when it loaded.
             let devkit = config.devkit.as_deref().filter(|_| devkit);
-            let (inv, renodx) = (spec.vortex.as_ref(), config.renodx_addon.as_deref());
-            let set = w3::mod_set(game_dir, &mut self.cache, inv, renodx, devkit)
+            let set = w3::mod_set(game_dir, &mut self.cache, spec.vortex.as_ref(), devkit)
                 .map_err(|e| format!("mod set: {e}"))
                 .and_then(|entries| {
                     if let Some(inv) = &spec.vortex {

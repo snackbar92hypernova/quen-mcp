@@ -109,10 +109,10 @@ pub fn tidy_parking(game_dir: &Path) {
 /// With Vortex's records (`inv`), also what they name a mod's: its other files in bin (kind `bin`, by file name, its
 /// config its `<stem>.ini`; an ini whose stem another file in bin has is that file's config), its menu XMLs (kind
 /// `menu`, by stem) and its folders in `DLC` (kind `dlc`).
-/// The RenoDX add-on (`renodx`, the config's `renodx_addon`) also has RenoDX's own sections of ReShade.ini, its keys
-/// recorded as `<section>.<key>`: `[renodx]` (the global settings under RenoDX's default `global_name`), and
-/// `[renodx-preset1]` and `[<name>-preset1]` (preset 1 under the default name and under the add-on's own, which our
-/// build sets). renodx's utils/settings.hpp loads preset 1 at every start: the preset slider's index isn't saved.
+/// An add-on's config also has ReShade.ini `[<name>-preset1]` (RenoDX's preset 1 under the add-on's own `global_name`,
+/// which our build sets), and ReShade's has `[renodx]` and `[renodx-preset1]` (the global settings and preset 1 under
+/// RenoDX's default `global_name`, no one add-on's); these keys are recorded as `<section>.<key>`. renodx's
+/// utils/settings.hpp loads preset 1 at every start: the preset slider's index isn't saved.
 /// `devkit`: the devkit's path relative to bin on a boot that loaded it (ReShade.ini `[ADDON] LoadFromDllMain`), an
 /// add-on entry by its stem, unless one of that name is loaded from bin.
 /// ponytail: DLC folders outside Vortex aren't fingerprinted (4.04 kept the game's own DLCs there, GBs).
@@ -120,7 +120,6 @@ pub fn mod_set(
     game_dir: &Path,
     cache: &mut HashCache,
     inv: Option<&Inventory>,
-    renodx: Option<&str>,
     devkit: Option<&str>,
 ) -> io::Result<Vec<ModEntry>> {
     let bin = boot::bin_dir(game_dir);
@@ -207,16 +206,14 @@ pub fn mod_set(
                     qualify: false,
                 };
                 let mut config = vec![own, reshade(name.clone(), false)];
-                if kind == Kind::Addon && renodx.is_some_and(|r| r.eq_ignore_ascii_case(&lower)) {
-                    let sections = [
-                        "renodx".into(),
-                        "renodx-preset1".into(),
-                        format!("{name}-preset1"),
-                    ];
-                    config.extend(sections.map(|s| reshade(s, true)));
+                if kind == Kind::Addon {
+                    config.push(reshade(format!("{name}-preset1"), true));
                 }
                 config
             }
+            Kind::ReShade => ["renodx", "renodx-preset1"]
+                .map(|s| reshade(s.into(), true))
+                .into(),
             Kind::Bin if !lower.ends_with(".ini") => vec![ConfigSource {
                 path: bin.join(Path::new(&name).with_extension("ini")),
                 section: None,
@@ -477,25 +474,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
     }
 
-    /// The RenoDX add-on's entry holds RenoDX's sections of ReShade.ini, key by section, and no other add-on's does;
-    /// the devkit is an entry only on a boot that loaded it, and never a second entry of one name.
+    /// ReShade's entry holds RenoDX's default sections of ReShade.ini and each add-on's entry its own preset 1, key by
+    /// section, with nothing in quen's config; the devkit is an entry only on a boot that loaded it, and never a second
+    /// entry of one name.
     #[test]
     fn renodx_s_sections_and_the_devkit_are_in_the_mod_set() {
         let dir = std::env::temp_dir().join(format!("quen-w3-mod-set-{}", std::process::id()));
         let bin = boot::bin_dir(&dir);
         fs::create_dir_all(bin.join("devkit")).unwrap();
+        fs::write(bin.join("dxgi.dll"), "reshade").unwrap();
         fs::write(bin.join("renodx-synthetic.addon64"), "renodx").unwrap();
         fs::write(bin.join("Other.addon64"), "other").unwrap();
         fs::write(bin.join(r"devkit\renodx-devkit.addon64"), "devkit").unwrap();
         let ini = |peak: &str| {
             format!(
                 "[renodx]\nSettingsMode=1\n[renodx-preset1]\nToneMapPeakNits={peak}\nSettingsMode=2\n\
-                 [renodx-synthetic-preset1]\nToneMapType=3\n[Other]\nMode=1\n"
+                 [renodx-synthetic-preset1]\nToneMapType=3\n[Other]\nMode=1\n[Other-preset1]\nMode=2\n"
             )
         };
         fs::write(bin.join("ReShade.ini"), ini("1000")).unwrap();
-        let addon = Some("renodx-synthetic.addon64");
-        let set = |devkit| mod_set(&dir, &mut HashCache::default(), None, addon, devkit).unwrap();
+        let set = |devkit| mod_set(&dir, &mut HashCache::default(), None, devkit).unwrap();
         let entry = |set: &[ModEntry], id: &str| set.iter().find(|e| e.id() == id).cloned();
         let values = |pairs: &[(&str, &str)]| {
             let pairs = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string()));
@@ -503,18 +501,24 @@ mod tests {
         };
         let before = set(None);
         assert_eq!(
-            entry(&before, "addon:renodx-synthetic")
-                .unwrap()
-                .config_values,
+            entry(&before, "reshade:ReShade").unwrap().config_values,
             values(&[
                 ("renodx.SettingsMode", "1"),
                 ("renodx-preset1.SettingsMode", "2"),
                 ("renodx-preset1.ToneMapPeakNits", "1000"),
-                ("renodx-synthetic-preset1.ToneMapType", "3"),
             ])
         );
+        assert_eq!(
+            entry(&before, "addon:renodx-synthetic")
+                .unwrap()
+                .config_values,
+            values(&[("renodx-synthetic-preset1.ToneMapType", "3")])
+        );
         let other = entry(&before, "addon:Other").unwrap();
-        assert_eq!(other.config_values, values(&[("Mode", "1")]));
+        assert_eq!(
+            other.config_values,
+            values(&[("Mode", "1"), ("Other-preset1.Mode", "2")])
+        );
         assert_eq!(entry(&before, "addon:renodx-devkit"), None);
 
         fs::write(bin.join("ReShade.ini"), ini("800")).unwrap();
@@ -527,7 +531,7 @@ mod tests {
         let [change] = &d.config_changed[..] else {
             panic!("{:?}", d.config_changed)
         };
-        assert_eq!(change.entry, "addon:renodx-synthetic");
+        assert_eq!(change.entry, "reshade:ReShade");
         assert_ne!(change.before, change.after);
         let peak = [Some("1000".to_string()), Some("800".to_string())];
         assert_eq!(

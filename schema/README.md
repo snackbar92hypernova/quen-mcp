@@ -117,8 +117,8 @@ from schema 15 `bin` (another file in bin a Vortex mod deployed, e.g. `dsound.dl
 (a Vortex mod's menu XML; its name is the file's stem) (rows imported from schema 1 may keep an older free-text kind). `parked` 1: the mod was moved out for the boot, so it didn't load. `home`: where it
 lives, relative to the game folder (rows written before 2026-10-18 hold the absolute path). `content_hash`: its build (a file's sha256, or a folder's tree hash). `file_count`, `bytes`.
 `config_hash`: the hash of its config files; `config_values` (JSON object): the parsed config keys that change its
-behaviour. The RenoDX add-on's entry (quen's config `renodx_addon`) also holds ReShade.ini `[renodx]`,
-`[renodx-preset1]` and `[<name>-preset1]`, each key as `<section>.<key>`. A boot that loaded the devkit has it as kind
+behaviour. The `reshade` entry also holds ReShade.ini `[renodx]` and `[renodx-preset1]`, and every `addon` entry
+`[<name>-preset1]`, each key as `<section>.<key>`. A boot that loaded the devkit has it as kind
 `addon`, its name the file's stem, without config. `version_label` and `provenance` (`git_commit`, `nexus_file`, from
 schema 16 `other`, or `unknown`): the label from mod_versions, if the build has one.
 

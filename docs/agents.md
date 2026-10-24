@@ -590,7 +590,7 @@ EXCEPT
 SELECT kind, name, content_hash, config_hash, parked FROM mod_set_entries WHERE mod_set_id = ?2
 ```
 
-The RenoDX add-on's entry (`renodx_addon`) also records ReShade.ini `[renodx]`, `[renodx-preset1]` and `[<its stem>-preset1]`, in `config_values` as `<section>.<key>`.
+The ReShade entry also records ReShade.ini `[renodx]` and `[renodx-preset1]`, and every add-on's entry `[<its stem>-preset1]`, in `config_values` as `<section>.<key>`.
 
 **Open questions:**
 - Claims not yet proven: `SELECT * FROM claims_status WHERE status = 'open' AND NOT proven`.
