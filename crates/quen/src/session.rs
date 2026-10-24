@@ -377,7 +377,8 @@ pub(crate) struct Live {
     pub(crate) patches: RefCell<Vec<(SystemTime, Value)>>,
     /// When the game was started: a state log older than this is a past launch's.
     pub(crate) launched: SystemTime,
-    /// `renderdoc:NAME` / `nsys:NAME` / `ngfx:NAME` / `tracy:NAME`, when the game runs under a profiler.
+    /// `renderdoc:NAME` / `nsys:NAME` / `ngfx:NAME` / `ngfx-capture:NAME` / `tracy:NAME`, when the game runs under a
+    /// profiler.
     pub(crate) profiler: Option<String>,
     /// A tracy launch's capture tool connected (boot::play): the end lets the game go first, so the tool writes.
     pub(crate) tracy_connected: Cell<bool>,
@@ -1968,6 +1969,16 @@ impl<'a> Session<'a> {
         if let Some(wait) = saves_quiet(&live.job, Some(&live.saves)) {
             fields.insert("saves_wait".into(), wait);
             call.lap("saves");
+        }
+        // An ngfx-capture launch's captures not yet recorded, each once it holds still: before the kill, which could
+        // cut one short.
+        if let Some(ngfx) = self
+            .config()
+            .ok()
+            .and_then(|c| profile::ngfx_end(c, &live, call))
+        {
+            fields.insert("ngfx".into(), ngfx);
+            call.lap("ngfx");
         }
         let game_exe = self
             .config()

@@ -185,6 +185,7 @@ Captures can grow large, so quen reports the capture folder's size against a bud
 A launch can attach a profiler through a launch profile, whose file changes are ordinary journaled steps and whose conditions go on the boot row:
 - **RenderDoc.** The game loads Direct3D 12 through NVIDIA Streamline's interposer, which hides the calls from RenderDoc. quen refuses unless the game's interposer is NVIDIA's signed original, swaps in a patched development build for the session, and afterwards checks that the original is back by sha256 and signature.
 - **Nsight Systems and Nsight Graphics GPU Trace.** ReShade is parked for both; GPU Trace locks the GPU clocks, and the boot is flagged so.
+- **Nsight Graphics frame captures.** The one capture that keeps ray tracing and path tracing on. ReShade is parked; quen presses the capture key, waits for the file and records it, and refuses the launch until Nsight asked its own first-start question.
 - **Tracy.** The instrumentation is built into quen's own ASI and stays dormant (no hook, thread or socket) in every other launch. The launch parks other mods that hook the same functions, as the knowledge base lists them, and starts Tracy's capture tool on a loopback port.
 - **The RenoDX devkit** can be loaded for shader and resource work. quen checks that it really loaded.
 

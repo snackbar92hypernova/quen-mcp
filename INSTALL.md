@@ -217,11 +217,14 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # renodx_build = '<folder>\renodx-thewitcher3remastered.addon64'
 # The RenoDX devkit, as ReShade.ini's [ADDON] LoadFromDllMain takes it.
 # devkit = 'devkit\renodx-devkit.addon64'
-# Profilers, for profiler: 'renderdoc:NAME', 'nsys:NAME' or 'ngfx:NAME'. ngfx_args go to every ngfx
-# launch; quote a value with spaces (never --platform: ngfx then fails to start).
+# Profilers, for profiler: 'renderdoc:NAME', 'nsys:NAME', 'ngfx:NAME' or 'ngfx-capture:NAME'. ngfx_args go
+# to every ngfx GPU Trace launch; quote a value with spaces (never --platform: ngfx then fails to start).
+# ngfx-capture:NAME runs the ngfx-capture.exe beside ngfx.exe unless ngfx_capture names another (ngfx.exe
+# there: ngfx's Graphics Capture activity instead).
 # nsys = '<folder>\nsys.exe'
 # ngfx = '<folder>\ngfx.exe'
 # ngfx_args = '--architecture "<your GPU architecture>" --metric-set-id 0'
+# ngfx_capture = '<folder>\ngfx-capture.exe'
 # RenderDoc needs both: renderdoccmd.exe, and a patched dev build of Streamline's interposer, which the
 # launch swaps in for the game's signed one and swaps back. Download quen's build
 # (quen-streamline-dev-interposer-2.14.1.zip from quen-mcp's GitHub Releases), or build it yourself:

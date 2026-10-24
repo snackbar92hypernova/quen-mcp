@@ -19,6 +19,13 @@
 //!   hotkey, its output folder made first (else "No such output directory"), never `--platform` (Qt takes it as its
 //!   own option and ngfx fails to start). GPU Trace locks the GPU clocks to base, so its times are relative only. ngfx
 //!   exits once its trace is exported and takes the game with it: one trace per boot.
+//! - `ngfx-capture`: an Nsight Graphics frame capture (`.ngfx-capture`) rather than a GPU Trace. ReShade parked, as
+//!   under ngfx; ray tracing, path tracing and DLSS RR stay on, frame generation off. ngfx-capture.exe (`--help`,
+//!   2026.3.1) writes into the run's folder, waits on no prompt (nothing closed for Nsight's "interfering
+//!   applications", no hang-detection crash report) and shows no HUD. The fallback, ngfx.exe's Graphics Capture
+//!   activity (the RTX Hair session's launch), writes into Nsight's own captures folder: quen moves out what the launch
+//!   wrote. The plan refuses until Nsight asked its first-start privacy question (its settings file, read only).
+//!   game_screenshot method ngfx presses F11 and waits for the file; the end records any capture not yet recorded.
 //! - `tracy`: the Tracy instrumentation in quen's own package (W3Quen.asi from quen-w3 0.1.3, w3/asi/trace.h), dormant
 //!   unless the game's environment has `W3_QUEN_TRACY=1`, which only this profile sets (with `TRACY_PORT`, a free
 //!   loopback port). The launch checks the capture tool is Tracy's version of the package's client, parks the mods the
@@ -38,11 +45,12 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::boot::Change;
-use quen_core::journal::sha256_hex;
+use quen_core::journal::{sha256_file, sha256_hex};
 use quen_core::ledger::{Capture, Ledger};
 use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL};
+use windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE;
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
 use crate::boot::plain;
@@ -61,6 +69,33 @@ const RESHADE: &str = "dxgi.dll";
 const RENDERDOC_SETTINGS: &str = "EnableDLSSRR=false,PTEnable=false,EnableRT=false,AAMode=1";
 /// RenderDoc's capture key.
 const CAPTURE_KEY: &str = "f12";
+/// Nsight Graphics' capture key: ngfx-capture's and ngfx's Graphics Capture default.
+const NGFX_KEY: &str = "f11";
+const NGFX_EXT: &str = "ngfx-capture";
+/// Nsight's own captures folder in Documents, where ngfx.exe's Graphics Capture wrote whatever `--output-dir` said (the
+/// RTX Hair session's hand run, 2026-10-22).
+/// ponytail: Nsight's default, not its settings' `CorePlugin.DefaultDocumentsFolder`: a moved one isn't watched.
+const NSIGHT_CAPTURES: &str = r"NVIDIA Nsight Graphics\GraphicsCaptures";
+/// What a capture tool writes (the captures row's kind), after which key, and its row's method.
+struct Writes {
+    ext: &'static str,
+    key: &'static str,
+    /// Why no file came, likely.
+    hint: &'static str,
+    method: &'static str,
+}
+const RDC: Writes = Writes {
+    ext: "rdc",
+    key: "F12",
+    hint: "RenderDoc not hooked?",
+    method: "renderdoc",
+};
+const NGFX: Writes = Writes {
+    ext: NGFX_EXT,
+    key: "F11",
+    hint: "Nsight not attached?",
+    method: "ngfx_capture",
+};
 /// What RenderDoc's log says once it wrapped the game's D3D12 device (rdc_boot.py's check).
 const WRAPPED: [&str; 2] = ["Created wrapped D3D12 device", "New D3D12 device"];
 /// rdc_boot.py's capture pacing; a second capture waits `GAP` after the last was written.
@@ -101,6 +136,7 @@ pub(crate) enum Tool {
     RenderDoc,
     Nsys,
     Ngfx,
+    NgfxCapture,
     Tracy,
 }
 
@@ -110,6 +146,7 @@ impl Tool {
             Tool::RenderDoc => "renderdoc",
             Tool::Nsys => "nsys",
             Tool::Ngfx => "ngfx",
+            Tool::NgfxCapture => "ngfx-capture",
             Tool::Tracy => "tracy",
         }
     }
@@ -136,8 +173,8 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
-    /// Checks `arg` (`renderdoc:NAME`, `nsys:NAME`, `ngfx:NAME`, `tracy:NAME`) against the config and the game's files
-    /// in `bin`, read-only: an error means nothing was changed. `signed` are the pinned sha256s of NVIDIA's interposer,
+    /// Checks `arg` (`renderdoc:NAME`, `nsys:NAME`, `ngfx:NAME`, `ngfx-capture:NAME`, `tracy:NAME`) against the config
+    /// and the game's files in `bin`, read-only: an error means nothing was changed. `signed` are the pinned sha256s of NVIDIA's interposer,
     /// `verify` its Authenticode check; `package` is the version of quen's package in the game, `capture_version` the
     /// version Tracy's capture tool says it is ([`tracy_version`]).
     #[allow(clippy::too_many_arguments)]
@@ -153,25 +190,36 @@ impl Profile {
     ) -> Result<Profile, String> {
         let usage = || {
             format!(
-                "profiler {arg:?} is not renderdoc:NAME, nsys:NAME, ngfx:NAME or tracy:NAME (NAME: letters, digits, \
-                 _ and -)"
+                "profiler {arg:?} is not renderdoc:NAME, nsys:NAME, ngfx:NAME, ngfx-capture:NAME or tracy:NAME (NAME: \
+                 letters, digits, _ and -)"
             )
         };
         let (tool, name) = arg
             .split_once(':')
             .filter(|(_, name)| plain(name, &['-']))
             .ok_or_else(usage)?;
+        // ngfx-capture: the configured exe, else the ngfx-capture.exe beside ngfx, else ngfx (the fallback route).
+        let beside = config
+            .ngfx
+            .as_ref()
+            .map(|n| n.with_file_name("ngfx-capture.exe"));
+        let capture = config.ngfx_capture.clone().or_else(|| {
+            beside
+                .filter(|p| p.is_file())
+                .or_else(|| config.ngfx.clone())
+        });
         let (tool, exe, key) = match tool {
             "renderdoc" => (Tool::RenderDoc, &config.renderdoc, "renderdoc"),
             "nsys" => (Tool::Nsys, &config.nsys, "nsys"),
             "ngfx" => (Tool::Ngfx, &config.ngfx, "ngfx"),
+            "ngfx-capture" => (Tool::NgfxCapture, &capture, "ngfx_capture (or ngfx)"),
             "tracy" => (Tool::Tracy, &config.tracy_capture, "tracy_capture"),
             _ => return Err(usage()),
         };
         let exe = exe.clone().filter(|p| p.is_file()).ok_or(format!(
             "profiler {arg}: {key} in the local config must be its exe"
         ))?;
-        if tool == Tool::Ngfx {
+        if matches!(tool, Tool::Ngfx | Tool::NgfxCapture) {
             ngfx_args(config.ngfx_args.as_deref().unwrap_or_default())?;
         }
         let mut profile = Profile {
@@ -281,23 +329,58 @@ impl Profile {
                 argv.extend([target, exe]);
                 (argv, bin.to_owned())
             }
-            // ngfx runs from its own folder (from the game's, its Qt platform init fails); --dir is the game's.
-            Tool::Ngfx => {
-                argv.extend(["--activity", "GPU Trace Profiler", "--exe"].map(String::from));
-                argv.extend([exe, "--dir".into(), bin.display().to_string()]);
+            // ngfx-capture.exe, from its own folder as ngfx: no prompt that would wait (nothing closed for Nsight's
+            // "interfering applications", no crash report offered past 60 s without a frame), the capture key F11, one
+            // frame, no HUD in quen's screenshots. ngfx_args are GPU Trace's: not passed.
+            Tool::NgfxCapture if !self.fallback() => {
+                argv.extend(["--exe".into(), exe, "--working-dir".into()]);
+                argv.push(bin.display().to_string());
                 argv.push("--output-dir".into());
                 argv.push(self.output_dir(out).display().to_string());
                 argv.extend(
                     [
-                        "--start-after-hotkey",
-                        "--limit-to-frames",
-                        frames.unwrap_or("3"),
+                        "--no-block-on-interfering-application",
+                        "--disable-hang-detection",
+                        "--capture-hotkey",
+                        "--frame-count",
+                        "1",
+                        "--no-hud",
                     ]
                     .map(String::from),
                 );
-                argv.extend(["--max-duration-ms", "3000", "--auto-export"].map(String::from));
-                // Only the user's config adds ngfx arguments: none come from the agent (security audit, 2026-10-17).
-                argv.extend(words(config.ngfx_args.as_deref().unwrap_or_default()));
+                let dir = self.exe.parent().unwrap_or(bin).to_owned();
+                (argv, dir)
+            }
+            // ngfx runs from its own folder (from the game's, its Qt platform init fails); --dir is the game's.
+            Tool::Ngfx | Tool::NgfxCapture => {
+                let activity = match self.tool {
+                    Tool::Ngfx => "GPU Trace Profiler",
+                    _ => "Graphics Capture",
+                };
+                argv.extend(["--activity", activity, "--exe"].map(String::from));
+                argv.extend([exe, "--dir".into(), bin.display().to_string()]);
+                argv.push("--output-dir".into());
+                argv.push(self.output_dir(out).display().to_string());
+                if self.tool == Tool::NgfxCapture {
+                    // The fallback, as the RTX Hair session launched it: without --no-timeout Nsight closed the game
+                    // minutes in. It writes into Nsight's own captures folder, whatever --output-dir says.
+                    argv.extend(
+                        ["--no-timeout", "--hotkey-capture", "--frame-count", "1"]
+                            .map(String::from),
+                    );
+                } else {
+                    argv.extend(
+                        [
+                            "--start-after-hotkey",
+                            "--limit-to-frames",
+                            frames.unwrap_or("3"),
+                        ]
+                        .map(String::from),
+                    );
+                    argv.extend(["--max-duration-ms", "3000", "--auto-export"].map(String::from));
+                    // Only the user's config adds ngfx arguments, never the agent (security audit, 2026-10-17).
+                    argv.extend(words(config.ngfx_args.as_deref().unwrap_or_default()));
+                }
                 let dir = self.exe.parent().unwrap_or(bin).to_owned();
                 (argv, dir)
             }
@@ -336,12 +419,22 @@ impl Profile {
     /// The folder the tool writes into, made before the launch: ngfx's `--output-dir` must exist.
     pub(crate) fn output_dir(&self, out: &Path) -> PathBuf {
         match self.tool {
-            Tool::Ngfx => out.join(&self.name),
+            Tool::Ngfx | Tool::NgfxCapture => out.join(&self.name),
             _ => out.to_owned(),
         }
     }
 
-    /// The boot row's record of the profile; a tracy one's also names the hooks.tsv rows at its hook sites.
+    /// ngfx-capture's fallback route, ngfx.exe's Graphics Capture activity: when the exe it runs is ngfx.exe.
+    fn fallback(&self) -> bool {
+        self.tool == Tool::NgfxCapture
+            && self
+                .exe
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("ngfx.exe"))
+    }
+
+    /// The boot row's record of the profile; a tracy one's also names the hooks.tsv rows at its hook sites, an
+    /// ngfx-capture one the launcher it ran (its file name).
     pub(crate) fn record(&self) -> Value {
         let mut record =
             json!({"tool": self.tool.name(), "settings": self.settings, "park": self.park});
@@ -349,12 +442,39 @@ impl Profile {
             record["collisions"] = json!(self.collisions);
             record["port"] = json!(self.port);
         }
+        if self.tool == Tool::NgfxCapture {
+            record["launcher"] = json!(self.exe.file_name().map(|n| n.to_string_lossy()));
+        }
         record
+    }
+
+    /// ngfx-capture: Nsight asked its first-start privacy question for the installed version (`nsight`: an exe's
+    /// version and Nsight's settings file, [`nsight`]). quen reads the answer only, and never gives it. Other profiles:
+    /// Ok.
+    pub(crate) fn asked(&self, nsight: &dyn Fn(&Path) -> Installed) -> Result<(), String> {
+        if self.tool != Tool::NgfxCapture {
+            return Ok(());
+        }
+        let (version, ini) = nsight(&self.exe);
+        let version = version.ok_or(format!(
+            "{} has no version resource: whether Nsight asked its first-start privacy question can't be checked",
+            self.exe.display()
+        ))?;
+        match ini.is_some_and(|ini| quen_core::ngfx::privacy_asked(&ini, &version)) {
+            true => Ok(()),
+            false => Err(format!(
+                "Nsight Graphics {version} hasn't asked its first-start privacy question yet: the user opens Nsight \
+                 Graphics once and answers it, then plan again (quen never answers it)"
+            )),
+        }
     }
 
     /// The conditions the run is under, for the boot row: the tool, and what it changes about the game.
     pub(crate) fn conditions(&self) -> Vec<&'static str> {
-        let mut conditions = vec![self.tool.name()];
+        let mut conditions = vec![match self.tool {
+            Tool::NgfxCapture => "ngfx_capture",
+            tool => tool.name(),
+        }];
         if self.tool == Tool::RenderDoc {
             conditions.push("streamline_dev_interposer");
         }
@@ -504,6 +624,19 @@ pub(crate) fn wrapped(launched: SystemTime) -> Option<PathBuf> {
                 WRAPPED.iter().any(|w| text.contains(w))
             })
     })
+}
+
+/// An installed Nsight's version and its settings file's text, when there are.
+pub(crate) type Installed = (Option<String>, Option<String>);
+
+/// The installed Nsight's version (`exe`'s version resource) and, with one, the text of Nsight's settings file:
+/// [`Profile::asked`]'s inputs.
+pub(crate) fn nsight(exe: &Path) -> Installed {
+    let version = crate::win::file_version(exe);
+    let ini = version
+        .as_ref()
+        .and_then(|_| fs::read_to_string(crate::doctor::nsight_ini()?).ok());
+    (version, ini)
 }
 
 /// The version Tracy's capture tool says it is: run without arguments, it prints `tracy-capture 0.14.1 / <git ref>` on
@@ -659,38 +792,47 @@ pub(crate) fn tracy_end(config: &Config, live: &Live, call: &mut Call) -> Option
         );
     }
     let sha256 = call.artifact(&path);
-    let rel = path
-        .strip_prefix(&root)
-        .unwrap_or(&path)
-        .display()
-        .to_string();
-    let row = |sha256: String| -> Result<i64, String> {
-        let mut ledger =
-            Ledger::open(config.state_dir().join("quen.db")).map_err(|e| e.to_string())?;
-        let t = ledger
-            .utc(session::now() as i64)
-            .map_err(|e| e.to_string())?;
-        let row = Capture {
-            boot_id: Some(live.boot),
-            path: rel,
-            sha256,
-            bytes: bytes as i64,
-            kind: "tracy".into(),
-            method: Some("tracy".into()),
-            t,
-            ..Capture::default()
-        };
-        ledger.add_capture(&row).map_err(|e| e.to_string())
-    };
     let mut field = json!({"capture": path, "bytes": bytes, "log": log});
+    let at = session::now() as i64;
     match sha256
         .ok_or(format!("{}: unreadable", path.display()))
-        .and_then(row)
-    {
+        .and_then(|sha256| {
+            add_row(
+                config,
+                row(live.boot, sha256, bytes, "tracy", "tracy"),
+                &path,
+                at,
+            )
+        }) {
         Ok(id) => call.row("captures", id),
         Err(why) => field["ledger_error"] = json!(why),
     }
     Some(field)
+}
+
+/// A capture file's row on `boot`, before [`add_row`] gives it its path and time.
+fn row(boot: i64, sha256: String, bytes: u64, kind: &str, method: &str) -> Capture {
+    Capture {
+        boot_id: Some(boot),
+        sha256,
+        bytes: bytes as i64,
+        kind: kind.into(),
+        method: Some(method.into()),
+        ..Capture::default()
+    }
+}
+
+/// Adds `row` for `path` (under the capture root), written at `at` (Unix seconds): its id.
+fn add_row(config: &Config, mut row: Capture, path: &Path, at: i64) -> Result<i64, String> {
+    let mut ledger = Ledger::open(config.state_dir().join("quen.db")).map_err(|e| e.to_string())?;
+    let root = config.capture_root();
+    row.path = path
+        .strip_prefix(&root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    row.t = ledger.utc(at).map_err(|e| e.to_string())?;
+    ledger.add_capture(&row).map_err(|e| e.to_string())
 }
 
 fn renderdoc(live: &Live) -> bool {
@@ -699,17 +841,31 @@ fn renderdoc(live: &Live) -> bool {
         .is_some_and(|p| p.starts_with("renderdoc:"))
 }
 
-/// game_keys under a renderdoc launch: F12 is RenderDoc's capture key, and a capture freezes the game for seconds,
-/// so captures go only through game_screenshot method renderdoc, which sends nothing until the .rdc is written.
+/// The run's name in an ngfx-capture launch.
+fn ngfx_name(live: &Live) -> Option<&str> {
+    live.profiler.as_deref()?.strip_prefix("ngfx-capture:")
+}
+
+/// game_keys under a renderdoc or ngfx-capture launch: F12 is RenderDoc's capture key and F11 Nsight's, and a capture
+/// freezes the game for seconds, so captures go only through game_screenshot method renderdoc or ngfx, which send
+/// nothing until the file is written and record it.
 pub(crate) fn capture_key(live: &Live, tokens: &[String]) -> Result<(), String> {
-    let f12 = tokens.iter().any(|t| {
-        t.split([':', '+'])
-            .any(|k| k.eq_ignore_ascii_case(CAPTURE_KEY))
-    });
-    if renderdoc(live) && f12 {
+    let pressed = |key: &str| {
+        tokens
+            .iter()
+            .any(|t| t.split([':', '+']).any(|k| k.eq_ignore_ascii_case(key)))
+    };
+    if renderdoc(live) && pressed(CAPTURE_KEY) {
         return Err(
             "F12 is RenderDoc's capture key in this session: take captures with game_screenshot method renderdoc, \
              which sends no key until the capture is written"
+                .into(),
+        );
+    }
+    if ngfx_name(live).is_some() && pressed(NGFX_KEY) {
+        return Err(
+            "F11 is Nsight's capture key in this session: take captures with game_screenshot method ngfx, which \
+             sends no key until the capture is written and records it"
                 .into(),
         );
     }
@@ -757,26 +913,15 @@ pub(crate) fn capture(cx: &Ctx, call: &mut Call, tag: &str) -> Result<Fields, Do
     }
     let pids = cx.live.job.pids().unwrap_or_default();
     let (window, _) = crate::capture::game_window(&pids)?;
-    let before = rdcs(&out);
-    let last = before
-        .iter()
-        .filter_map(|(p, _)| fs::metadata(p).and_then(|m| m.modified()).ok())
-        .max();
-    if let Some(wait) = last.and_then(|t| (t + GAP).duration_since(SystemTime::now()).ok()) {
-        sleep(wait);
-    }
-    call.lap("check");
-    crate::status::hide(cx, call, false).map_err(Done::Refused)?;
-    cx.keys(call, &[format!("{CAPTURE_KEY}:300")], false, Focus::Refuse)?;
-    let at = session::now() as i64;
+    let list = || files(&out, RDC.ext, SystemTime::UNIX_EPOCH);
+    let (at, before) = pressed(cx, call, &list, CAPTURE_KEY)?;
     // From the key on, nothing is sent and nothing returns, a cancel included, until the capture is written: the game
     // is frozen meanwhile, and the next tool's keys would land in it.
-    let names: Vec<PathBuf> = before.into_iter().map(|(p, _)| p).collect();
-    let list = || {
+    let polled = || {
         call.progress("RenderDoc is writing the capture");
-        rdcs(&out)
+        list()
     };
-    let written = wait_rdc(&names, &list, &|| responsive(window), &PACE);
+    let written = wait_file(&before, &polled, &|| responsive(window), &PACE, &RDC);
     let (file, bytes) = written.map_err(|why| Done::Failed(why, Map::new()))?;
     call.lap("capture");
     // RenderDoc names it <NAME>_frame<N>.rdc: renamed to the tag once written, or kept where it is.
@@ -784,44 +929,255 @@ pub(crate) fn capture(cx: &Ctx, call: &mut Call, tag: &str) -> Result<Fields, Do
         Ok(()) => dest,
         Err(_) => file,
     };
-    let sha256 = call.artifact(&path);
-    call.lap("hash");
     let mut fields = Map::new();
+    fields.insert("renderdoc_log".into(), json!(log));
+    recorded(cx, call, &RDC, &path, (bytes, at), &mut fields)?;
+    Ok(fields)
+}
+
+/// What a capture call does once its checks passed: waits [`GAP`] after the newest capture `list` shows, hides quen's
+/// status line and presses `key` (`f12`, `f11`). When it pressed it (Unix seconds), and the captures there were then.
+fn pressed(
+    cx: &Ctx,
+    call: &mut Call,
+    list: &dyn Fn() -> Vec<(PathBuf, u64)>,
+    key: &str,
+) -> Result<(i64, Vec<PathBuf>), Done> {
+    let before: Vec<PathBuf> = list().into_iter().map(|(p, _)| p).collect();
+    let last = before
+        .iter()
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    if let Some(wait) = last.and_then(|t| (t + GAP).duration_since(SystemTime::now()).ok()) {
+        sleep(wait);
+    }
+    call.lap("check");
+    crate::status::hide(cx, call, false).map_err(Done::Refused)?;
+    cx.keys(call, &[format!("{key}:300")], false, Focus::Refuse)?;
+    Ok((session::now() as i64, before))
+}
+
+/// A written capture's sha256 and captures row on the session's boot (`at`: when its key was pressed), its path and
+/// size in `fields`. Failed, with `fields`, when the row couldn't be added.
+fn recorded(
+    cx: &Ctx,
+    call: &mut Call,
+    w: &Writes,
+    path: &Path,
+    (bytes, at): (u64, i64),
+    fields: &mut Fields,
+) -> Result<(), Done> {
+    let sha256 = call.artifact(path);
+    call.lap("hash");
     fields.insert("capture".into(), json!(path));
     fields.insert("bytes".into(), json!(bytes));
-    fields.insert("renderdoc_log".into(), json!(log));
-    let rel = path
-        .strip_prefix(&root)
-        .unwrap_or(&path)
-        .display()
-        .to_string();
-    let row = |sha256: String| -> Result<i64, String> {
-        let mut ledger =
-            Ledger::open(config.state_dir().join("quen.db")).map_err(|e| e.to_string())?;
-        let t = ledger.utc(at).map_err(|e| e.to_string())?;
-        let row = Capture {
-            boot_id: Some(cx.live.boot),
-            path: rel,
-            sha256,
-            bytes: bytes as i64,
-            kind: "rdc".into(),
-            method: Some("renderdoc".into()),
-            t,
-            ..Capture::default()
-        };
-        ledger.add_capture(&row).map_err(|e| e.to_string())
-    };
+    let boot = cx.live.boot;
     match sha256
         .ok_or(format!("{}: unreadable", path.display()))
-        .and_then(row)
-    {
-        Ok(id) => call.row("captures", id),
+        .and_then(|sha256| {
+            add_row(
+                cx.config,
+                row(boot, sha256, bytes, w.ext, w.method),
+                path,
+                at,
+            )
+        }) {
+        Ok(id) => {
+            call.row("captures", id);
+            Ok(())
+        }
         Err(why) => {
             let why = format!("the capture was written, but no ledger row was added: {why}");
-            return Err(Done::Failed(why, fields));
+            Err(Done::Failed(why, std::mem::take(fields)))
         }
     }
+}
+
+/// game_screenshot method ngfx: one Nsight Graphics capture (F11) as `<tag>.ngfx-capture` in the run's folder, with
+/// its captures row. Only in an ngfx-capture session, and never over the capture budget or under 12 GB free without
+/// the user's OK (`user_ok`, nsight-capture design answer 8); then nothing is sent and nothing returns until the file
+/// holds still. A capture Nsight wrote into its own folder is moved in ([`take`]).
+pub(crate) fn ngfx_capture(
+    cx: &Ctx,
+    call: &mut Call,
+    tag: &str,
+    user_ok: bool,
+) -> Result<Fields, Done> {
+    let config = cx.config;
+    let name = ngfx_name(cx.live).ok_or_else(|| {
+        "method ngfx needs a session launched with profiler ngfx-capture:NAME".to_owned()
+    })?;
+    let root = config.capture_root();
+    let out = root.join(cx.live.boot.to_string()).join(name);
+    let dest = out.join(format!("{tag}.{NGFX_EXT}"));
+    if dest.exists() {
+        let why = format!(
+            "{} exists: tag {tag:?} is taken in this boot",
+            dest.display()
+        );
+        return Err(why.into());
+    }
+    let total = quen_core::disk::total(&root);
+    room(
+        total,
+        free_bytes(&out)?,
+        config.capture_budget_gb(),
+        user_ok,
+    )?;
+    let pids = cx.live.job.pids().unwrap_or_default();
+    let (window, _) = crate::capture::game_window(&pids)?;
+    let dirs = ngfx_dirs(&out);
+    let since = cx.live.launched;
+    let list = || {
+        let found = dirs.iter().flat_map(|d| files(d, NGFX_EXT, since));
+        found.collect::<Vec<_>>()
+    };
+    let (at, before) = pressed(cx, call, &list, NGFX_KEY)?;
+    // As RenderDoc's: nothing sent until the file holds still. A game that closed on the capture answers nothing.
+    let polled = || {
+        call.progress("Nsight is writing the capture");
+        list()
+    };
+    let answers = || responsive(window) || cx.live.job.pids().is_ok_and(|p| p.is_empty());
+    let written = wait_file(&before, &polled, &answers, &PACE, &NGFX);
+    let (file, bytes) = written.map_err(|why| Done::Failed(why, Map::new()))?;
+    call.lap("capture");
+    let mut fields = Map::new();
+    let ours = file.parent() == Some(out.as_path());
+    let path = match take(&file, &dest) {
+        Ok(()) => dest,
+        // In the run's folder already: kept under Nsight's name, as RenderDoc's.
+        Err(_) if ours => file.clone(),
+        Err(why) => {
+            fields.insert("capture".into(), json!(file));
+            let why = format!("{why}: session_end records it");
+            return Err(Done::Failed(why, fields));
+        }
+    };
+    if !ours {
+        fields.insert("moved_from".into(), json!(file));
+    }
+    recorded(cx, call, &NGFX, &path, (bytes, at), &mut fields)?;
+    let total = quen_core::disk::total(&root);
+    fields.insert("capture_root_gb".into(), json!(quen_core::disk::gb(total)));
     Ok(fields)
+}
+
+/// Whether an Nsight capture may be taken (nsight-capture design answer 8): not while the capture root holds more than
+/// `budget_gb` or its volume has under [`FREE_MIN`] free, unless the user agreed (`user_ok`).
+fn room(total: u64, free: u64, budget_gb: f64, user_ok: bool) -> Result<(), String> {
+    let over = total as f64 > budget_gb * 1e9;
+    if user_ok || (!over && free >= FREE_MIN) {
+        return Ok(());
+    }
+    Err(format!(
+        "the capture root holds {} GB (capture_budget_gb {budget_gb}) and {} GB are free: an Nsight capture is refused \
+         over the budget or under {} GB free unless the user agrees. Tell them a capture can take several GB, then \
+         pass user_ok; capture_usage and capture_clean free space",
+        quen_core::disk::gb(total),
+        quen_core::disk::gb(free),
+        FREE_MIN / 1_000_000_000
+    ))
+}
+
+/// Where an ngfx-capture launch's captures can appear: its run's folder `out`, and Nsight's own captures folder (the
+/// fallback writes there; whether ngfx-capture.exe honours `--output-dir` is unproven).
+fn ngfx_dirs(out: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![out.to_owned()];
+    dirs.extend(crate::win::documents().map(|d| d.join(NSIGHT_CAPTURES)));
+    dirs
+}
+
+/// Moves a written capture to `dest`, where no file is: a rename on one volume; across volumes a copy whose sha256
+/// must match, then the original to the Recycle Bin.
+fn take(file: &Path, dest: &Path) -> Result<(), String> {
+    let failed =
+        |e: std::io::Error| format!("moving {} to {}: {e}", file.display(), dest.display());
+    match crate::win::rename_no_replace(file, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.raw_os_error() != Some(ERROR_NOT_SAME_DEVICE as i32) => return Err(failed(e)),
+        Err(_) => {}
+    }
+    fs::copy(file, dest).map_err(failed)?;
+    let sha = |p: &Path| sha256_file(p).map_err(|e| format!("{}: {e}", p.display()));
+    if sha(file)? != sha(dest)? {
+        let _ = crate::win::recycle(dest); // quen's own copy
+        return Err(format!(
+            "the copy of {} differs from it: the original is kept",
+            file.display()
+        ));
+    }
+    crate::win::recycle(file).map_err(|e| format!("{} was copied, but stays: {e}", file.display()))
+}
+
+/// An ngfx-capture launch's end, before the kill (which could cut a capture short): each `.ngfx-capture` of the launch
+/// without a captures row, once it holds still, gets its row on the boot (moved into the run's folder when Nsight wrote
+/// it into its own). The field lists them, and what failed. None for any other launch.
+pub(crate) fn ngfx_end(config: &Config, live: &Live, call: &mut Call) -> Option<Value> {
+    let name = ngfx_name(live)?;
+    let out = config.capture_root().join(live.boot.to_string()).join(name);
+    let dirs = ngfx_dirs(&out);
+    Some(sweep(
+        config,
+        live.boot,
+        &out,
+        &dirs,
+        live.launched,
+        &PACE,
+        call,
+    ))
+}
+
+/// [`ngfx_end`]'s sweep of `dirs` for captures written since `since`, `out` the run's folder.
+fn sweep(
+    config: &Config,
+    boot: i64,
+    out: &Path,
+    dirs: &[PathBuf],
+    since: SystemTime,
+    pace: &Pace,
+    call: &mut Call,
+) -> Value {
+    let root = config.capture_root();
+    let ledger = Ledger::open(config.state_dir().join("quen.db"));
+    let known = |p: &Path| {
+        let rel = p.strip_prefix(&root).map(|r| r.display().to_string());
+        let found = |rel: String| ledger.as_ref().ok()?.capture_ref(None, Some(&rel)).ok()?;
+        rel.ok().and_then(found).is_some()
+    };
+    let found: Vec<PathBuf> = dirs
+        .iter()
+        .flat_map(|d| files(d, NGFX_EXT, since))
+        .map(|(p, _)| p)
+        .filter(|p| !known(p))
+        .collect();
+    let t = Instant::now();
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    for file in found {
+        let size = || fs::metadata(&file).ok().map(|m| m.len());
+        let one = settled(&size, pace, t, &file, "the end began").and_then(|bytes| {
+            let path = match file.parent() == Some(out) {
+                true => file.clone(),
+                false => {
+                    let dest = out.join(file.file_name().unwrap_or_default());
+                    take(&file, &dest)?;
+                    dest
+                }
+            };
+            let sha256 = call
+                .artifact(&path)
+                .ok_or(format!("{}: unreadable", path.display()))?;
+            let row = row(boot, sha256, bytes, NGFX.ext, NGFX.method);
+            let id = add_row(config, row, &path, session::now() as i64)?;
+            call.row("captures", id);
+            Ok(json!({"capture": path, "bytes": bytes, "id": id, "moved_from": (path != file).then_some(&file)}))
+        });
+        match one {
+            Ok(v) => done.push(v),
+            Err(why) => failed.push(json!({"file": file, "why": why})),
+        }
+    }
+    json!({"recorded": done, "failed": failed})
 }
 
 /// The dev interposer is still the game's and its switch file is there: no capture without the swap.
@@ -837,19 +1193,22 @@ fn swapped_in(config: &Config, bin: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The `.rdc` files in `dir` and their sizes.
-fn rdcs(dir: &Path) -> Vec<(PathBuf, u64)> {
-    let files = fs::read_dir(dir).into_iter().flatten().flatten();
-    files
+/// The `.<ext>` files in `dir` written since `since`, and their sizes.
+fn files(dir: &Path, ext: &str, since: SystemTime) -> Vec<(PathBuf, u64)> {
+    let entries = fs::read_dir(dir).into_iter().flatten().flatten();
+    entries
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rdc")))
-        .filter_map(|p| Some((p.clone(), fs::metadata(&p).ok()?.len())))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)))
+        .filter_map(|p| {
+            let meta = fs::metadata(&p).ok()?;
+            (meta.modified().ok()? >= since).then_some((p, meta.len()))
+        })
         .collect()
 }
 
 /// How long each stage of a capture may take.
 struct Pace {
-    /// From the key to the new .rdc.
+    /// From the key to the new file.
     appear: Duration,
     /// Its size unchanged this long means written.
     stable: Duration,
@@ -861,14 +1220,15 @@ struct Pace {
     settle: Duration,
 }
 
-/// rdc_boot.py's `wait_rdc`: the first `.rdc` `list` shows that isn't in `before`, once its size held for
+/// rdc_boot.py's `wait_rdc`: the first file `list` shows that isn't in `before`, once its size held for
 /// `pace.stable` and `responsive` (the game's window answers again: a capture blocks it while written), then
 /// `pace.settle`. Err once a stage runs out of time; the caller sends no key then either.
-fn wait_rdc(
+fn wait_file(
     before: &[PathBuf],
     list: &dyn Fn() -> Vec<(PathBuf, u64)>,
     responsive: &dyn Fn() -> bool,
     pace: &Pace,
+    w: &Writes,
 ) -> Result<(PathBuf, u64), String> {
     let t = Instant::now();
     let new = || list().into_iter().find(|(p, _)| !before.contains(p));
@@ -878,29 +1238,18 @@ fn wait_rdc(
         }
         if t.elapsed() > pace.appear {
             return Err(format!(
-                "no new .rdc {} s after F12 (RenderDoc not hooked?): nothing more was sent",
-                pace.appear.as_secs()
+                "no new .{} {} s after {} ({}): nothing more was sent",
+                w.ext,
+                pace.appear.as_secs(),
+                w.key,
+                w.hint
             ));
         }
         sleep(POLL.min(pace.stable));
     };
     let size = || list().into_iter().find(|(p, _)| *p == file).map(|(_, n)| n);
-    let mut last = None;
-    let bytes = loop {
-        let now = size();
-        if now.is_some_and(|n| n > 0) && now == last {
-            break now.unwrap_or_default();
-        }
-        if t.elapsed() > pace.growing {
-            return Err(format!(
-                "{} still grows {} s after F12: nothing more was sent",
-                file.display(),
-                pace.growing.as_secs()
-            ));
-        }
-        last = now;
-        sleep(pace.stable);
-    };
+    let bytes =
+        settled(&size, pace, t, &file, w.key).map_err(|e| format!("{e}: nothing more was sent"))?;
     let hung = Instant::now();
     while !responsive() {
         if hung.elapsed() > pace.hung {
@@ -913,6 +1262,32 @@ fn wait_rdc(
     }
     sleep(pace.settle);
     Ok((file, bytes))
+}
+
+/// `size` once it held above 0 for `pace.stable`; Err once `pace.growing` passed since `t` (`after`: what began then).
+fn settled(
+    size: &dyn Fn() -> Option<u64>,
+    pace: &Pace,
+    t: Instant,
+    file: &Path,
+    after: &str,
+) -> Result<u64, String> {
+    let mut last = None;
+    loop {
+        let now = size();
+        if now.is_some_and(|n| n > 0) && now == last {
+            return Ok(now.unwrap_or_default());
+        }
+        if t.elapsed() > pace.growing {
+            return Err(format!(
+                "{} still grows {} s after {after}",
+                file.display(),
+                pace.growing.as_secs()
+            ));
+        }
+        last = now;
+        sleep(pace.stable);
+    }
 }
 
 /// Whether the window answers a message that does nothing within 2 s: a capture blocks the game while written.
@@ -983,10 +1358,14 @@ pub(crate) fn words(s: &str) -> Vec<String> {
 mod tests {
     use std::cell::Cell;
     use std::env;
+    use std::io::Write;
 
     use quen_core::journal::{Fs, Journal, MemFs, replay};
+    use quen_core::ledger::{BootStart, Game};
 
     use super::*;
+    use crate::mcp::Conn;
+    use crate::session::{Session, Shared};
 
     /// A synthetic game bin folder and tool exes for one test, gone afterwards (only what the test made in it).
     struct Temp(PathBuf);
@@ -1248,6 +1627,360 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// ngfx-capture: without ngfx-capture.exe beside ngfx, ngfx.exe's Graphics Capture as the RTX Hair session
+    /// launched it; with it (or ngfx_capture in the config), ngfx-capture.exe into the run's folder with no prompt, F11,
+    /// one frame and no HUD; ngfx.exe as ngfx_capture picks the fallback. Both park ReShade and leave ray tracing, path
+    /// tracing and DLSS RR alone, never pass ngfx_args (GPU Trace's); a missing exe and --platform in ngfx_args are
+    /// refused.
+    #[test]
+    fn ngfx_capture_routes_park_reshade_and_keep_ray_tracing() {
+        let t = Temp::new("ngfx-capture");
+        let (mut config, bin, signed) = game(&t);
+        let (exe, dir) = (r"C:\g\witcher3.exe".to_owned(), bin.display().to_string());
+        let out = Path::new(r"C:\cap\7");
+        let p = parse(&config, "ngfx-capture:hair", &bin, &signed).unwrap();
+        assert_eq!(
+            (&p.park[..], p.settings, p.changes.len(), p.conditions()),
+            (
+                &[RESHADE.to_owned()][..],
+                "",
+                0,
+                vec!["ngfx_capture", "reshade_parked"]
+            )
+        );
+        let (argv, cwd) = p.command(&config, exe.clone(), &bin, out, None);
+        assert_eq!(
+            argv[1..],
+            [
+                "--activity",
+                "Graphics Capture",
+                "--exe",
+                &exe,
+                "--dir",
+                &dir,
+                "--output-dir",
+                r"C:\cap\7\hair",
+                "--no-timeout",
+                "--hotkey-capture",
+                "--frame-count",
+                "1"
+            ]
+        );
+        assert_eq!(
+            (cwd, p.output_dir(out), &p.record()["launcher"]),
+            (t.0.join(r"ngfx\host"), out.join("hair"), &json!("ngfx.exe"))
+        );
+        let beside = t.put(r"ngfx\host\ngfx-capture.exe", "");
+        let p = parse(&config, "ngfx-capture:hair", &bin, &signed).unwrap();
+        let (argv, cwd) = p.command(&config, exe.clone(), &bin, out, None);
+        assert_eq!(argv[0], beside.display().to_string());
+        assert_eq!(
+            argv[1..],
+            [
+                "--exe",
+                &exe,
+                "--working-dir",
+                &dir,
+                "--output-dir",
+                r"C:\cap\7\hair",
+                "--no-block-on-interfering-application",
+                "--disable-hang-detection",
+                "--capture-hotkey",
+                "--frame-count",
+                "1",
+                "--no-hud"
+            ]
+        );
+        assert_eq!(
+            (cwd, p.conditions(), &p.record()["launcher"]),
+            (
+                t.0.join(r"ngfx\host"),
+                vec!["ngfx_capture", "reshade_parked"],
+                &json!("ngfx-capture.exe")
+            )
+        );
+        let elsewhere = t.put(r"other\ngfx-capture.exe", "");
+        config.ngfx_capture = Some(elsewhere.clone());
+        let p = parse(&config, "ngfx-capture:x", &bin, &signed).unwrap();
+        assert_eq!(
+            p.command(&config, exe.clone(), &bin, out, None).0[0],
+            elsewhere.display().to_string()
+        );
+        config.ngfx_capture = config.ngfx.clone();
+        let p = parse(&config, "ngfx-capture:x", &bin, &signed).unwrap();
+        assert_eq!(
+            p.command(&config, exe.clone(), &bin, out, None).0[1],
+            "--activity"
+        );
+        let refused = |config: &Config, why: &str| {
+            let err = parse(config, "ngfx-capture:x", &bin, &signed)
+                .err()
+                .unwrap();
+            assert!(err.contains(why), "{why}: {err}");
+        };
+        let mut qt = config.clone();
+        qt.ngfx_args = Some("--platform \"Windows (x86_64)\"".into());
+        refused(&qt, "Qt");
+        qt.ngfx_capture = Some(beside);
+        refused(&qt, "Qt");
+        config.ngfx_capture = Some(t.0.join("missing.exe"));
+        refused(&config, "ngfx_capture (or ngfx) in the local config");
+        config.ngfx_capture = None;
+        config.ngfx = None;
+        refused(&config, "ngfx_capture (or ngfx) in the local config");
+    }
+
+    /// Nsight's settings file as it records the first-start answer for `version`, among other keys (synthetic).
+    fn nsight_ini(version: &str) -> String {
+        format!(
+            "[CorePlugin.Environment]\nShowVersionUpdateNotifications=true\n\n[CorePlugin.Privacy]\n\
+             AllowAnalytics=false\nAskedFor_NVIDIA%20Nsight%20Graphics_{version}=true\n"
+        )
+    }
+
+    /// The plan's last check under ngfx-capture: Nsight asked its first-start question for the installed version (its
+    /// settings file, read only). Another version's answer, none, no settings file or no version resource refuse;
+    /// other profiles don't read it.
+    #[test]
+    fn ngfx_capture_needs_nsights_own_first_start_answer() {
+        let t = Temp::new("ngfx-asked");
+        let (config, bin, signed) = game(&t);
+        let p = parse(&config, "ngfx-capture:x", &bin, &signed).unwrap();
+        let v = "2026.3.1.0";
+        let fake = |version: Option<&str>, ini: Option<String>| {
+            let said = (version.map(String::from), ini);
+            move |_: &Path| said.clone()
+        };
+        assert_eq!(p.asked(&fake(Some(v), Some(nsight_ini(v)))), Ok(()));
+        let other = "[CorePlugin.Privacy]\nAllowAnalytics=false\n".to_owned();
+        for (version, ini, why) in [
+            (
+                Some(v),
+                Some(nsight_ini("2026.3.0.0")),
+                "2026.3.1.0 hasn't asked",
+            ),
+            (Some(v), Some(other), "hasn't asked"),
+            (Some(v), None, "hasn't asked"),
+            (None, Some(nsight_ini(v)), "no version resource"),
+        ] {
+            let err = p.asked(&fake(version, ini)).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+        let ngfx = parse(&config, "ngfx:t", &bin, &signed).unwrap();
+        let unread = |_: &Path| -> (Option<String>, Option<String>) { panic!("read") };
+        assert_eq!(ngfx.asked(&unread), Ok(()));
+    }
+
+    /// Design answer 8: an Nsight capture is refused over the capture budget or under 12 GB free, unless the user
+    /// agreed.
+    #[test]
+    fn an_nsight_capture_needs_room_or_the_users_ok() {
+        let gb = 1_000_000_000;
+        assert_eq!(room(19 * gb, 50 * gb, 20.0, false), Ok(()));
+        for (total, free) in [(21 * gb, 50 * gb), (5 * gb, 11 * gb)] {
+            let err = room(total, free, 20.0, false).unwrap_err();
+            assert!(
+                err.contains("unless the user agrees") && err.contains("user_ok"),
+                "{err}"
+            );
+            assert_eq!(room(total, free, 20.0, true), Ok(()));
+        }
+    }
+
+    /// A data root whose ledger holds boot 1, and a capture root, in `t`.
+    fn ledger_config(t: &Temp) -> Config {
+        let config = Config {
+            data_root: t.0.join("data"),
+            capture_root: Some(t.0.join("cap")),
+            ..Config::default()
+        };
+        fs::create_dir_all(config.state_dir()).unwrap();
+        let mut ledger = Ledger::open(config.state_dir().join("quen.db")).unwrap();
+        let game = Game {
+            name: "synthetic".into(),
+            exe_path: "game.exe".into(),
+            exe_sha256: "0".repeat(64),
+            build_stamp: None,
+        };
+        ledger.add_game(&game).unwrap();
+        let boot = BootStart {
+            game_id: 1,
+            t_start: "2026-10-24T10:00:00Z".into(),
+            ..BootStart::default()
+        };
+        assert_eq!(ledger.start_boot(&boot).unwrap(), 1);
+        config
+    }
+
+    /// Writes `chunks` KB into `path` with `gap` before each, as a capture tool writes its file.
+    fn grow(path: PathBuf, chunks: usize, gap: Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut file = fs::File::create(&path).unwrap();
+            for _ in 0..chunks {
+                sleep(gap);
+                file.write_all(&[7; 1024]).unwrap();
+                file.flush().unwrap();
+            }
+        })
+    }
+
+    /// Captures rows as `path, kind, method, boot`.
+    fn rows(config: &Config) -> Vec<Vec<Value>> {
+        let ledger = Ledger::open(config.state_dir().join("quen.db")).unwrap();
+        let sql = "SELECT path, kind, method, boot_id, bytes FROM captures ORDER BY id";
+        ledger.query(sql, &[], Duration::from_secs(5)).unwrap().rows
+    }
+
+    const QUICK: Pace = Pace {
+        appear: Duration::from_secs(5),
+        stable: Duration::from_millis(300),
+        growing: Duration::from_secs(10),
+        hung: Duration::from_secs(1),
+        settle: Duration::ZERO,
+    };
+
+    /// A real file that grows: the wait takes it once it holds still, written since the launch, in Nsight's own folder
+    /// or the run's (an older capture in Nsight's folder is never taken); it is moved to the tag (Nsight's folder keeps
+    /// nothing) and recorded on the boot, kind ngfx-capture, method ngfx_capture.
+    #[test]
+    fn a_growing_capture_is_waited_for_moved_in_and_recorded() {
+        let t = Temp::new("ngfx-wait");
+        let config = ledger_config(&t);
+        let (out, nsight) = (config.capture_root().join(r"1\hair"), t.0.join("nsight"));
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&nsight).unwrap();
+        t.put(
+            r"nsight\older.ngfx-capture",
+            "a capture from before the launch",
+        );
+        sleep(Duration::from_millis(50));
+        let since = SystemTime::now();
+        let dirs = [out.clone(), nsight.clone()];
+        let list = || {
+            let found = dirs.iter().flat_map(|d| files(d, NGFX_EXT, since));
+            found.collect::<Vec<_>>()
+        };
+        assert!(list().is_empty(), "the older capture isn't the launch's");
+        let writing = grow(
+            nsight.join("witcher3_frame1.ngfx-capture"),
+            5,
+            Duration::from_millis(20),
+        );
+        let (file, bytes) = wait_file(&[], &list, &|| true, &QUICK, &NGFX).unwrap();
+        writing.join().unwrap();
+        assert_eq!(
+            (&file, bytes),
+            (&nsight.join("witcher3_frame1.ngfx-capture"), 5 * 1024)
+        );
+        let dest = out.join("A.ngfx-capture");
+        take(&file, &dest).unwrap();
+        assert!(!file.exists() && fs::metadata(&dest).unwrap().len() == bytes);
+        assert!(nsight.join("older.ngfx-capture").exists());
+        let sha256 = sha256_file(&dest).unwrap();
+        add_row(
+            &config,
+            row(1, sha256, bytes, NGFX.ext, NGFX.method),
+            &dest,
+            1_792_000_000,
+        )
+        .unwrap();
+        // Written into the run's folder (ngfx-capture.exe's --output-dir): renamed to its tag there.
+        let before: Vec<PathBuf> = list().into_iter().map(|(p, _)| p).collect();
+        let writing = grow(
+            out.join("witcher3_frame2.ngfx-capture"),
+            3,
+            Duration::from_millis(20),
+        );
+        let (file, bytes) = wait_file(&before, &list, &|| true, &QUICK, &NGFX).unwrap();
+        writing.join().unwrap();
+        assert_eq!((file.parent(), bytes), (Some(out.as_path()), 3 * 1024));
+        take(&file, &out.join("B.ngfx-capture")).unwrap();
+        assert_eq!(
+            rows(&config),
+            [vec![
+                json!("1/hair/A.ngfx-capture"),
+                json!("ngfx-capture"),
+                json!("ngfx_capture"),
+                json!(1),
+                json!(5 * 1024)
+            ]]
+        );
+        // Nothing new: no file, and no key after it.
+        let quick = Pace {
+            appear: Duration::from_millis(100),
+            ..QUICK
+        };
+        let before: Vec<PathBuf> = list().into_iter().map(|(p, _)| p).collect();
+        let err = wait_file(&before, &list, &|| true, &quick, &NGFX).unwrap_err();
+        assert!(
+            err.contains("no new .ngfx-capture") && err.contains("after F11"),
+            "{err}"
+        );
+    }
+
+    /// session_end's sweep under ngfx-capture: a capture in the run's folder without a row is recorded where it is, one
+    /// Nsight wrote into its own folder since the launch is moved in and recorded; one already recorded, and one in
+    /// Nsight's folder from before the launch, are left as they are.
+    #[test]
+    fn the_end_records_the_launchs_captures_not_yet_recorded() {
+        let t = Temp::new("ngfx-sweep");
+        let config = ledger_config(&t);
+        let (out, nsight) = (config.capture_root().join(r"1\hair"), t.0.join("nsight"));
+        t.put(r"nsight\older.ngfx-capture", "before the launch");
+        sleep(Duration::from_millis(50));
+        let since = SystemTime::now();
+        // NTFS stamps a write with a coarser clock than SystemTime::now: one right after `since` can read as before it.
+        sleep(Duration::from_millis(50));
+        let recorded = t.put(r"cap\1\hair\A.ngfx-capture", "recorded by game_screenshot");
+        let sha256 = sha256_file(&recorded).unwrap();
+        add_row(
+            &config,
+            row(1, sha256, 27, NGFX.ext, NGFX.method),
+            &recorded,
+            1_792_000_000,
+        )
+        .unwrap();
+        t.put(r"cap\1\hair\witcher3_frame2.ngfx-capture", "no row yet");
+        t.put(
+            r"nsight\witcher3_frame3.ngfx-capture",
+            "written into Nsight's folder",
+        );
+        let shared = Shared::new(Ok(config.clone()));
+        let session = Session::new(&shared, None);
+        let mut call = session.call(Conn::nobody(), Value::Null, None);
+        let dirs = [out.clone(), nsight.clone()];
+        let field = sweep(&config, 1, &out, &dirs, since, &QUICK, &mut call);
+        assert_eq!(field["failed"], json!([]), "{field}");
+        let moved: Vec<&Value> = field["recorded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| &r["moved_from"])
+            .collect();
+        assert_eq!(
+            moved,
+            [
+                &json!(null),
+                &json!(nsight.join("witcher3_frame3.ngfx-capture"))
+            ]
+        );
+        let paths: Vec<Value> = rows(&config).into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                json!("1/hair/A.ngfx-capture"),
+                json!("1/hair/witcher3_frame2.ngfx-capture"),
+                json!("1/hair/witcher3_frame3.ngfx-capture")
+            ]
+        );
+        assert!(out.join("witcher3_frame3.ngfx-capture").is_file());
+        assert!(nsight.join("older.ngfx-capture").is_file());
+        assert!(!nsight.join("witcher3_frame3.ngfx-capture").exists());
+        // A second end finds nothing left.
+        let again = sweep(&config, 1, &out, &dirs, since, &QUICK, &mut call);
+        assert_eq!(again, json!({"recorded": [], "failed": []}));
     }
 
     /// A synthetic hooks.tsv: rows at W3Quen's Tracy sites (two of one mod, one of a mod that isn't installed), rows
@@ -1526,12 +2259,12 @@ mod tests {
             answers.set(answers.get() + 1);
             answers.get() > 2
         };
-        let got = wait_rdc(std::slice::from_ref(&old), &list, &responsive, &pace).unwrap();
+        let got = wait_file(std::slice::from_ref(&old), &list, &responsive, &pace, &RDC).unwrap();
         assert_eq!(got, (new.clone(), 30));
         assert_eq!(answers.get(), 3, "waited for the window");
         let none = || vec![(old.clone(), 5)];
         assert!(
-            wait_rdc(std::slice::from_ref(&old), &none, &|| true, &pace)
+            wait_file(std::slice::from_ref(&old), &none, &|| true, &pace, &RDC)
                 .unwrap_err()
                 .contains("no new .rdc")
         );
@@ -1541,11 +2274,11 @@ mod tests {
             vec![(new.clone(), growing.get())]
         };
         assert!(
-            wait_rdc(&[], &grows, &|| true, &pace)
+            wait_file(&[], &grows, &|| true, &pace, &RDC)
                 .unwrap_err()
                 .contains("still grows")
         );
-        let hung = wait_rdc(&[], &|| vec![(new.clone(), 9)], &|| false, &pace).unwrap_err();
+        let hung = wait_file(&[], &|| vec![(new.clone(), 9)], &|| false, &pace, &RDC).unwrap_err();
         assert!(hung.contains("doesn't answer"), "{hung}");
     }
 }

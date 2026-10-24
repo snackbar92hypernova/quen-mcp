@@ -31,6 +31,8 @@
 //! nsys = '%NSIGHT_SYSTEMS%\nsys.exe'                             # profiler launches (profiler: nsys:NAME, ngfx:NAME)
 //! ngfx = '%NSIGHT_GRAPHICS%\ngfx.exe'
 //! ngfx_args = '--architecture <GPU> --metric-set-id 0'           # added to every ngfx launch
+//! ngfx_capture = '%NSIGHT_GRAPHICS%\ngfx-capture.exe'            # profiler: ngfx-capture:NAME; unset: the one beside
+//!                                                                # ngfx, else ngfx itself; ngfx.exe here: that route
 //! renderdoc = '%RENDERDOC%\renderdoccmd.exe'                     # profiler: renderdoc:NAME, with the dev interposer
 //! streamline_dev_interposer = '%STREAMLINE%\_artifacts\sl.interposer\Develop_x64\sl.interposer.dll'
 //!                                                                # (tools/streamline) swapped in for RenderDoc runs
@@ -77,6 +79,9 @@ pub struct Config {
     pub nsys: Option<PathBuf>,
     pub ngfx: Option<PathBuf>,
     pub ngfx_args: Option<String>,
+    /// The `ngfx-capture:NAME` launch's exe: Nsight Graphics' ngfx-capture.exe, or ngfx.exe for its Graphics Capture
+    /// activity (profile.rs); unset: the ngfx-capture.exe beside `ngfx`, else `ngfx`.
+    pub ngfx_capture: Option<PathBuf>,
     /// renderdoccmd.exe, and the patched dev build of Streamline's interposer that a `renderdoc:NAME` launch swaps in
     /// for the game's signed one (tools/streamline, profile.rs).
     pub renderdoc: Option<PathBuf>,
@@ -233,6 +238,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
             "nsys" => config.nsys = Some(value.into()),
             "ngfx" => config.ngfx = Some(value.into()),
             "ngfx_args" => config.ngfx_args = Some(value.into()),
+            "ngfx_capture" => config.ngfx_capture = Some(value.into()),
             "renderdoc" => config.renderdoc = Some(value.into()),
             "streamline_dev_interposer" => config.streamline_dev_interposer = Some(value.into()),
             "tracy_capture" => config.tracy_capture = Some(value.into()),
@@ -286,6 +292,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, String> {
         ("renodx_build", &config.renodx_build),
         ("nsys", &config.nsys),
         ("ngfx", &config.ngfx),
+        ("ngfx_capture", &config.ngfx_capture),
         ("renderdoc", &config.renderdoc),
         (
             "streamline_dev_interposer",

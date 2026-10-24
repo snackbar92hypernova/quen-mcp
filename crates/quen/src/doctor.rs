@@ -832,7 +832,7 @@ pub(crate) const NSIGHT_SYSTEMS: Dep = Dep {
 pub(crate) const NSIGHT_GRAPHICS: Dep = Dep {
     name: "NVIDIA Nsight Graphics",
     required: false,
-    enables: "session_launch profiler ngfx:NAME (with ngfx in quen's config)",
+    enables: "session_launch profiler ngfx:NAME and ngfx-capture:NAME (with ngfx in quen's config)",
     how_to_get: "NVIDIA Nsight Graphics: https://developer.nvidia.com/nsight-graphics",
     check: |cx| cx.profiler(&cx.config.ngfx, "ngfx"),
 };
@@ -859,9 +859,7 @@ fn ngfx_replay(cx: &Cx) -> State {
         return State::missing(format!("no ngfx-replay.exe beside {}", ngfx.display()));
     }
     let version = crate::win::file_version(&exe);
-    let ini = env::var_os("APPDATA")
-        .map(|d| PathBuf::from(d).join(r"NVIDIA Corporation\NVIDIA Nsight Graphics.ini"));
-    let asked = ini.as_ref().map(fs::read_to_string);
+    let asked = nsight_ini().map(fs::read_to_string);
     let note = match (&version, asked) {
         (None, _) => "no version resource: Nsight's first-start question can't be checked".into(),
         (_, None | Some(Err(_))) => {
@@ -881,6 +879,12 @@ fn ngfx_replay(cx: &Cx) -> State {
         note: Some(note),
         ..State::found(exe)
     }
+}
+
+/// Nsight Graphics' settings file, where it records its first-start privacy question per version: read, never written.
+pub(crate) fn nsight_ini() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(|d| PathBuf::from(d).join(r"NVIDIA Corporation\NVIDIA Nsight Graphics.ini"))
 }
 
 pub(crate) const GPU_COUNTERS: Dep = Dep {
