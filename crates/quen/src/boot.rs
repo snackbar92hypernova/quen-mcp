@@ -83,7 +83,8 @@ pub(crate) struct Spec {
     pub(crate) photo: bool,
     /// Start the game with `-debugscripts` (finding 50), a condition on the boot row.
     debugscripts: bool,
-    /// `renderdoc:NAME`, `nsys:NAME` or `ngfx:NAME`, as asked, and its launch profile.
+    /// `renderdoc:NAME`, `nsys:NAME`, `ngfx:NAME`, `ngfx-capture:NAME` or `tracy:NAME`, as asked, and its launch
+    /// profile.
     pub(crate) profiler: Option<String>,
     pub(crate) profile: Option<Profile>,
     /// Every file change, in order: quen-core's plan, then the profile's.
@@ -346,9 +347,12 @@ impl Spec {
         }
         let debugscripts = flag("debugscripts", false)?;
         if debugscripts {
-            // ngfx starts the game from its own arguments (`--exe`), where quen passes none.
-            if profile.as_ref().is_some_and(|p| p.tool == Tool::Ngfx) {
-                return Err("debugscripts isn't taken under profiler ngfx".into());
+            // ngfx and ngfx-capture start the game from their own arguments (`--exe`), where quen passes none.
+            if profile
+                .as_ref()
+                .is_some_and(|p| matches!(p.tool, Tool::Ngfx | Tool::NgfxCapture))
+            {
+                return Err("debugscripts isn't taken under profiler ngfx or ngfx-capture".into());
             }
             conditions.push("debugscripts");
         }
@@ -358,8 +362,10 @@ impl Spec {
                     "profiler {profiler} parks ReShade, which the devkit needs: devkit: false"
                 ));
             }
-            if fg && profile.tool == Tool::RenderDoc {
-                return Err("profiler renderdoc turns frame generation off: leave fg out".into());
+            if fg && matches!(profile.tool, Tool::RenderDoc | Tool::NgfxCapture) {
+                return Err(format!(
+                    "profiler {profiler} turns frame generation off: leave fg out"
+                ));
             }
             if let Some(key) = profile.overridden(flat, sections) {
                 return Err(format!(
@@ -394,6 +400,8 @@ impl Spec {
                         .join(",");
                 }
             }
+            // Last, after the launch's own refusals: Nsight's first-start question, read from its settings file.
+            profile.asked(&crate::profile::nsight)?;
             settings_diff.insert("profile".into(), profile.record());
             conditions.extend(profile.conditions());
         }
@@ -632,7 +640,7 @@ impl Spec {
 
     /// What starts the game, and in which folder: the exe itself in bin, or its profile's tool around it, writing into
     /// `out` (profile.rs); with `debugscripts` the game's argument after the exe, which ends the command line but under
-    /// ngfx (refused with it).
+    /// ngfx and ngfx-capture (refused with it).
     pub(crate) fn command(&self, config: &Config, out: &Path) -> (Vec<String>, PathBuf) {
         let bin = config.bin_dir().unwrap_or_default();
         let exe = bin.join(&config.game_exe).display().to_string();

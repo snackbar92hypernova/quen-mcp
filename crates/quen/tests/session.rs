@@ -1301,7 +1301,7 @@ fn launch_profiles_check_park_and_flag_before_anything_changes() {
     let changes = nsys["changes"].to_string();
     assert!(changes.contains("dxgi.dll"), "{changes}");
     let staged = tool(r"pc\dxgi.dll");
-    for profiler in ["nsys:run", "ngfx:trace"] {
+    for profiler in ["nsys:run", "ngfx:trace", "ngfx-capture:cap"] {
         for (args, why) in [
             (
                 json!({"profiler": profiler, "devkit": true}),
@@ -1340,6 +1340,25 @@ fn launch_profiles_check_park_and_flag_before_anything_changes() {
         argv.contains(r"<boot>\\trace") && !argv.contains("--platform"),
         "{argv}"
     );
+    // ngfx-capture (here ngfx's Graphics Capture: no ngfx-capture.exe beside ngfx): frame generation and the script log
+    // refused, then Nsight's first-start question, which a synthetic exe without a version can't answer.
+    for (args, why) in [
+        (
+            json!({"profiler": "ngfx-capture:cap", "fg": true}),
+            "turns frame generation off",
+        ),
+        (
+            json!({"profiler": "ngfx-capture:cap", "debugscripts": true}),
+            "isn't taken under profiler ngfx or ngfx-capture",
+        ),
+        (
+            json!({"profiler": "ngfx-capture:cap"}),
+            "whether Nsight asked its first-start privacy question can't be checked",
+        ),
+    ] {
+        let refused = dry(&mut quen, args.clone());
+        assert!(reason(&refused).contains(why), "{args}: {refused}");
+    }
     assert_eq!(fx.settings(), SETTINGS, "a dry run changed the settings");
     assert!(bin.join("dxgi.dll").exists() && !fx.path("data/state/journal.jsonl").exists());
 }

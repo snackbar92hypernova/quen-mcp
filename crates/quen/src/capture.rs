@@ -103,8 +103,9 @@ pub fn tool() -> Value {
             (wgc_fp16), written as a float16 .npy of linear scRGB (scrgb_f16, 1.0 = 80 nits) and a 16-bit PQ BT.2020 \
             PNG with cICP (pq_bt2020_u16: code values). If WGC fails (wgc_error says why), quen falls back to Desktop \
             Duplication of the game's screen area (desktop_duplication, includes_desktop true: an overlay can \
-            show), only while the game is in front; a focus change drops the frame and refuses. method renderdoc: one \
-            RenderDoc capture, minutes (see method). Compare only captures of one method, encoding and display state \
+            show), only while the game is in front; a focus change drops the frame and refuses. method renderdoc / ngfx: \
+            one RenderDoc / Nsight Graphics capture, minutes (see method). Compare only captures of one method, \
+            encoding and display state \
             (each row records them). Refused, nothing changed: wrong token, the tag taken in this session, no visible \
             game window, no frame; with needs: method hdr while HDR is off (take sdr).",
         "inputSchema": {
@@ -112,7 +113,8 @@ pub fn tool() -> Value {
             "properties": {
                 "token": {"type": "string", "description": "the token session_launch returned"},
                 "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "the file name, unique in the session (A1, B2, ...)"},
-                "method": {"type": "string", "enum": ["sdr", "hdr", "renderdoc"], "description": "default sdr. renderdoc, only in a session launched with profiler renderdoc:NAME: one RenderDoc capture (F12) as <capture root>\\<boot>\\<tag>.rdc (3-5 GB; 12 GB free needed), the game in front; it sends nothing more and returns once the capture is written (up to minutes: the game freezes while RenderDoc writes it), never without the Streamline swap in place"},
+                "method": {"type": "string", "enum": ["sdr", "hdr", "renderdoc", "ngfx"], "description": "default sdr. renderdoc, only in a session launched with profiler renderdoc:NAME: one RenderDoc capture (F12) as <capture root>\\<boot>\\<tag>.rdc (3-5 GB; 12 GB free needed), the game in front; it sends nothing more and returns once the capture is written (up to minutes: the game freezes while RenderDoc writes it), never without the Streamline swap in place. ngfx, only in a session launched with profiler ngfx-capture:NAME: one Nsight Graphics capture (F11) as <capture root>\\<boot>\\<NAME>\\<tag>.ngfx-capture (moved there when Nsight wrote it into its own folder: moved_from), the game in front; it sends nothing more and returns once the file holds still (up to minutes), with its captures row (kind ngfx-capture: ngfx_extract takes its capture_id) and the capture root's total (capture_root_gb). Refused while the capture root is over capture_budget_gb or under 12 GB free, unless user_ok"},
+                "user_ok": {"type": "boolean", "description": "method ngfx only: true only after telling the user that the capture root is over its budget or low on space and that a capture can take several GB, and they agreed"},
             },
             "required": ["token", "tag"],
             "additionalProperties": false,
@@ -125,6 +127,9 @@ struct Shot {
     tag: String,
     hdr: bool,
     renderdoc: bool,
+    ngfx: bool,
+    /// method ngfx: the user agreed to a capture over the budget or low on space.
+    user_ok: bool,
 }
 
 impl Shot {
@@ -135,16 +140,24 @@ impl Shot {
         if tag.is_empty() || tag.len() > 64 || !tag.chars().all(fine) {
             return Err("tag: 1-64 letters, digits, _ or - (it names the file)".into());
         }
-        let (hdr, renderdoc) = match args.get("method").map(Value::as_str) {
-            None | Some(Some("sdr")) => (false, false),
-            Some(Some("hdr")) => (true, false),
-            Some(Some("renderdoc")) => (false, true),
-            Some(m) => return Err(format!("method {m:?}: sdr, hdr or renderdoc")),
+        let (hdr, renderdoc, ngfx) = match args.get("method").map(Value::as_str) {
+            None | Some(Some("sdr")) => (false, false, false),
+            Some(Some("hdr")) => (true, false, false),
+            Some(Some("renderdoc")) => (false, true, false),
+            Some(Some("ngfx")) => (false, false, true),
+            Some(m) => return Err(format!("method {m:?}: sdr, hdr, renderdoc or ngfx")),
+        };
+        let user_ok = match args.get("user_ok") {
+            None => false,
+            Some(_) if !ngfx => return Err("user_ok goes with method ngfx".into()),
+            Some(v) => v.as_bool().ok_or("user_ok must be true or false")?,
         };
         Ok(Shot {
             tag: tag.into(),
             hdr,
             renderdoc,
+            ngfx,
+            user_ok,
         })
     }
 
@@ -155,10 +168,13 @@ impl Shot {
 }
 
 pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["tag", "method"])?;
+    let cx = game::ctx(session, args, &["tag", "method", "user_ok"])?;
     let shot = Shot::parse(args)?;
     if shot.renderdoc {
         return crate::profile::capture(&cx, call, &shot.tag);
+    }
+    if shot.ngfx {
+        return crate::profile::ngfx_capture(&cx, call, &shot.tag, shot.user_ok);
     }
     let root = cx.config.capture_root();
     // Windows' separator, so the artifact's absolute path has one kind; the ledger stores `/` either way.

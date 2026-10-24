@@ -2005,6 +2005,44 @@ if os.path.exists(act): exec(open(act).read())
         assert!(matches!(done, Done::Refused(why) if why.contains("no live session")));
     }
 
+    /// Under profiler ngfx-capture, F11 (Nsight's capture key) goes only through game_screenshot method ngfx; method
+    /// ngfx needs that profiler; user_ok goes with method ngfx only. Nothing reaches the game.
+    #[test]
+    fn f11_is_nsights_capture_key_under_ngfx_capture() {
+        let fx = Fake::new("ngfx-key");
+        let run = |profiler: Option<&str>, tool: &str, args: Value| {
+            let mut session = fx.session();
+            session.live.as_mut().unwrap().profiler = profiler.map(String::from);
+            let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+            let done = super::call(&mut session, &mut call, tool, &args);
+            session.envelope(tool, call, done)
+        };
+        let keys = |tokens: Value| json!({"token": "tok", "tokens": tokens, "dry_run": true});
+        for tokens in [json!(["f11"]), json!(["shift+F11"]), json!(["F11:300"])] {
+            let out = run(Some("ngfx-capture:hair"), "game_keys", keys(tokens));
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains("game_screenshot method ngfx"), "{out}");
+        }
+        for profiler in [None, Some("ngfx:trace"), Some("nsys:run")] {
+            let out = run(profiler, "game_keys", keys(json!(["f11"])));
+            assert_eq!(out["ok"], true, "{profiler:?}: {out}");
+        }
+        let shot = |method: &str, user_ok: Option<bool>| {
+            let mut args = json!({"token": "tok", "tag": "A", "method": method});
+            if let Some(ok) = user_ok {
+                args["user_ok"] = json!(ok);
+            }
+            args
+        };
+        let out = run(Some("ngfx:trace"), "game_screenshot", shot("ngfx", None));
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("profiler ngfx-capture:NAME"), "{out}");
+        let out = run(None, "game_screenshot", shot("sdr", Some(true)));
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("user_ok goes with method ngfx"), "{out}");
+        assert!(fx.calls().is_empty(), "the game got {:?}", fx.calls());
+    }
+
     /// Finding 50: game_scriptlog reads the script log's last lines, those of one channel (any case) if asked; from a
     /// log over 1 MiB the first line read, cut, is dropped; a UTF-16 log reads as text. Bad arguments are refused.
     #[test]

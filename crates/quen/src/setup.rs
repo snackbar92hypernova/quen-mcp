@@ -26,7 +26,7 @@ use crate::{profile, relocate, w3, win};
 
 /// The keys `values` may set: every config key but the Python harness's (`harness`, `python`), the game's image name
 /// (`game_exe`) and the capture test switch (`force_duplication`).
-const SETTABLE: [&str; 18] = [
+const SETTABLE: [&str; 19] = [
     "data_root",
     "capture_root",
     "game_dir",
@@ -37,6 +37,7 @@ const SETTABLE: [&str; 18] = [
     "devkit",
     "nsys",
     "ngfx",
+    "ngfx_capture",
     "renderdoc",
     "streamline_dev_interposer",
     "tracy_capture",
@@ -48,7 +49,7 @@ const SETTABLE: [&str; 18] = [
 ];
 
 /// The settable keys whose value is an absolute path.
-const PATHS: [&str; 13] = [
+const PATHS: [&str; 14] = [
     "data_root",
     "capture_root",
     "game_dir",
@@ -57,6 +58,7 @@ const PATHS: [&str; 13] = [
     "kb",
     "nsys",
     "ngfx",
+    "ngfx_capture",
     "renderdoc",
     "streamline_dev_interposer",
     "tracy_capture",
@@ -548,6 +550,10 @@ fn usable(key: &str, c: &Config) -> Result<(), String> {
         "presentmon" => doctor(&doctor::PRESENTMON),
         "nsys" => exe(&c.nsys, "nsys.exe"),
         "ngfx" => exe(&c.ngfx, "ngfx.exe"),
+        // ngfx.exe there picks the ngfx-capture profile's other route (profile.rs).
+        "ngfx_capture" => exe(&c.ngfx_capture, "ngfx-capture.exe")
+            .or_else(|_| exe(&c.ngfx_capture, "ngfx.exe"))
+            .map_err(|_| format!("{key}: not a file named ngfx-capture.exe or ngfx.exe")),
         "renderdoc" => exe(&c.renderdoc, "renderdoccmd.exe"),
         "streamline_dev_interposer" => doctor(&doctor::STREAMLINE_DEV),
         "tracy_capture" => doctor(&doctor::TRACY),
@@ -802,6 +808,7 @@ pub fn tool() -> Value {
                         "devkit": s("the devkit add-on, relative to bin\\x64_dx12"),
                         "nsys": s("Nsight Systems' nsys.exe"),
                         "ngfx": s("Nsight Graphics' ngfx.exe"),
+                        "ngfx_capture": s("Nsight Graphics' ngfx-capture.exe for profiler ngfx-capture:NAME (unset: the one beside ngfx); its ngfx.exe instead launches through ngfx's Graphics Capture activity"),
                         "renderdoc": s("RenderDoc's renderdoccmd.exe"),
                         "streamline_dev_interposer": s("the patched dev sl.interposer.dll (unsigned)"),
                         "tracy_capture": s("Tracy 0.14.1's tracy-capture.exe"),
