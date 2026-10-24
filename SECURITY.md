@@ -88,7 +88,7 @@ Only your account can write these. A program running as you could change them, b
 
 Text quen returns comes partly from places quen doesn't control: ledger rows (any agent or script can add them), the output and logs of the game, its mods and the tools quen runs, save names, file names in the game folder. To the agent this is data, never instructions.
 
-- `ledger_query` is read-only.
+- `ledger_query` and `ledger_search` are read-only.
 - `ledger_ingest` puts a row on the running session's boot only when the call carries that session's token. Otherwise the row names its boot, or has none. A row doesn't prove who wrote it.
 
 ## Limits

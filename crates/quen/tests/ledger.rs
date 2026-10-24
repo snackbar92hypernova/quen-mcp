@@ -1,5 +1,5 @@
 //! The ledger tools end to end: the real binary's `quen ledger add` / `migrate` and the MCP
-//! tools `ledger_ingest`, `ledger_query` and `ledger_claim`, and game knowledge (`ledger_import`, `ledger_about`,
+//! tools `ledger_ingest`, `ledger_query`, `ledger_search` and `ledger_claim`, and game knowledge (`ledger_import`, `ledger_about`,
 //! `quen kb`, `quen re`), on a synthetic data root and harness in a temp folder.
 #![cfg(windows)]
 
@@ -320,6 +320,37 @@ fn the_mcp_tools_ingest_query_and_judge_claims() {
         json!([[2]]),
         "the refused support wrote nothing: {n}"
     );
+
+    // ledger_search counts only the tables with hits; over 16 KB it answers its first hits and a file with all.
+    let found = tool("ledger_search", json!({"text": "SLOWER"}));
+    let hit =
+        json!({"table": "claims", "id": 1, "column": "text", "excerpt": "B is 0.2 ms slower"});
+    assert_eq!(
+        (&found["tables"], &found["hits"]),
+        (&json!({"claims": 1}), &json!([hit])),
+        "{found}"
+    );
+    let rows: Vec<Value> = (0..200)
+        .map(|_| {
+            let mut m = measurement("files", 1.0);
+            m["note"] = json!(format!("spill {}", "x".repeat(300)));
+            m
+        })
+        .collect();
+    assert_eq!(tool("ledger_ingest", json!({"rows": rows}))["ok"], true);
+    let big = tool("ledger_search", json!({"text": "spill"}));
+    assert_eq!(
+        (&big["truncated"], &big["hit_count"], &big["tables"]),
+        (&json!(true), &json!(200), &json!({"measurements": 200})),
+        "{big}"
+    );
+    let path = big["file"]
+        .as_str()
+        .unwrap()
+        .replace("%USERPROFILE%", &home);
+    let file: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(file["hits"].as_array().unwrap().len(), 200);
+    assert!(big["hits"].as_array().unwrap().len() < 200);
 
     let list = quen.request("tools/list", json!({}));
     let names: Vec<&str> = list["result"]["tools"]

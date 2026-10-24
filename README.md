@@ -84,7 +84,7 @@ quen makes that the agent's job, with guard rails:
   - Captures and measurements.
   - Claims, which count as proven only when two independent methods support them.
   - Reverse-engineering findings and knowledge-base notes, indexed per function, shader or hook (`ledger_about`), so nothing has to be extracted twice.
-  - Views answer the common questions; `ledger_query` runs read-only SQL.
+  - Views answer the common questions; `ledger_query` runs read-only SQL; `ledger_search` finds rows by the text in them.
 - **A built-in guide.** `quen_guide` serves the agent playbook and the ledger's schema from the installed program, so every agent gets instructions that match its version.
 
 ## How it fits together
