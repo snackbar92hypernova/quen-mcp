@@ -86,9 +86,10 @@ pub fn tools() -> Vec<Value> {
                 crc_ok (header, tables, exports_bad: reported, never refused), names, imports, exports, buffers, and \
                 tree: each export's properties (handles as {import: path} or {export: index}; a type quen doesn't \
                 decode comes back raw, never failing the read) and a CMaterialInstance's params. Another file: its \
-                size and first bytes. evidence: a ledger row's fields (method_family files, tag O). Over 16 KB the \
-                whole result goes to a JSON file under the capture root (file, truncated). Files over 256 MiB are \
-                refused.",
+                size and first bytes, and text, the whole file, when it is UTF-8 or UTF-16 with a BOM, not blank, \
+                with no control characters but tabs and line breaks (the BOM and trailing NULs dropped). evidence: \
+                a ledger row's fields (method_family files, tag O). Over 16 KB the whole result goes to a JSON file \
+                under the capture root (file, truncated). Files over 256 MiB are refused.",
             "inputSchema": {"type": "object", "properties": {
                 "path": {"type": "string", "description": "the file's path, as data_find lists it"},
                 "where": wheres,
@@ -587,7 +588,7 @@ fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     };
     let sha = sha256_hex(&bytes);
     out.insert("sha256".into(), json!(sha));
-    match cr2w::read(&bytes, &opts) {
+    let list = match cr2w::read(&bytes, &opts) {
         Ok(mut v) => {
             let tree = v
                 .as_object_mut()
@@ -595,13 +596,18 @@ fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
                 .unwrap_or_default();
             out.insert("cr2w".into(), v);
             out.insert("tree".into(), tree);
+            "tree"
         }
         Err(why) => {
             let mut v = cr2w::not_cr2w(&bytes);
             v["why"] = json!(why);
             out.insert("not_cr2w".into(), v);
+            if let Some(text) = cr2w::text(&bytes) {
+                out.insert("text".into(), json!(text));
+            }
+            "text"
         }
-    }
+    };
     let key = provenance["content"]["key"]
         .as_str()
         .unwrap_or("none")
@@ -615,7 +621,7 @@ fn read(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         json!({"method_family": "files", "tag": "O", "note": note}),
     );
     out.insert("provenance".into(), provenance);
-    spill(session, call, config, "data_read", args, out, "tree")
+    spill(session, call, config, "data_read", args, out, list)
 }
 
 /// A scan's unit: one path's copies that share a crc32 (a bundle source), or a depot file.
@@ -822,7 +828,7 @@ fn scan(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
 
 /// A result over [`INLINE_BYTES`] goes whole to `<tool>-<secs>-<random>.json`, in the live session's capture folder,
 /// else in `<capture root>\data\reads`, with a captures row (none while another quen holds the lock: `captures_row`
-/// says why); inline only the first of its `list` that fit (`truncated`, `file`).
+/// says why); inline only the first of its `list` (items, or a text's bytes) that fit (`truncated`, `file`).
 fn spill(
     session: &Session,
     call: &mut Call,
@@ -854,14 +860,19 @@ fn spill(
         &mut listed,
     )?;
     call.artifact(&file);
-    if let Some(Value::Array(items)) = out.get_mut(list) {
-        let mut size = 0;
-        let fit = items.iter().take_while(|item| {
-            size += item.to_string().len() + 1;
-            size <= INLINE_BYTES / 2
-        });
-        let fit = fit.count();
-        items.truncate(fit);
+    match out.get_mut(list) {
+        Some(Value::Array(items)) => {
+            let mut size = 0;
+            let fit = items.iter().take_while(|item| {
+                size += item.to_string().len() + 1;
+                size <= INLINE_BYTES / 2
+            });
+            let fit = fit.count();
+            items.truncate(fit);
+        }
+        // ponytail: cut by raw bytes; JSON escapes (\n, \") make the inline text a little longer.
+        Some(Value::String(text)) => text.truncate(text.floor_char_boundary(INLINE_BYTES / 2)),
+        _ => {}
     }
     out.insert("truncated".into(), json!(true));
     out.insert("file".into(), json!(file));
@@ -1482,7 +1493,7 @@ mod tests {
         let modded = cr2w(&["", "CMaterialInstance", "Roughness_max"], &[]);
         t.put(
             r"game\content\content0\bundles\blob.bundle",
-            bundle(&[(r"a\X.w2mi", &vanilla), (r"b\y.xbm", b"DDS raw bytes")]),
+            bundle(&[(r"a\X.w2mi", &vanilla), (r"b\y.xbm", b"DDS \0raw bytes")]),
         );
         t.put(
             r"game\Mods\modA\content\blob0.bundle",
@@ -1540,13 +1551,36 @@ mod tests {
         assert!(note.starts_with(&want), "{note}");
         let raw = run(&config, "data_read", json!({"path": r"b\y.xbm"}));
         assert_eq!(
-            raw["not_cr2w"]["first_bytes"], "44445320726177206279746573",
+            (&raw["not_cr2w"]["first_bytes"], &raw["text"]),
+            (&json!("4444532000726177206279746573"), &Value::Null),
             "{raw}"
         );
         assert_eq!(
             run(&config, "data_read", json!({"path": "nope"}))["refused"],
             true
         );
+    }
+
+    /// A text file comes back as text; over 16 KB, whole in the file and its first 8 KB inline.
+    #[test]
+    fn a_text_file_comes_back_as_text() {
+        let t = Temp::new("text");
+        let csv = "name;probability\r\n".repeat(1000);
+        t.put(
+            r"game\content\content0\bundles\startup.bundle",
+            bundle(&[(r"env\weather.csv", csv.as_bytes())]),
+        );
+        let read = run(
+            &t.config(),
+            "data_read",
+            json!({"path": r"env\weather.csv"}),
+        );
+        assert_eq!(read["truncated"], true, "{read}");
+        let inline = read["text"].as_str().unwrap();
+        assert!(inline.len() == INLINE_BYTES / 2 && csv.starts_with(inline));
+        let file: Value =
+            serde_json::from_slice(&fs::read(read["file"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(file["text"], csv);
     }
 
     /// A refs scan pages by limit and goes on from next with no file twice; identical copies count once; limit 0

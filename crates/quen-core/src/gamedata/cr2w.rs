@@ -326,6 +326,31 @@ pub fn not_cr2w(d: &[u8]) -> Value {
     json!({"bytes": d.len(), "first_bytes": hex(&d[..d.len().min(16)])})
 }
 
+/// A file's text: UTF-8 (a BOM dropped) or UTF-16 after its BOM, without its trailing NULs (padding a few of the
+/// game's CSVs end in); not blank, with no control characters but tabs and line breaks (many of the game's navigation
+/// files are valid UTF-8 too). None: a binary file.
+pub fn text(d: &[u8]) -> Option<String> {
+    let mut s = match d {
+        [0xFF, 0xFE, rest @ ..] | [0xFE, 0xFF, rest @ ..] if rest.len() % 2 == 0 => {
+            let from = if d[0] == 0xFF {
+                u16::from_le_bytes
+            } else {
+                u16::from_be_bytes
+            };
+            let units: Vec<u16> = rest.chunks(2).map(|c| from([c[0], c[1]])).collect();
+            String::from_utf16(&units).ok()?
+        }
+        _ => std::str::from_utf8(d.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(d))
+            .ok()?
+            .to_owned(),
+    };
+    s.truncate(s.trim_end_matches('\0').len());
+    let printable = s
+        .chars()
+        .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'));
+    (printable && !s.trim().is_empty()).then_some(s)
+}
+
 struct Cx<'a> {
     names: &'a [String],
     imports: &'a [Import],
@@ -848,6 +873,37 @@ pub(crate) mod tests {
         );
         assert!(read(b"RIFF....", &opts()).is_err());
         assert_eq!(not_cr2w(b"RIFF1234")["first_bytes"], "5249464631323334");
+    }
+
+    /// UTF-8 comes back whole, a BOM dropped; UTF-16 after its BOM, either order; trailing NULs are dropped; another
+    /// NUL or control character, invalid UTF-8, or a blank file is binary.
+    #[test]
+    fn text_is_utf8_or_utf16_with_a_bom() {
+        let csv = "name;probability\r\nrain;0.5\r\n";
+        assert_eq!(text(csv.as_bytes()).as_deref(), Some(csv));
+        assert_eq!(text(b"\xEF\xBB\xBFa;b").as_deref(), Some("a;b"));
+        let utf16 = |bom: [u8; 2], f: fn(u16) -> [u8; 2]| {
+            let units = "ä;b".encode_utf16().flat_map(f);
+            text(&bom.into_iter().chain(units).collect::<Vec<u8>>())
+        };
+        assert_eq!(
+            utf16([0xFF, 0xFE], u16::to_le_bytes).as_deref(),
+            Some("ä;b")
+        );
+        assert_eq!(
+            utf16([0xFE, 0xFF], u16::to_be_bytes).as_deref(),
+            Some("ä;b")
+        );
+        assert_eq!(text(b"a;b\r\n\0\0").as_deref(), Some("a;b\r\n"));
+        for binary in [
+            &b"DDS \0\0\0\x7c"[..],
+            b"a\x01b",
+            b"a;\xE4;b",
+            b"\t\0\0",
+            b"",
+        ] {
+            assert_eq!(text(binary), None, "{binary:?}");
+        }
     }
 
     /// The older header: names and dependencies as strings, the first dependency implicit; read
