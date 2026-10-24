@@ -1622,8 +1622,9 @@ impl<'a> Session<'a> {
             };
             cx.devkit_loaded()
         };
-        let devkit = || spec.devkit || (spec.play && self.live.as_ref().is_some_and(loaded));
-        let played = played.and_then(|()| match devkit() {
+        let devkit = played.is_ok()
+            && (spec.devkit || (spec.play && self.live.as_ref().is_some_and(loaded)));
+        let played = played.and_then(|()| match devkit {
             true => {
                 let mut diff = spec.settings_diff.clone();
                 let conditions = diff.entry("conditions").or_insert(json!([]));
@@ -1642,8 +1643,10 @@ impl<'a> Session<'a> {
             return self.fail(call, why, fields);
         }
         if let Some(game_dir) = &config.game_dir {
-            // The mods that loaded, now that the boot has parked its set.
-            let set = w3::mod_set(game_dir, &mut self.cache, spec.vortex.as_ref())
+            // The mods that loaded, now that the boot has parked its set, the devkit among them when it loaded.
+            let devkit = config.devkit.as_deref().filter(|_| devkit);
+            let (inv, renodx) = (spec.vortex.as_ref(), config.renodx_addon.as_deref());
+            let set = w3::mod_set(game_dir, &mut self.cache, inv, renodx, devkit)
                 .map_err(|e| format!("mod set: {e}"))
                 .and_then(|entries| {
                     if let Some(inv) = &spec.vortex {

@@ -365,6 +365,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 - **How quen loads it:** a launch with `devkit: true` writes the devkit's path (`devkit` in quen's config, relative to bin) into ReShade.ini's `[ADDON] LoadFromDllMain`, journaled; `devkit: false` empties that line. The RenoDX add-on (`renodx_addon`) isn't needed for it.
 - **Default:** `devkit: true` when the devkit is in quen's config, ReShade (`dxgi.dll` and `ReShade.ini`) and the devkit's file are in bin, and nothing parks ReShade; otherwise false. Asked for while one of those is missing, or while `park` parks `dxgi.dll`, it is refused.
 - **The check:** the launch waits up to 60 s for the devkit's module in the game. Only then does the boot row get `devkit = 1` and `"devkit"` in `settings_diff.conditions`; without the module the launch fails and its changes are undone.
+- **Mod set:** a boot that loaded the devkit has it as an entry: kind `addon`, name its file's stem (`renodx-devkit`), `home` its path under bin, no config.
 - **It roughly doubles frame time: never time on a devkit boot.** Use it for shader and resource work, dumps, snapshots, and absolute-nits checks (peak, paper white).
 - **Dumps:**
   - Each one freezes presents for about a second. The game must be in front and rendering, not in its pause menu, with frame generation off (quen's default).
@@ -576,6 +577,8 @@ SELECT kind, name, content_hash, config_hash, parked FROM mod_set_entries WHERE 
 EXCEPT
 SELECT kind, name, content_hash, config_hash, parked FROM mod_set_entries WHERE mod_set_id = ?2
 ```
+
+The RenoDX add-on's entry (`renodx_addon`) also records ReShade.ini `[renodx]`, `[renodx-preset1]` and `[<its stem>-preset1]`, in `config_values` as `<section>.<key>`.
 
 **Open questions:**
 - Claims not yet proven: `SELECT * FROM claims_status WHERE status = 'open' AND NOT proven`.

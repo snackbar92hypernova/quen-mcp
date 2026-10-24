@@ -4,7 +4,7 @@ mod ledger_common;
 
 use ledger_common::{TempDb, boot, game, rows, sha};
 use quen_core::ledger::{
-    BootModStatus, Error, Ledger, LoadStatus, ModVersion, Provenance, SCHEMA_VERSION,
+    BootModStatus, Error, Ledger, LoadStatus, ModVersion, Provenance, Row, SCHEMA_VERSION,
 };
 use quen_core::mods::{
     ConfigSource, HashCache, Kind, MemSource, ModEntry, ModSpec, fingerprint, set_hash,
@@ -43,7 +43,7 @@ fn a_0001_ledger_migrates_in_place() {
     let mut l = Ledger::open(&db.0).unwrap();
     let version = rows(&l, "SELECT user_version FROM pragma_user_version", &[]);
     assert_eq!(version, vec![vec![json!(SCHEMA_VERSION)]]);
-    assert_eq!(SCHEMA_VERSION, 15);
+    assert_eq!(SCHEMA_VERSION, 16);
     let entries = rows(
         &l,
         "SELECT mod_set_id, kind, name, parked, content_hash, home, file_count, bytes, config_hash, config_values,
@@ -153,6 +153,7 @@ fn only_a_known_build_gets_a_label() {
         path: "GAME/bin/x64/W3ElementMap.ini".into(),
         section: None,
         keys: vec!["Mode".into(), "RaisePercent".into()],
+        qualify: false,
     };
     let specs = [
         spec(
@@ -255,6 +256,42 @@ fn only_a_known_build_gets_a_label() {
         })
         .is_err(),
         "a content hash is 64 lowercase hex"
+    );
+}
+
+/// A build from someone else's fork, its commit unknown: ledger_ingest's row labels it `other`, its source free text,
+/// and the entries with its hash get the label. A provenance outside the list is refused.
+#[test]
+fn a_build_from_elsewhere_is_labelled_other() {
+    let mut l = Ledger::open_in_memory().unwrap();
+    let label = |provenance: &str| {
+        serde_json::from_value::<Vec<Row>>(
+            json!([{"table": "mod_versions", "content_hash": sha(8), "kind": "addon",
+            "name": "renodx-synthetic", "version": "fork", "provenance": provenance,
+            "source": "github.com/owner/repo, commit unknown"}]),
+        )
+    };
+    assert!(label("fork").is_err(), "an unknown provenance");
+    l.ingest(&label("other").unwrap()).unwrap();
+    let entry = ModEntry {
+        kind: Kind::Addon,
+        name: "renodx-synthetic".into(),
+        home: "bin/x64/renodx-synthetic.addon64".into(),
+        parked: false,
+        content_hash: sha(8),
+        file_count: 1,
+        bytes: 6,
+        config_hash: None,
+        config_values: Default::default(),
+    };
+    l.add_mod_set(&[entry]).unwrap();
+    assert_eq!(
+        rows(
+            &l,
+            "SELECT version_label, provenance FROM mod_set_entries",
+            &[]
+        ),
+        [[json!("fork"), json!("other")]]
     );
 }
 
