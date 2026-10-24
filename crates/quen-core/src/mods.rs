@@ -143,6 +143,9 @@ pub struct ConfigSource {
     /// The keys whose values are recorded, matched exactly; empty records every key in scope. Within one source, a
     /// key's first line wins.
     pub keys: Vec<String>,
+    /// With a section: each value is recorded as `<section>.<key>`, so it neither overrides nor is overridden by
+    /// another source's same key (RenoDX's global and preset sections).
+    pub qualify: bool,
 }
 
 /// One mod's fingerprint: identity (kind and name), build and config. It is a row of `mod_set_entries`, and
@@ -165,7 +168,7 @@ pub struct ModEntry {
     /// The sha256 of the sorted `file name[Section]<TAB>sha256 of the lines in scope` lines of its config sources (`-`
     /// for a missing file); `None` when it has none.
     pub config_hash: Option<String>,
-    /// The recorded config values, as text.
+    /// The recorded config values, as text, by key (`<section>.<key>` from a [`ConfigSource::qualify`] source).
     #[serde(default)]
     pub config_values: BTreeMap<String, String>,
 }
@@ -276,6 +279,7 @@ fn config(
             sha256_hex(scope.concat().as_bytes())
         ));
         let mut found = BTreeMap::new();
+        let prefix = source.section.as_deref().filter(|_| source.qualify);
         for line in scope.iter().map(|line| line.trim()) {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -285,9 +289,8 @@ fn config(
                 && !key.is_empty()
                 && (source.keys.is_empty() || source.keys.iter().any(|k| k == key))
             {
-                found
-                    .entry(key.to_string())
-                    .or_insert_with(|| value.trim().to_string());
+                let key = prefix.map_or_else(|| key.to_string(), |s| format!("{s}.{key}"));
+                found.entry(key).or_insert_with(|| value.trim().to_string());
             }
         }
         values.extend(found);
@@ -583,6 +586,7 @@ mod tests {
             path: path.into(),
             section: section.map(String::from),
             keys: keys.iter().map(|k| k.to_string()).collect(),
+            qualify: false,
         }
     }
 
@@ -873,6 +877,30 @@ mod tests {
         let mut folder = specs()[0].clone();
         folder.home = "GAME/Mods/modGone".into();
         assert!(fingerprint(&src, &mut HashCache::default(), &folder).is_err());
+    }
+
+    #[test]
+    fn qualified_sections_keep_a_shared_key_apart() {
+        let mut src = game();
+        src.put(
+            format!("{BIN}/ReShade.ini"),
+            "[renodx]\nMode=1\n[renodx-preset1]\nMode=2\nPeak=1000\n[W3Perf]\nMode=3\n",
+        );
+        let mut spec = specs()[2].clone();
+        spec.config = ["renodx", "renodx-preset1", "W3Perf"]
+            .map(|s| ConfigSource {
+                qualify: s != "W3Perf",
+                ..source(&format!("{BIN}/ReShade.ini"), Some(s), &[])
+            })
+            .into();
+        let e = fingerprint(&src, &mut HashCache::default(), &spec).unwrap();
+        let want = [
+            ("Mode", "3"),
+            ("renodx-preset1.Mode", "2"),
+            ("renodx-preset1.Peak", "1000"),
+            ("renodx.Mode", "1"),
+        ];
+        assert_eq!(e.config_values, values(&want));
     }
 
     #[test]

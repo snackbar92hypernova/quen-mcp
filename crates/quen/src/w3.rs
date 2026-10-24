@@ -109,11 +109,19 @@ pub fn tidy_parking(game_dir: &Path) {
 /// With Vortex's records (`inv`), also what they name a mod's: its other files in bin (kind `bin`, by file name, its
 /// config its `<stem>.ini`; an ini whose stem another file in bin has is that file's config), its menu XMLs (kind
 /// `menu`, by stem) and its folders in `DLC` (kind `dlc`).
+/// The RenoDX add-on (`renodx`, the config's `renodx_addon`) also has RenoDX's own sections of ReShade.ini, its keys
+/// recorded as `<section>.<key>`: `[renodx]` (the global settings under RenoDX's default `global_name`), and
+/// `[renodx-preset1]` and `[<name>-preset1]` (preset 1 under the default name and under the add-on's own, which our
+/// build sets). renodx's utils/settings.hpp loads preset 1 at every start: the preset slider's index isn't saved.
+/// `devkit`: the devkit's path relative to bin on a boot that loaded it (ReShade.ini `[ADDON] LoadFromDllMain`), an
+/// add-on entry by its stem, unless one of that name is loaded from bin.
 /// ponytail: DLC folders outside Vortex aren't fingerprinted (4.04 kept the game's own DLCs there, GBs).
 pub fn mod_set(
     game_dir: &Path,
     cache: &mut HashCache,
     inv: Option<&Inventory>,
+    renodx: Option<&str>,
+    devkit: Option<&str>,
 ) -> io::Result<Vec<ModEntry>> {
     let bin = boot::bin_dir(game_dir);
     let parking = parking(game_dir);
@@ -184,23 +192,36 @@ pub fn mod_set(
         } else {
             continue;
         };
+        let reshade = |section: String, qualify| ConfigSource {
+            path: bin.join("ReShade.ini"),
+            section: Some(section),
+            keys: Vec::new(),
+            qualify,
+        };
         let config = match kind {
-            Kind::Asi | Kind::Addon => vec![
-                ConfigSource {
+            Kind::Asi | Kind::Addon => {
+                let own = ConfigSource {
                     path: bin.join(format!("{name}.ini")),
                     section: None,
                     keys: Vec::new(),
-                },
-                ConfigSource {
-                    path: bin.join("ReShade.ini"),
-                    section: Some(name.clone()),
-                    keys: Vec::new(),
-                },
-            ],
+                    qualify: false,
+                };
+                let mut config = vec![own, reshade(name.clone(), false)];
+                if kind == Kind::Addon && renodx.is_some_and(|r| r.eq_ignore_ascii_case(&lower)) {
+                    let sections = [
+                        "renodx".into(),
+                        "renodx-preset1".into(),
+                        format!("{name}-preset1"),
+                    ];
+                    config.extend(sections.map(|s| reshade(s, true)));
+                }
+                config
+            }
             Kind::Bin if !lower.ends_with(".ini") => vec![ConfigSource {
                 path: bin.join(Path::new(&name).with_extension("ini")),
                 section: None,
                 keys: Vec::new(),
+                qualify: false,
             }],
             _ => Vec::new(),
         };
@@ -212,6 +233,25 @@ pub fn mod_set(
             ignore: Vec::new(),
             config,
         });
+    }
+    if let Some(path) = devkit {
+        let home = bin.join(path);
+        let name = home
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let named = |s: &ModSpec| s.kind == Kind::Addon && s.name.eq_ignore_ascii_case(&name);
+        if !specs.iter().any(|s| !s.parked && named(s)) {
+            specs.push(ModSpec {
+                kind: Kind::Addon,
+                name,
+                home,
+                parked: false,
+                ignore: Vec::new(),
+                config: Vec::new(),
+            });
+        }
     }
     // A file staged over an installed one: the copy is loaded, the original parked under its name. The ledger keys an
     // entry by kind and name, so the set holds the loaded one.
@@ -413,6 +453,7 @@ pub fn state(config: &Config, started: Option<SystemTime>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     /// Feature tests 4: session_status's game state says when the log is a past launch's: written before the game quen
@@ -433,6 +474,69 @@ mod tests {
         assert_eq!(stale(Some(now + Duration::from_secs(60))), true);
         assert_eq!(stale(Some(now - Duration::from_secs(60))), false);
         assert_eq!(state(&config, None)["bits"], json!(["valid", "menu"]));
+        let _ = fs::remove_dir_all(&dir); // this test's own temp folder
+    }
+
+    /// The RenoDX add-on's entry holds RenoDX's sections of ReShade.ini, key by section, and no other add-on's does;
+    /// the devkit is an entry only on a boot that loaded it, and never a second entry of one name.
+    #[test]
+    fn renodx_s_sections_and_the_devkit_are_in_the_mod_set() {
+        let dir = std::env::temp_dir().join(format!("quen-w3-mod-set-{}", std::process::id()));
+        let bin = boot::bin_dir(&dir);
+        fs::create_dir_all(bin.join("devkit")).unwrap();
+        fs::write(bin.join("renodx-synthetic.addon64"), "renodx").unwrap();
+        fs::write(bin.join("Other.addon64"), "other").unwrap();
+        fs::write(bin.join(r"devkit\renodx-devkit.addon64"), "devkit").unwrap();
+        let ini = |peak: &str| {
+            format!(
+                "[renodx]\nSettingsMode=1\n[renodx-preset1]\nToneMapPeakNits={peak}\nSettingsMode=2\n\
+                 [renodx-synthetic-preset1]\nToneMapType=3\n[Other]\nMode=1\n"
+            )
+        };
+        fs::write(bin.join("ReShade.ini"), ini("1000")).unwrap();
+        let addon = Some("renodx-synthetic.addon64");
+        let set = |devkit| mod_set(&dir, &mut HashCache::default(), None, addon, devkit).unwrap();
+        let entry = |set: &[ModEntry], id: &str| set.iter().find(|e| e.id() == id).cloned();
+        let values = |pairs: &[(&str, &str)]| {
+            let pairs = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+            pairs.collect::<BTreeMap<_, _>>()
+        };
+        let before = set(None);
+        assert_eq!(
+            entry(&before, "addon:renodx-synthetic")
+                .unwrap()
+                .config_values,
+            values(&[
+                ("renodx.SettingsMode", "1"),
+                ("renodx-preset1.SettingsMode", "2"),
+                ("renodx-preset1.ToneMapPeakNits", "1000"),
+                ("renodx-synthetic-preset1.ToneMapType", "3"),
+            ])
+        );
+        let other = entry(&before, "addon:Other").unwrap();
+        assert_eq!(other.config_values, values(&[("Mode", "1")]));
+        assert_eq!(entry(&before, "addon:renodx-devkit"), None);
+
+        fs::write(bin.join("ReShade.ini"), ini("800")).unwrap();
+        let after = set(Some(r"devkit\renodx-devkit.addon64"));
+        let devkit = entry(&after, "addon:renodx-devkit").unwrap();
+        let home = Path::new(r"bin\x64_dx12\devkit\renodx-devkit.addon64");
+        assert_eq!((devkit.home.as_path(), devkit.parked), (home, false));
+        let d = mods::diff(&before, &after);
+        assert_eq!(d.added, ["addon:renodx-devkit"]);
+        let [change] = &d.config_changed[..] else {
+            panic!("{:?}", d.config_changed)
+        };
+        assert_eq!(change.entry, "addon:renodx-synthetic");
+        assert_ne!(change.before, change.after);
+        let peak = [Some("1000".to_string()), Some("800".to_string())];
+        assert_eq!(
+            change.values,
+            BTreeMap::from([("renodx-preset1.ToneMapPeakNits".to_string(), peak)])
+        );
+        // A devkit in bin itself is the entry bin's listing already has.
+        let in_bin = set(Some("other.addon64"));
+        assert_eq!(in_bin.len(), before.len());
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
     }
 

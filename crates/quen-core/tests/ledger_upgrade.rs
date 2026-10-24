@@ -76,6 +76,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0015_mod_kinds.sql",
         "8f6620b592a18b90df6258e513ff90736c384e3815ec1a54af794cae81e0128b",
     ),
+    (
+        "0016_provenance_other.sql",
+        "2f7a24556b0f560a0230b029305dab98ed5e61262590daa7da0044c8f71e833b",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -558,6 +562,20 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
                VALUES (1, 'bin', 'y', 0, 'y', '0000000000000000000000000000000000000000000000000000000000000000', NULL, 1)",
             "UPDATE mod_versions SET kind = 'other'",
             "UPDATE boot_mod_status SET kind = 'other'",
+        ] {
+            assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
+        }
+        // 0016: a label and an entry take provenance other; no other new value.
+        now.execute_batch(&format!(
+            "INSERT INTO mod_versions (content_hash, kind, name, version, provenance, source)
+               VALUES ('{0}', 'addon', 'renodx-synthetic', 'fork', 'other', 'github.com/owner/repo, commit unknown');
+             UPDATE mod_set_entries SET version_label = 'fork', provenance = 'other' WHERE name = 'modAlpha';",
+            sha(13)
+        ))
+        .unwrap();
+        for bad in [
+            "UPDATE mod_versions SET provenance = 'fork'",
+            "UPDATE mod_set_entries SET provenance = 'fork' WHERE name = 'modAlpha'",
         ] {
             assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
         }

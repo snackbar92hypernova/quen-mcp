@@ -75,6 +75,9 @@ sql_enum! {
         GitCommit = "git_commit",
         /// A third-party download; the source is the Nexus file name.
         NexusFile = "nexus_file",
+        /// Any other build, e.g. one from someone else's fork; the source is free text naming where it came from
+        /// (`github.com/<owner>/<repo>, commit unknown`).
+        Other = "other",
     }
 }
 
@@ -128,7 +131,7 @@ pub struct ModVersion {
     pub name: String,
     pub version: String,
     pub provenance: Provenance,
-    /// The git commit, or the Nexus file name.
+    /// The git commit, the Nexus file name, or (other) where the build came from.
     pub source: String,
 }
 
