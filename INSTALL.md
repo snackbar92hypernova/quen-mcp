@@ -381,7 +381,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
 | `gamesaves\` | a copy of your `gamesaves` folder, refreshed before every launch |
 | `logs\<time>-<session>\` | one folder per session: the backups of the files it patched (`backup\`), the game's log, a numbered log per tool step (PresentMon's too), the finished journal, and `game-logs\`: copies of the game folder's `*.log` files the boot wrote (quen's, the Native Bridge's, ReShade's, the mods'), which the next launch would overwrite. They can hold personal data (a Steam id, the PC's name): keep them on this PC |
 | `logs\serve.log` | the background `quen serve` log (a `quen serve --stay` writes to its terminal instead) |
-| `logs\queries\` | `ledger_query` results too big to answer inline |
+| `logs\queries\` | `ledger_query` and `ledger_search` results too big to answer inline |
 | `state\backups\` | a copy of the ledger from before each upgrade of its schema |
 | `captures\<session>\` | screenshots, PresentMon CSVs and memory-tool results too big to answer inline (or under `capture_root`) |
 | `captures\<boot id>\` | a profiler's output: RenderDoc captures (3-5 GB each), Nsight reports and traces, Tracy captures |

@@ -1,14 +1,15 @@
-//! Opening, migrations, the read-only query and typed ingest (docs/intent.md, "The ledger").
+//! Opening, migrations, the read-only query and search, and typed ingest (docs/intent.md, "The ledger").
 
 mod ledger_common;
 
 use std::time::{Duration, Instant};
 
-use ledger_common::{TempDb, boot, capture, game, measurement, rows, sha};
+use ledger_common::{TempDb, boot, capture, fake_kb, game, measurement, rows, sha};
 use quen_core::hdr::Encoding;
 use quen_core::ledger::{
-    BootEnd, BootModStatus, BootStart, Capture, Claim, Error, Ledger, LoadStatus, Measurement,
-    ModVersion, Outcome, PlayerPose, Pose, Provenance, ReTarget, Row, SCHEMA_VERSION, Save, Tag,
+    BootEnd, BootModStatus, BootStart, Capture, Claim, Error, Game, Hit, Ledger, LoadStatus,
+    Measurement, ModVersion, Outcome, PlayerPose, Pose, Provenance, ReTarget, Row, SCHEMA_VERSION,
+    Save, Tag,
 };
 use quen_core::mods::{Kind, ModEntry};
 use rusqlite::Connection;
@@ -241,6 +242,124 @@ fn query_stops_at_its_time_limit() {
         vec![vec![json!(1)]],
         "the connection still works"
     );
+}
+
+/// ledger_search's core: a word is found in a claim's text, a measurement's note and the KB's index, in any ASCII case,
+/// by table, then id; `%` and `_` are plain characters.
+#[test]
+fn search_finds_text_across_tables_literally_in_any_case() {
+    let db = TempDb::new();
+    let mut l = Ledger::open(&db.0).unwrap();
+    l.add_game(&Game {
+        name: "synthetic".into(),
+        exe_path: "%GAME_DIR%/bin/x64/game.exe".into(),
+        exe_sha256: sha(1),
+        build_stamp: None,
+    })
+    .unwrap();
+    l.scan_kb(&fake_kb(db.dir(), &sha(1))).unwrap();
+    let c = l
+        .add_claim(&Claim {
+            text: "Zephyr clips at 50% white".into(),
+            scope: None,
+        })
+        .unwrap();
+    let mut note = |text: &str| {
+        l.add_measurement(&Measurement {
+            boot_id: None,
+            capture_id: None,
+            metric: "frame_ms".into(),
+            value: Some(1.0),
+            unit: None,
+            state_label: None,
+            method_family: "tracy".into(),
+            tag: Tag::M,
+            run_id: None,
+            note: Some(text.into()),
+            extraction_id: None,
+            world: None,
+        })
+        .unwrap()
+    };
+    let m = note("ZEPHYR ran 500 frames");
+    note("BetaXSetup ran");
+    let find = |text: &str| l.search(text, Duration::from_secs(10)).unwrap();
+    let hit = |table: &str, id: i64, column: &str, excerpt: &str| Hit {
+        table: table.into(),
+        id: Some(id),
+        column: column.into(),
+        excerpt: excerpt.into(),
+    };
+    assert_eq!(
+        find("zephyr"),
+        [
+            hit("claims", c, "text", "Zephyr clips at 50% white"),
+            hit("measurements", m, "note", "ZEPHYR ran 500 frames"),
+        ]
+    );
+    assert_eq!(
+        find("50%"),
+        [hit("claims", c, "text", "Zephyr clips at 50% white")]
+    );
+    let key = find("beta_setup");
+    assert!(
+        key.iter().any(
+            |h| (h.table.as_str(), h.column.as_str(), h.excerpt.as_str())
+                == ("entities", "key", "Beta_Setup")
+        ),
+        "{key:?}"
+    );
+    assert!(key.iter().all(|h| h.table != "measurements"), "{key:?}");
+    let heading = find("ALLOCATION");
+    assert!(
+        heading
+            .iter()
+            .any(|h| (h.table.as_str(), h.column.as_str()) == ("kb_sections", "heading")),
+        "{heading:?}"
+    );
+}
+
+/// A table no code knows, as a later migration would add, is searched too; one WITHOUT ROWID gives no id; a blob is not
+/// text; a long value's excerpt is cut on character boundaries; the search stops at its time limit.
+#[test]
+fn search_reads_the_tables_from_the_database_itself() {
+    let db = TempDb::new();
+    drop(Ledger::open(&db.0).unwrap());
+    let long = format!("{}needle{}", "é".repeat(100), "ü".repeat(100));
+    Connection::open(&db.0)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE future_notes (id INTEGER PRIMARY KEY, body TEXT, raw BLOB);
+             CREATE TABLE future_pairs (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             INSERT INTO future_notes VALUES (7, '{long}', NULL), (8, 'none here', x'6e6565646c65');
+             INSERT INTO future_pairs VALUES ('a', 'a Needle');"
+        ))
+        .unwrap();
+    let l = Ledger::open_readonly(&db.0).unwrap();
+    let side = (120 - "needle".len()) / 2;
+    let cut = format!("…{}needle{}…", "é".repeat(side), "ü".repeat(side));
+    assert_eq!(
+        l.search("NEEDLE", Duration::from_secs(10)).unwrap(),
+        [
+            Hit {
+                table: "future_notes".into(),
+                id: Some(7),
+                column: "body".into(),
+                excerpt: cut,
+            },
+            Hit {
+                table: "future_pairs".into(),
+                id: None,
+                column: "v".into(),
+                excerpt: "a Needle".into(),
+            },
+        ]
+    );
+    assert!(matches!(
+        l.search("needle", Duration::ZERO),
+        Err(Error::TimeLimit)
+    ));
+    refused(l.search("", Duration::from_secs(1)), "empty");
 }
 
 #[test]

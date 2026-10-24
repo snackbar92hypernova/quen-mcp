@@ -63,18 +63,19 @@ const LONG: [&str; 20] = [
 ];
 
 /// The tools that change nothing beyond quen's own data root: annotated `readOnlyHint` (finding 44: Codex asks before
-/// every unannotated call). Their own files there count as nothing changed: ledger_query's and mem_diff's spill files,
-/// and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get, world_actors,
-/// world_frame, world_ground, world_ray, world_nav, world_map and game_listsaves read through the game's channel
-/// (world_map's map files and their captures rows are its own); game_scriptlog reads the game's script log;
+/// every unannotated call). Their own files there count as nothing changed: ledger_query's, ledger_search's and
+/// mem_diff's spill files, and the mem and data tools' results over 16 KB (or kept) with their captures rows. world_get,
+/// world_actors, world_frame, world_ground, world_ray, world_nav, world_map and game_listsaves read through the game's
+/// channel (world_map's map files and their captures rows are its own); game_scriptlog reads the game's script log;
 /// measure_image reads quen's screenshots and writes its measurement rows; mods reads Vortex's records and the game's
 /// folders; ngfx_extract reads a capture file, its outputs and an import's hard link under the capture root.
-const READ_ONLY: [&str; 30] = [
+const READ_ONLY: [&str; 31] = [
     "session_status",
     "session_plan",
     "quen_guide",
     "quen_doctor",
     "ledger_query",
+    "ledger_search",
     "ledger_about",
     "capture_usage",
     "job_status",
@@ -750,7 +751,9 @@ fn mask(text: &str, home: &str) -> String {
 const INSTRUCTIONS: &str = "quen drives one Witcher 3 test session at a time for mod testing: session_plan checks \
 a launch and changes nothing; session_launch (tell the user what launches first and pass user_ok; the client then asks \
 them on every call: never route around a denied or pending launch), then session_end with the token launch returned. \
-Read quen_guide before the first launch, and its ledger_schema topic before writing ledger queries. On first use, run \
+Read quen_guide before the first launch, and its ledger_schema topic before writing ledger queries. Past results \
+(boots, captures, measurements, claims, game knowledge) are in the ledger, a database that grep and file search can't \
+read: find them by text with ledger_search, then ledger_about or ledger_query. On first use, run \
 quen_setup (confirm the paths with the user once; again after they install a tool) and quen_doctor (what is \
 installed); a refusal with needs names \
 what is missing and where to get it. Every result is one JSON envelope: ok, \

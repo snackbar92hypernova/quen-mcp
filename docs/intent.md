@@ -137,6 +137,7 @@ In a test session, a save other than the game's own autosaves and checkpoints en
 The ledger is a SQLite database under the data root, never in git. Big files stay on disk; the ledger holds their paths, sha256, sizes and metadata. It records games and builds; boots with their settings, mod set and conditions; saves; captures; measurements; camera poses and sweeps; claims and their support; references from documents to captures; and game knowledge. Views answer the usual questions: a boot's conditions, the rows of an A/B run, how two boots differ, which claims are proven.
 
 - `ledger_query` runs read-only SQL with a time limit.
+- `ledger_search` finds the rows of every table whose text contains a given text.
 - `ledger_ingest`, and `quen ledger add` for scripts, write rows from the other tools. A row lands on the running session's boot only when the call carries that session's token.
 - Migrations are numbered, and a shipped one is never edited, only followed by a new one, so a tester's ledger survives every update. quen migrates an older ledger when it starts, after a backup.
 - [schema/README.md](../schema/README.md) describes every table, view and column, and quen serves it to agents.

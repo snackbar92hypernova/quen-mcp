@@ -33,7 +33,7 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
@@ -128,6 +128,19 @@ impl From<rusqlite::Error> for Error {
 pub struct Rows {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+}
+
+/// About how many characters of a hit's text [`Ledger::search`] shows, the match in the middle.
+const EXCERPT: usize = 120;
+
+/// One value [`Ledger::search`] found: its table, its row's rowid (None in a table `WITHOUT ROWID`), its column, and
+/// about [`EXCERPT`] characters of it around the first match, `…` where it was cut.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Hit {
+    pub table: String,
+    pub id: Option<i64>,
+    pub column: String,
+    pub excerpt: String,
 }
 
 /// One connection to the ledger. Connections from [`Ledger::open_readonly`] can only read: their writes fail in SQLite.
@@ -328,6 +341,100 @@ impl Ledger {
                 rows: rows?,
             }),
         }
+    }
+
+    /// Every text value in every table (not the views, which repeat their rows; not SQLite's own tables) that contains
+    /// `text`, case-insensitively for ASCII letters only (SQLite's LIKE), by table, then id. The tables and columns come
+    /// from the database itself, so a table a later migration adds is searched too. Each table is one [`Ledger::query`],
+    /// within what is left of `time_limit`; [`Error::TimeLimit`] once it is spent. An empty `text` is refused.
+    pub fn search(&self, text: &str, time_limit: Duration) -> Result<Vec<Hit>> {
+        if text.is_empty() {
+            return Err(Error::Refused("the search text is empty".into()));
+        }
+        let deadline = Instant::now() + time_limit;
+        let left = || {
+            Some(deadline.saturating_duration_since(Instant::now()))
+                .filter(|d| !d.is_zero())
+                .ok_or(Error::TimeLimit)
+        };
+        let columns = self.query(
+            "SELECT t.name, t.wr, c.name FROM pragma_table_list AS t, pragma_table_info(t.name) AS c \
+             WHERE t.schema = 'main' AND t.type = 'table' AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             ORDER BY t.name, c.cid",
+            &[],
+            left()?,
+        )?;
+        let pattern = format!(
+            "%{}%",
+            text.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let pattern = [Value::String(pattern)];
+        let needle = text.to_ascii_lowercase();
+        // ASCII lowercasing keeps every byte offset, so the match found in the copy is on char boundaries in `value`.
+        let excerpt = |value: &str| {
+            let (at, end) = value
+                .to_ascii_lowercase()
+                .find(&needle)
+                .map_or((0, 0), |at| (at, at + needle.len()));
+            let side = EXCERPT.saturating_sub(value[at..end].chars().count()) / 2;
+            let from = value[..at]
+                .char_indices()
+                .rev()
+                .take(side)
+                .last()
+                .map_or(at, |(i, _)| i);
+            let to = value[end..]
+                .char_indices()
+                .nth(side)
+                .map_or(value.len(), |(i, _)| end + i);
+            let cut = |yes: bool| if yes { "…" } else { "" };
+            format!(
+                "{}{}{}",
+                cut(from > 0),
+                &value[from..to],
+                cut(to < value.len())
+            )
+        };
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let mut hits = Vec::new();
+        for table in columns.rows.chunk_by(|a, b| a[0] == b[0]) {
+            let name = table[0][0].as_str().unwrap_or_default();
+            let id = if table[0][1] == 1 { "NULL" } else { "rowid" };
+            let cols: Vec<&str> = table.iter().filter_map(|c| c[2].as_str()).collect();
+            let tests: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    let c = quote(c);
+                    format!("typeof({c}) = 'text' AND {c} LIKE ?1 ESCAPE '\\'")
+                })
+                .collect();
+            let values: Vec<String> = tests
+                .iter()
+                .zip(&cols)
+                .map(|(test, c)| format!("iif({test}, {}, NULL)", quote(c)))
+                .collect();
+            let sql = format!(
+                "SELECT {id}, {} FROM {} WHERE {} ORDER BY 1",
+                values.join(", "),
+                quote(name),
+                tests.join(" OR ")
+            );
+            for row in self.query(&sql, &pattern, left()?)?.rows {
+                for (column, value) in cols.iter().zip(&row[1..]) {
+                    if let Some(value) = value.as_str() {
+                        hits.push(Hit {
+                            table: name.into(),
+                            id: row[0].as_i64(),
+                            column: (*column).into(),
+                            excerpt: excerpt(value),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(hits)
     }
 }
 

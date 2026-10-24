@@ -154,6 +154,8 @@ fn reads_answer_during_another_connections_launch_and_are_their_own() {
                     let query = json!({"sql": sql, "params": [who, boot.to_string()]});
                     let rows = timed(&mut q, "ledger_query", query);
                     assert_eq!(rows["rows"], json!([[who, 1]]), "{rows}");
+                    let found = timed(&mut q, "ledger_search", json!({"text": who}));
+                    assert_eq!(found["ok"], true, "{found}");
                     let usage = timed(&mut q, "capture_usage", json!({}));
                     assert_eq!(usage["ok"], true, "{usage}");
                     let guide = timed(&mut q, "quen_guide", json!({}));
@@ -749,6 +751,8 @@ fn an_outside_writer_past_the_busy_timeout_gets_a_clear_refusal_and_nothing_half
             json!({"sql": "SELECT metric FROM measurements"}),
         );
         assert_eq!(read["rows"], json!([["before"]]), "{read}");
+        let found = timed(&mut a, "ledger_search", json!({"text": "before"}));
+        assert_eq!(found["tables"], json!({"measurements": 1}), "{found}");
         runs.into_iter().map(|r| r.join().unwrap()).collect()
     });
     for out in &outs {

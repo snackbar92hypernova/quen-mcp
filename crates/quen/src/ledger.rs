@@ -1,4 +1,4 @@
-//! The ledger tools: `ledger_query`, `ledger_ingest`, `ledger_claim`, and for game knowledge
+//! The ledger tools: `ledger_query`, `ledger_search`, `ledger_ingest`, `ledger_claim`, and for game knowledge
 //! `ledger_import` and `ledger_about` over MCP; the `quen ledger` CLI the Python analysis scripts call (`add`), the
 //! import of the harness's history (`migrate`) and `about`; `quen kb` (scan, claims, export) and `quen re import`.
 //! They run on the reader thread, so a query never waits behind a boot. The ledger is `<data root>\state\quen.db`.
@@ -6,6 +6,7 @@
 //! Only the holder of the game lock writes rows about a boot (captures, measurements, load status). A writer
 //! here holds it (a live session) or finds it free; while another quen holds it, those writes are refused.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,26 @@ pub fn tools() -> Vec<Value> {
                     "time_limit_s": {"type": "number", "description": "seconds, default 10, at most 30"},
                 },
                 "required": ["sql"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "ledger_search",
+            "description": "Read-only text search of the ledger: every table's text values that contain text, \
+                case-insensitively for ASCII letters only, matched literally (% and _ are plain characters), on a \
+                read-only connection, interrupted at time_limit_s (default 10, at most 30). Returns hit_count, tables \
+                (hits per table, only tables with hits) and hits ordered by table, then id: each with table, id (the \
+                row's rowid; null in tables without one), column and excerpt (about 120 characters around the first \
+                match). A hit leads on: ledger_query by id (SELECT * FROM <table> WHERE rowid = ?1), ledger_about by \
+                kind and key (an entities row). A result over 16 KB comes back as its first hits and the path of a \
+                JSON file holding all of them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "the text to find, not empty"},
+                    "time_limit_s": {"type": "number", "description": "seconds, default 10, at most 30"},
+                },
+                "required": ["text"],
                 "additionalProperties": false,
             },
         }),
@@ -178,6 +199,7 @@ pub fn call(shared: &Shared, name: &str, args: &Value) -> Value {
         Err(e) => Done::Refused(format!("quen's config: {e}")),
         Ok(config) => match name {
             "ledger_query" => query(config, args, &mut artifacts),
+            "ledger_search" => done(search(config, args, &mut artifacts)),
             "ledger_ingest" => match ingest_args(shared, args) {
                 Err(why) => Done::Refused(why),
                 Ok((rows, boot)) => {
@@ -317,53 +339,101 @@ fn query(config: &Config, args: &Value, artifacts: &mut Vec<Value>) -> Done {
             None => Vec::new(),
             Some(_) => list(args, "params")?,
         };
-        let limit = match args.get("time_limit_s") {
-            None => TIME_LIMIT_S,
-            Some(v) => v
-                .as_f64()
-                .filter(|s| *s > 0.0)
-                .ok_or("time_limit_s must be a positive number")?
-                .min(TIME_LIMIT_MAX_S),
-        };
-        let path = db_path(config);
-        if !path.exists() {
-            return Err(format!(
-                "no ledger yet at {}: nothing has been recorded",
-                path.display()
-            ));
-        }
-        let rows = Ledger::open_readonly(&path)
-            .and_then(|l| l.query(sql, &params, Duration::from_secs_f64(limit)))
-            .map_err(why)?;
+        let limit = time_limit(args)?;
+        let rows = readonly(config)?.query(sql, &params, limit).map_err(why)?;
         let mut fields = Map::new();
         fields.insert("columns".into(), json!(rows.columns));
         fields.insert("row_count".into(), json!(rows.rows.len()));
-        let text = json!(rows.rows).to_string();
-        if text.len() <= INLINE_BYTES {
-            fields.insert("rows".into(), json!(rows.rows));
-            return Ok(fields);
-        }
         let data =
             json!({"sql": sql, "params": params, "columns": rows.columns, "rows": rows.rows});
-        let file = spill(&queries(config), "", &data, artifacts)?;
-        let mut size = 0;
-        let head: Vec<&Vec<Value>> = rows
-            .rows
-            .iter()
-            .take_while(|r| {
-                size += json!(r).to_string().len() + 1;
-                size <= INLINE_BYTES / 2
-            })
-            .collect();
-        fields.insert("rows".into(), json!(head));
-        fields.insert("truncated".into(), json!(true));
-        fields.insert("file".into(), json!(file));
+        let rows = rows.rows.into_iter().map(Value::from).collect();
+        inline_or_file(config, &mut fields, "rows", rows, &data, artifacts)?;
         Ok(fields)
     };
     match run() {
         Ok(fields) => Done::Ok(fields),
         Err(why) => Done::Refused(why),
     }
+}
+
+/// `ledger_search`, read-only: the hits, counted per table.
+fn search(
+    config: &Config,
+    args: &Value,
+    artifacts: &mut Vec<Value>,
+) -> Result<Map<String, Value>, String> {
+    let args = object(args, &["text", "time_limit_s"])?;
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("text must be a string")?;
+    let limit = time_limit(args)?;
+    let hits = readonly(config)?.search(text, limit).map_err(why)?;
+    let mut tables = BTreeMap::<&str, usize>::new();
+    for hit in &hits {
+        *tables.entry(&hit.table).or_default() += 1;
+    }
+    let mut fields = Map::new();
+    fields.insert("hit_count".into(), json!(hits.len()));
+    fields.insert("tables".into(), json!(tables));
+    let data = json!({"text": text, "tables": tables, "hits": hits});
+    let hits = hits.iter().map(|h| json!(h)).collect();
+    inline_or_file(config, &mut fields, "hits", hits, &data, artifacts)?;
+    Ok(fields)
+}
+
+/// `time_limit_s` of ledger_query and ledger_search: default [`TIME_LIMIT_S`], at most [`TIME_LIMIT_MAX_S`].
+fn time_limit(args: &Map<String, Value>) -> Result<Duration, String> {
+    let secs = match args.get("time_limit_s") {
+        None => TIME_LIMIT_S,
+        Some(v) => v
+            .as_f64()
+            .filter(|s| *s > 0.0)
+            .ok_or("time_limit_s must be a positive number")?
+            .min(TIME_LIMIT_MAX_S),
+    };
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// A read-only connection to the ledger, refused while there is none.
+fn readonly(config: &Config) -> Result<Ledger, String> {
+    let path = db_path(config);
+    if !path.exists() {
+        return Err(format!(
+            "no ledger yet at {}: nothing has been recorded",
+            path.display()
+        ));
+    }
+    Ledger::open_readonly(&path).map_err(why)
+}
+
+/// `items` under `key` in `fields`; over [`INLINE_BYTES`] as JSON, `data` goes to a file ([`spill`]) instead, and
+/// `fields` keep only the first items that fit in half of that, with `truncated` and the `file`.
+fn inline_or_file(
+    config: &Config,
+    fields: &mut Map<String, Value>,
+    key: &str,
+    items: Vec<Value>,
+    data: &Value,
+    artifacts: &mut Vec<Value>,
+) -> Result<(), String> {
+    if serde_json::to_string(&items).unwrap_or_default().len() <= INLINE_BYTES {
+        fields.insert(key.into(), Value::from(items));
+        return Ok(());
+    }
+    let file = spill(&queries(config), "", data, artifacts)?;
+    let mut size = 0;
+    let head: Vec<Value> = items
+        .into_iter()
+        .take_while(|r| {
+            size += r.to_string().len() + 1;
+            size <= INLINE_BYTES / 2
+        })
+        .collect();
+    fields.insert(key.into(), Value::from(head));
+    fields.insert("truncated".into(), json!(true));
+    fields.insert("file".into(), json!(file));
+    Ok(())
 }
 
 /// `data` written to a new JSON file in `dir`, `<prefix><secs>-<random>.json`, listed in `artifacts`: its path.
@@ -389,7 +459,7 @@ pub(crate) fn spill(
     Ok(file)
 }
 
-/// Where ledger_query and ledger_about put a result too big to answer inline.
+/// Where ledger_query, ledger_search and ledger_about put a result too big to answer inline.
 pub(crate) fn queries(config: &Config) -> PathBuf {
     config.data_root.join("logs").join("queries")
 }
@@ -468,16 +538,7 @@ fn about(
     q: &About,
     artifacts: &mut Vec<Value>,
 ) -> Result<Map<String, Value>, String> {
-    let path = db_path(config);
-    if !path.exists() {
-        return Err(format!(
-            "no ledger yet at {}: nothing has been recorded",
-            path.display()
-        ));
-    }
-    let answer = Ledger::open_readonly(&path)
-        .and_then(|l| l.about(q))
-        .map_err(why)?;
+    let answer = readonly(config)?.about(q).map_err(why)?;
     if answer.to_string().len() <= INLINE_BYTES {
         return Ok(Map::from_iter([("about".into(), answer)]));
     }
