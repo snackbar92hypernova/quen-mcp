@@ -251,7 +251,7 @@ The command-channel protocol and the game-state source are defined in the core, 
 
 ## Status
 
-- **Early access.** quen is 0.1.26; its in-game package is quen-w3 0.1.18.
+- **Early access.** quen is 0.1.27; its in-game package is quen-w3 0.1.18.
 - **One test machine.** Built and tested on one PC: The Witcher 3 5.01, Steam, DX12, on Windows, with one GPU and one display. GOG copies are untested: their exe counts as an unknown build.
 - **Clients.** Claude Code is the client quen is built and tested with. VS Code, Cursor and Gemini CLI pass the protocol checks with the official MCP tools, but haven't been tried with a model. Codex CLI works with `quen serve --stay` started in a terminal first; tested with real Codex CLI (a launch, in-game calls, closing Codex mid-session), with Codex's approvals set so only the launch asks.
 - **Not yet checked:**
