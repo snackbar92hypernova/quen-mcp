@@ -851,9 +851,12 @@ pub(crate) fn play(
         }
         let pids = job.pids().map_err(|e| format!("the job: {e}"))?;
         if pids.is_empty() {
-            return Err(
-                "the game exited during the launch (a script compile error can close it)".into(),
-            );
+            // Under a profiler the job's first process is its launcher, which can exit before the game starts.
+            return Err(match spec.profiler {
+                Some(_) => "the game or the profiler's launcher exited during the launch (the launcher's output is in the session's game.log)",
+                None => "the game exited during the launch (a script compile error can close it)",
+            }
+            .into());
         }
         if let Some(title) = capture::dialog(&pids) {
             // The game's text, cut short: its title, never more.

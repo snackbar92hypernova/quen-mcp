@@ -331,7 +331,8 @@ impl Profile {
             }
             // ngfx-capture.exe, from its own folder as ngfx: no prompt that would wait (nothing closed for Nsight's
             // "interfering applications", no crash report offered past 60 s without a frame), the capture key F11, one
-            // frame, no HUD in quen's screenshots. ngfx_args are GPU Trace's: not passed.
+            // frame (joined: after --capture-hotkey a separate value is refused, boot 258), no HUD in quen's screenshots.
+            // ngfx_args are GPU Trace's: not passed.
             Tool::NgfxCapture if !self.fallback() => {
                 argv.extend(["--exe".into(), exe, "--working-dir".into()]);
                 argv.push(bin.display().to_string());
@@ -342,8 +343,7 @@ impl Profile {
                         "--no-block-on-interfering-application",
                         "--disable-hang-detection",
                         "--capture-hotkey",
-                        "--frame-count",
-                        "1",
+                        "--frame-count=1",
                         "--no-hud",
                     ]
                     .map(String::from),
@@ -1688,8 +1688,7 @@ mod tests {
                 "--no-block-on-interfering-application",
                 "--disable-hang-detection",
                 "--capture-hotkey",
-                "--frame-count",
-                "1",
+                "--frame-count=1",
                 "--no-hud"
             ]
         );
