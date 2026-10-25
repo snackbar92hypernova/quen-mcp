@@ -331,9 +331,9 @@ impl Profile {
             }
             // ngfx-capture.exe, from its own folder as ngfx: no prompt that would wait (nothing closed for Nsight's
             // "interfering applications", no crash report offered past 60 s without a frame), GPU_UPLOAD heaps demoted to
-            // system memory (the help's default, but its variable stays 0 unless passed: boot 259's capture didn't
-            // replay), one frame, no HUD in quen's screenshots. No --capture-hotkey: it takes the next argument as its
-            // key (boot 258, 259), and without it the key is F11. ngfx_args are GPU Trace's: not passed.
+            // system memory as Nsight's UI captures (the help's default, but its variable stays 0 unless passed), one
+            // frame, no HUD in quen's screenshots. No --capture-hotkey: it takes the next argument as its key (boot 258,
+            // 259), and without it the key is F11. ngfx_args are GPU Trace's: not passed.
             Tool::NgfxCapture if !self.fallback() => {
                 argv.extend(["--exe".into(), exe, "--working-dir".into()]);
                 argv.push(bin.display().to_string());
