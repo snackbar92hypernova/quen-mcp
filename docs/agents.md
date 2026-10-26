@@ -277,7 +277,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 
 - **The tool:** `measure_image` reads a screenshot quen took (`game_screenshot`, `game_frame`, `sweep_play`: captures of method `printwindow`, `wgc_fp16` or `desktop_duplication`), named by its captures id or its path (`<session>/<tag>.png`), and checks the file against its row's sha256. It writes one measurement row per number, all in one transaction: `method_family` screenshot, tag M, `capture_id` and `boot_id` the screenshot's, `state_label` and `run_id` as given, `world` NULL. The note: `measure_image <encoding> <w>x<h> crop <x>,<y> <w>x<h> px`, then the hue range, the `reference` and `noise_ref` captures, the pixels left out, your `note`. `name` prefixes each metric (`geralt_r_lin_mean`).
 - **Where it runs:** it reads files only, on quen's session thread, so never during another call's window; also while the user has the controls, and as a `run_plan` step. While a session is live, only the connection that launched it calls it, as every session tool.
-- **Encodings:** `srgb8` (the 8-bit PNG), `pq_bt2020_u16` (the 16-bit PNG, with cICP BT.2020 PQ), `scrgb_f16` (the `.npy`). Refused, nothing written: any other capture (an `.rdc`, a CSV, a devkit EXR: numbers from that are family `renodx_devkit`), a capture without an encoding, removed, or changed since its row.
+- **Encodings:** `srgb8` (the 8-bit PNG), `pq_bt2020_u16` (the 16-bit PNG, with cICP BT.2020 PQ), `scrgb_f16` (the `.npy`, written only with `npy: true`). Refused, nothing written: any other capture (an `.rdc`, a CSV, a devkit EXR: numbers from that are family `renodx_devkit`), a capture without an encoding, removed, or changed since its row.
 - **The crop:** `crop` `[x, y, width, height]` from the top-left, whole pixels, or with `crop_unit` `fraction` fractions of the frame, each edge rounded to a pixel (the result's `crop` gives the pixels). Default: the whole frame.
 
 | `metrics` | Rows | Unit |
@@ -288,7 +288,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 | `diff` | `diff_<u>_mean`: the mean of each pixel's largest \|a − b\| over R, G and B against `reference`; with `noise_ref` (a second capture of the screenshot's own state), `floor_<u>_mean` against it and `diff_over_floor` (left out when the floor is 0). Refused: a reference of another method, encoding, size or display state | `u`: `srgb8` (levels) or `pq` (PQ code units, 1.0 spans 0 to 10,000 nits); `ratio` |
 
 - Medians and p95 are linear between ranks: the median of an even count is the mean of the two middle values.
-- The two HDR files of one shot give the same linear light and luminance, within the PNG's 16-bit PQ steps, less what the PNG clamped (outside BT.2020, above 10,000 nits); their `_pq_` and `_scrgb_` values don't compare.
+- The two HDR files of one shot (`npy: true`) give the same linear light and luminance, within the PNG's 16-bit PQ steps, less what the PNG clamped (outside BT.2020, above 10,000 nits); their `_pq_` and `_scrgb_` values don't compare.
 - A pixel with a NaN or an infinity (only the `.npy` can hold one) is left out of every metric; `non_finite` counts them.
 - On synthetic 4K frames (release build, one timing): 0.05–0.11 s to decode a file, 0.03–1.35 s per metric.
 
@@ -386,7 +386,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
   - Copy each dump or snapshot to `<capture root>\<session>\devkit-<tag>.<ext>`.
   - Capture row: kind = its extension, method `renodx_devkit`, the encoding above, `includes_overlay` false (a dump doesn't hold ReShade's overlay). `encoding` names a display-image encoding: for any other buffer (scene-linear data, G-buffer targets) leave it out and give the format in `frame_state`.
   - Derived numbers: `method_family` renodx_devkit, `tag` M, with the capture's `capture_id`.
-- **A second method for image claims:** `game_screenshot` `method: "hdr"` writes `pq_bt2020_u16` and `scrgb_f16` files of its own (family `screenshot`). Decode both to the same units first. Compare only captures of one method, encoding and display state.
+- **A second method for image claims:** `game_screenshot` `method: "hdr"` writes a `pq_bt2020_u16` file of its own, and with `npy: true` a `scrgb_f16` one (family `screenshot`). Decode both to the same units first. Compare only captures of one method, encoding and display state.
 
 ### RenderDoc: quen's `renderdoc` launch profile
 

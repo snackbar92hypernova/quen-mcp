@@ -421,8 +421,12 @@ impl Frame {
         let mut encoder = png::Encoder::new(w, self.width, self.height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Sixteen);
-        // Live boot 1: the default deflate took most of 5.65 s on a real 4K frame.
-        encoder.set_compression(png::Compression::Fast);
+        // ponytail: zlib level 1 with Balanced's adaptive filter. Two real 4K PQ frames re-encoded in memory (release
+        // build, 2026-10-26): Fast 0.08-0.09 s, 91 % of the raw bytes; level 1 0.2 s, 71 %; level 2 0.7 s, 71 %;
+        // level 3 1.7-2.1 s, 71 %; Balanced 2.9-3.2 s, 70 %; High 3.3-3.5 s, 70 %. Live boot 1: Balanced took most of
+        // 5.65 s.
+        encoder.set_compression(png::Compression::Balanced);
+        encoder.set_deflate_compression(png::DeflateCompression::Level(1));
         let mut writer = encoder.write_header()?;
         // png 0.18 reads cICP but never writes it, so the raw chunk goes in here: after IHDR, before IDAT.
         writer.write_chunk(png::chunk::cICP, &CICP_PQ_BT2020)?;
