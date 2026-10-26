@@ -204,30 +204,55 @@ pub fn leftovers(
     files
 }
 
-/// The ids of `rows` (captures the ledger says are on disk) that no file of `files` matches: removed by hand, or kept
-/// under another capture root (feature tests 2b). Those of quen's boots first, then of imported boots, then of no
-/// boot, each sorted, with how many of each (finding 36: the harness import records its files by their path in its
-/// own folder, and without a boot but for its boot logs).
-pub fn missing(rows: &[CaptureRow], files: &[File]) -> (Vec<i64>, [usize; 3]) {
+/// What [`missing`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Missing {
+    /// The rows whose file is gone: those of quen's boots first, then of imported boots, then of no boot, each sorted.
+    pub ids: Vec<i64>,
+    /// How many of `ids` are of quen's boots, of imported boots and of no boot.
+    pub by: [usize; 3],
+    /// Rows whose file is under the harness's `cap` folder instead: not missing.
+    pub in_harness: usize,
+    /// Rows of imported boots and of no boot left out of `ids`: no harness folder to look in.
+    pub unresolved: usize,
+}
+
+/// The rows (captures the ledger says are on disk) that no file of `files` matches: removed by hand, or kept under
+/// another capture root (feature tests 2b). The harness import records its files by their path in its `cap` folder,
+/// and without a boot but for its boot logs (finding 36), so each is looked for under `harness` (that folder) first.
+/// Without it, or when none of them is there (not the folder they were imported from), the rows of imported boots and
+/// of no boot are left out as `unresolved`.
+pub fn missing(rows: &[CaptureRow], files: &[File], harness: Option<&Path>) -> Missing {
     let found: std::collections::HashSet<i64> = files.iter().filter_map(|f| f.capture).collect();
-    let mut gone: Vec<(usize, i64)> = rows
+    let there =
+        |r: &CaptureRow| harness.is_some_and(|h| h.join(r.path.replace('\\', "/")).is_file());
+    let gone: Vec<(&CaptureRow, bool)> = rows
         .iter()
         .filter(|r| !found.contains(&r.id))
-        .map(|r| {
-            (
-                if r.boot_id.is_none() {
-                    2
-                } else {
-                    usize::from(r.imported)
-                },
-                r.id,
-            )
-        })
+        .map(|r| (r, there(r)))
         .collect();
-    gone.sort_unstable();
-    let mut counts = [0; 3];
-    gone.iter().for_each(|&(origin, _)| counts[origin] += 1);
-    (gone.into_iter().map(|(_, id)| id).collect(), counts)
+    let in_harness = gone.iter().filter(|(_, there)| *there).count();
+    let mut out = Missing {
+        in_harness,
+        ..Missing::default()
+    };
+    let mut ids: Vec<(usize, i64)> = Vec::new();
+    for (r, there) in gone {
+        let origin = if r.boot_id.is_none() {
+            2
+        } else {
+            usize::from(r.imported)
+        };
+        if in_harness == 0 && origin > 0 {
+            out.unresolved += 1;
+        } else if !there {
+            ids.push((origin, r.id));
+            out.by[origin] += 1;
+        }
+    }
+    ids.sort_unstable();
+    out.ids = ids.into_iter().map(|(_, id)| id).collect();
+    out
 }
 
 /// The usage: totals by boot (largest first), by kind and by age, and every file over [`LARGE`].
@@ -551,12 +576,39 @@ mod tests {
             row(9, "old/x.png", Some(9), false),
             row(5, "y.png", None, true),
         ];
-        assert_eq!(missing(&gone, &files), (vec![9, 5], [1, 0, 1]));
-        let imported = CaptureRow {
-            imported: true,
-            ..row(7, "z.png", Some(3), false)
+        let want = |ids: Vec<i64>, by, in_harness, unresolved| Missing {
+            ids,
+            by,
+            in_harness,
+            unresolved,
         };
-        assert_eq!(missing(&[imported], &files), (vec![7], [0, 1, 0]));
+        // Without a harness folder, only quen's boots' rows count as missing.
+        assert_eq!(missing(&gone, &files, None), want(vec![9], [1, 0, 0], 0, 1));
+        // The harness's cap folder holds two of the imported rows' files: those are not missing, the rest are.
+        let h = Temp::new("harness");
+        h.put("cap/boot_a/shot.png", 1);
+        h.put(r"cap/z.png", 1);
+        let imported = |id, path: &str| CaptureRow {
+            imported: true,
+            ..row(id, path, Some(3), false)
+        };
+        let harness = [
+            imported(7, "z.png"),
+            imported(8, r"boot_a\shot.png"),
+            imported(6, "gone.png"),
+            row(5, "y.png", None, true),
+            row(9, "old/x.png", Some(9), false),
+        ];
+        let cap = h.0.join("cap");
+        assert_eq!(
+            missing(&harness, &files, Some(&cap)),
+            want(vec![9, 6, 5], [1, 1, 1], 2, 0)
+        );
+        // A folder that holds none of them is not theirs: as without one.
+        assert_eq!(
+            missing(&harness, &files, Some(&h.0)),
+            want(vec![9], [1, 0, 0], 0, 4)
+        );
         assert_eq!(total(&t.0), 555);
         let mut dirs = super::folders(&t.0);
         dirs.sort();
