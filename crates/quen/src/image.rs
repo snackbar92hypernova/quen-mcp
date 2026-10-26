@@ -49,7 +49,7 @@ pub fn tool() -> Value {
             nits from the HDR files, relative from srgb8: sRGB white = 1), hue_share (the share of pixels in an HSV hue \
             range), diff (against reference, and noise_ref as the floor). Reads the files only, each checked against \
             its sha256, on the session thread: never during a window. Refused, nothing written: not quen's screenshot \
-            or not an image (an .rdc, a CSV), the file removed or changed, an argument a metric doesn't take, a crop \
+            or not an image (an .rdc, a CSV, Nsight's final.png: its encoding is unknown), the file removed or changed, an argument a metric doesn't take, a crop \
             off the frame, a reference of another method, encoding, size or display state.",
         "inputSchema": {
             "type": "object",
@@ -109,6 +109,14 @@ fn shot(ledger: &Ledger, config: &Config, key: &str, v: &Value) -> Result<Shot, 
     let id = row[0].as_i64().unwrap_or_default();
     let text = |i: usize| row[i].as_str().unwrap_or_default().to_string();
     let (path, method) = (text(1), text(3));
+    if method == "ngfx_extract" && path.ends_with("/final.png") {
+        return Err(format!(
+            "{key}: capture {id} ({path}) is Nsight's final image (ngfx_extract's screenshot op): Nsight makes it from \
+             the presented back buffer by a conversion it doesn't name (boot 259's: an 8-bit RGBA PNG with no \
+             colour-space chunk, from a 10-bit back buffer on an HDR display), so its encoding is unknown and \
+             measure_image doesn't read it"
+        ));
+    }
     if !crate::capture::IMAGE_METHODS.contains(&method.as_str()) {
         return Err(format!(
             "{key}: capture {id} ({path}) was taken by {method:?}, not by quen's screenshot (methods {}): its numbers \
@@ -547,6 +555,7 @@ pub(crate) mod tests {
             Some(Encoding::PqCodesF16),
         );
         let old = stored(&fx, "O1.png", &png, "printwindow", None);
+        let nsight = stored(&fx, "final.png", &png, "ngfx_extract", None);
         let changed = stored(&fx, "C1.png", &png, "printwindow", Some(Encoding::Srgb8));
         fs::write(
             fx.dir.join("data/captures/s1/C1.png"),
@@ -565,6 +574,10 @@ pub(crate) mod tests {
             (json!({"capture": csv, "metrics": ch}), "\"actor_trace\""),
             (json!({"capture": exr, "metrics": ch}), "\"renodx_devkit\""),
             (json!({"capture": old, "metrics": ch}), "encoding null"),
+            (
+                json!({"capture": nsight, "metrics": ch}),
+                "is Nsight's final image (ngfx_extract's screenshot op)",
+            ),
             (
                 json!({"capture": changed, "metrics": ch}),
                 "changed since quen wrote it",

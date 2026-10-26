@@ -74,7 +74,7 @@ pub(crate) fn tools() -> Vec<Value> {
                 session (session_launch mode play), where the user has them from the launch, or in a test session \
                 after hands_give. The client asks the user on every call (user_ok is only your word): never route \
                 around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
-                moves the focus (game_keys, game_console, game_exec, game_load, game_pause, game_settime, \
+                moves the focus (game_keys, game_console, game_exec, game_asi, game_load, game_pause, game_settime, \
                 game_weather, game_teleport, game_place, game_items, game_save, game_camera with a pose, game_frame, \
                 game_freecam but status, game_cvar set or restore, mem_patch, mem_unpatch and their _instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
@@ -91,19 +91,18 @@ pub(crate) fn tools() -> Vec<Value> {
             "name": "hands_give",
             "description": "Give the controls of the game to the user: back in a play session, or in a test session \
                 for the user to do something in the game. No prompt. applied: memory patches and cvar writes still \
-                applied (in a play session, this hand-over's). A play session refuses while there is one, unless \
-                keep_writes with the user's OK; a test session gives the controls with them applied. Then the free \
-                camera, quen's pause and a camera path end (freecam, pause, path: the game's replies), the game shows \
-                that the user has \
-                the controls (status: its reply, or why not): until hands_take with quen-w3 0.1.15+ and the \
-                config's indicator on, else 8 s. Then the controls go to the user. kept: this hand-over's teleports, settime, \
-                weather and items; unexpected_saves: saves written while the agent had the controls. in_front: the window in \
-                front at the end (game, client or other). Refused: the user has them already, a wrong token, \
-                to_client with no client window found at connect. Failed: one wasn't undone (left); the \
-                controls went to the user.",
+                applied; asi_modes: ASI mode sets, the last per export (quen can't undo one); in a play session, this \
+                hand-over's. A play session refuses while there is one, unless keep_writes with the user's OK. Then \
+                the free camera, quen's pause and a camera path end (freecam, pause, path: the game's replies); unless \
+                to_client, the game comes to the front as focus to game brings it, tried twice (to_game: what it did, \
+                or why not); the game shows that the user has the controls (status). kept: this \
+                hand-over's teleports, settime, weather and items; unexpected_saves: saves written while the agent had \
+                them. in_front: the window in front at the end (game, client or other). Refused: the user has them \
+                already, a wrong token, to_client with no client window found at connect. Failed: one wasn't undone \
+                (left); the controls went to the user.",
             "inputSchema": schema(json!({
-                "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches and cvar writes still applied, the user having agreed. Default false: refused while any is"},
-                "to_client": {"type": "boolean", "description": "true: bring this client's window to the front last, as focus to client does, so the user sees the chat (to_client in the result: why it didn't). Default false: the focus stays where it is"},
+                "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches, cvar writes and ASI mode sets still applied, the user having agreed. Default false: refused while any is"},
+                "to_client": {"type": "boolean", "description": "true: bring this client's window to the front last, as focus to client does, so the user sees the chat (to_client in the result: why it didn't). Default false: the game comes to the front"},
             }), &[]),
         }),
     ]
@@ -204,7 +203,7 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         true => Some(call.conn.client.clone()?),
         false => None,
     };
-    let (applied, kept) = {
+    let (applied, kept, modes) = {
         let patches = cx.live.patches.borrow();
         let mine = patches.get(h.since.get()..).unwrap_or_default();
         // A test session's writes stay applied across its hand-overs: all of them count.
@@ -212,17 +211,29 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         let mut applied: Vec<Value> = applied(writes).iter().map(|a| a[3].clone()).collect();
         // An instance patch's fields are one entry: named once.
         applied.dedup();
-        (applied, kept(mine))
+        (applied, kept(mine), modes(writes))
     };
     let mut fields = Map::new();
+    let mut why = Vec::new();
     if !applied.is_empty() {
         fields.insert("applied".into(), json!(applied));
-        if cx.live.play && !keep {
-            let why = "a memory patch or cvar write of this hand-over is still applied (applied): undo each \
-                       (mem_unpatch, mem_unpatch_instances, game_cvar restore), or pass keep_writes: true with the \
-                       user's OK. Nothing done";
-            return Err(Done::RefusedWith(why.into(), fields));
-        }
+        why.push(
+            "a memory patch or cvar write of this hand-over is still applied (applied): undo each (mem_unpatch, \
+             mem_unpatch_instances, game_cvar restore)",
+        );
+    }
+    if !modes.is_empty() {
+        fields.insert("asi_modes".into(), json!(modes));
+        why.push(
+            "this hand-over set an ASI's mode (asi_modes), which quen can't undo: it can't read an ASI's mode",
+        );
+    }
+    if cx.live.play && !keep && !why.is_empty() {
+        let why = format!(
+            "{}. keep_writes: true, with the user's OK, gives the controls with them. Nothing done",
+            why.join("; ")
+        );
+        return Err(Done::RefusedWith(why, fields));
     }
     fields.insert("kept".into(), json!(kept));
     // quen's pause, a camera path a sweep left and the free camera quen read on end with the hand-over.
@@ -253,6 +264,27 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
             Err(why) => left.push(format!("{what}: {why}")),
         }
         call.lap(what);
+    }
+    // Boot 264: a hands_give left the client in front (quen's idle focus and the client's prompt hook can bring it there,
+    // and nothing brought the game back). The game comes back as focus to game brings it, checked, tried once more.
+    if client.is_none() && in_front(&cx, call) != "game" {
+        let mut tried = Err(String::new());
+        for _ in 0..2 {
+            tried = focus::to_game(&cx, call).map_err(|done| crate::boot::reason(&done));
+            if tried.is_ok() && in_front(&cx, call) == "game" {
+                break;
+            }
+        }
+        let shown = match tried {
+            Ok(done) if in_front(&cx, call) == "game" => {
+                cx.live.away.set(false);
+                json!(done)
+            }
+            Ok(_) => json!("the game isn't in front: it came to the front and lost it again"),
+            Err(why) => json!(format!("the game isn't in front: {why}")),
+        };
+        fields.insert("to_game".into(), shown);
+        call.lap("to_game");
     }
     // The user may be in the game when the controls go to them: it says so, and where to hand them back.
     if let Some(shown) = status::set(&cx, Some(call), State::Yours) {
@@ -295,9 +327,9 @@ fn in_front(cx: &Ctx, call: &Call) -> &'static str {
 /// The connection that launched a play session closed. While the agent has the controls, this hand-over's memory
 /// patches and cvar writes still applied are undone, newest first: each journaled like any write, and only while the
 /// bytes there are still the ones it wrote, as mem_unpatch checks (another writer's are left); an instance patch's
-/// fields as mem_unpatch_instances undoes them, one step per patch. A write kept by agreement (hands_give's keep_writes)
-/// is an earlier hand-over's and stays. Then the user has the controls. What it undid, what it left and why, and the
-/// hand-over's teleports, settime and weather (kept), for the log.
+/// fields as mem_unpatch_instances undoes them, one step per patch. Its ASI mode sets are left ([`modes`]). A write kept
+/// by agreement (hands_give's keep_writes) is an earlier hand-over's and stays. Then the user has the controls. What it
+/// undid, what it left and why, and the hand-over's teleports, settime and weather (kept), for the log.
 pub(crate) fn dropped(session: &Session) -> Value {
     let Some(live) = &session.live else {
         return Value::Null;
@@ -310,6 +342,10 @@ pub(crate) fn dropped(session: &Session) -> Value {
                 .get(live.handovers.since.get()..)
                 .unwrap_or_default();
             keep = kept(mine);
+            left.extend(modes(mine).iter().map(|what| {
+                let what = what.as_str().unwrap_or_default();
+                format!("{what}: an ASI's mode set, which quen can't undo")
+            }));
             let applied =
                 applied(mine)
                     .into_iter()
@@ -416,6 +452,24 @@ fn kept(patches: &[(SystemTime, Value)]) -> Vec<Value> {
         .collect()
 }
 
+/// The ASI mode sets among `patches` (`Ctx::set_mode`'s entries: no write, tainting no save), the last per export,
+/// newest first. quen can't read an ASI's mode, so it can't put back the one before a set.
+fn modes(patches: &[(SystemTime, Value)]) -> Vec<Value> {
+    let export = |what: &Value| {
+        what.as_str()
+            .and_then(|w| w.split('(').next())
+            .map(str::to_owned)
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for (_, p) in patches.iter().rev() {
+        let set = p["write"].is_null() && p["writes"].is_null() && p["taints"] == false;
+        if set && !out.iter().any(|o| export(o) == export(&p["what"])) {
+            out.push(p["what"].clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +482,7 @@ mod tests {
         for tool in [
             "game_keys",
             "game_console",
+            "game_asi",
             "game_load",
             "game_pause",
             "game_settime",
@@ -609,9 +664,58 @@ mod tests {
         let out = run(&session, "hands_give", json!({"token": "tok"}));
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["applied"], json!(["mem_patch cull at 0x20"]), "{out}");
-        // No window here is the dummy game's or a client's.
+        // No window here is the dummy game's or a client's: the game couldn't come to the front, and to_game says why.
         assert_eq!(out["in_front"], "other", "{out}");
+        let to_game = out["to_game"].as_str().unwrap();
+        assert!(
+            to_game.starts_with("the game isn't in front: no visible window"),
+            "{out}"
+        );
         assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// An ASI mode set can't be undone (quen can't read the mode before it): in a play session hands_give names this
+    /// hand-over's, the last per export, and refuses unless keep_writes; a dropped connection leaves them, named.
+    #[test]
+    fn an_asi_mode_set_holds_a_play_hand_over_until_keep_writes() {
+        let fx = Fake::new("play-asi");
+        let session = handed_over(&fx, true);
+        for what in [
+            "W3X.asi!W3X_SetMode(0) returned 1",
+            "W3Y.asi!W3Y_SetMode(1) returned 1",
+            "W3X.asi!W3X_SetMode(1) returned 1",
+        ] {
+            patch(&session, what, Value::Null);
+        }
+        let modes = json!([
+            "W3X.asi!W3X_SetMode(1) returned 1",
+            "W3Y.asi!W3Y_SetMode(1) returned 1"
+        ]);
+        let out = run(&session, "hands_give", json!({"token": "tok"}));
+        assert_eq!(
+            (&out["refused"], &out["asi_modes"]),
+            (&json!(true), &modes),
+            "{out}"
+        );
+        assert!(
+            out["reason"].as_str().unwrap().contains("can't undo"),
+            "{out}"
+        );
+        assert_eq!(fx.shared.hands(), Some(Hands::Agent), "nothing changed");
+        let out = dropped(&session);
+        assert_eq!(out["undone"], json!([]), "{out}");
+        assert_eq!(
+            out["left"][0],
+            "W3X.asi!W3X_SetMode(1) returned 1: an ASI's mode set, which quen can't undo"
+        );
+        assert_eq!(out["left"].as_array().unwrap().len(), 2, "{out}");
+        fx.shared.set_hands(Some(Hands::Agent));
+        let out = run(
+            &session,
+            "hands_give",
+            json!({"token": "tok", "keep_writes": true}),
+        );
+        assert_eq!((&out["ok"], &out["asi_modes"]), (&json!(true), &modes));
     }
 
     /// The free camera quen last read on goes off before the controls go to the user, and the result says so; when it
