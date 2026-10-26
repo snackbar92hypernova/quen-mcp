@@ -292,6 +292,8 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 - The two HDR files of one shot (`npy: true`) give the same linear light and luminance, within the PNG's 16-bit PQ steps, less what the PNG clamped (outside BT.2020, above 10,000 nits); their `_pq_` and `_scrgb_` values don't compare.
 - A pixel with a NaN or an infinity (only the `.npy` can hold one) is left out of every metric; `non_finite` counts them.
 - On synthetic 4K frames (release build, one timing): 0.05–0.11 s to decode a file, 0.03–1.35 s per metric.
+- Between photo-mode visits Geralt's idle pose and the scene's light change with no setting changed (boot 279: a tree area's mean 0.165 in one visit, 0.097 in the next). Shots from different visits don't compare.
+- `game_cvar` `set` `PostProcess/EnableDLSSRR` inside one visit gave the Options menu's Ray Reconstruction state: off equal to the menu's off within the noise floor (boot 279, DLSS Performance). It leaves `PTHairQualityMode` as it is; the Options menu writes 0 to it when RR goes off.
 
 ### Tracy: quen's `tracy` launch profile
 
