@@ -20,10 +20,11 @@ use crate::{doctor, measure, status};
 
 /// The tools a step may call: what a test session's agent calls without the client's prompt (the owner's Q7), sweeps
 /// aside. Never a launch, a save, a hand-over, a cleanup, a memory patch, a focus move or a ledger write.
-const TOOLS: [&str; 29] = [
+const TOOLS: [&str; 30] = [
     "game_console",
     "game_exec",
     "game_cvar",
+    "game_asi",
     "game_keys",
     "game_teleport",
     "game_place",
@@ -60,7 +61,8 @@ const WAIT_MAX_S: f64 = 600.0;
 const MAX_STEPS: usize = 200;
 /// What a step's tool takes, in seconds, for the estimate: a read is 0.02-0.04 s quen-side (boot 175), a game_frame side
 /// 0.75-0.86 s with its 250 ms settle (boot 190), a load 33.84 s (boot 191's setup), a screenshot under 1 s (inside
-/// those sides); any other verb one channel round trip and its checks.
+/// those sides); any other verb one channel round trip and its checks, or an ASI export's call (boot 264's journal: three
+/// within 1 s).
 // ponytail: per-tool constants from single boots; replace with each tool's median once plans have run.
 const READ_S: f64 = 0.05;
 const SIDE_S: f64 = 0.55;

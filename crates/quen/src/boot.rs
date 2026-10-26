@@ -175,7 +175,8 @@ impl Spec {
         if let Some(key) = refused.iter().find(|k| play && args.contains_key(**k)) {
             return Err(format!(
                 "{key} isn't taken in a play session (mode play): it launches the game with the user's mods and \
-                 files as they are"
+                 files as they are. A test launch (photo: false) with it, then hands_give, gives the user the \
+                 controls with it applied"
             ));
         }
         let (game_dir, documents) = (

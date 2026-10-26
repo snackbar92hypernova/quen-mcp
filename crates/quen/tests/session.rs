@@ -599,7 +599,9 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
         ),
         (
             json!({"stage": [at("W3Test.asi")], "mode": "play"}),
-            "stage isn't taken in a play session",
+            "stage isn't taken in a play session (mode play): it launches the game with the user's mods and files \
+             as they are. A test launch (photo: false) with it, then hands_give, gives the user the controls with it \
+             applied",
         ),
         // Finding 49: no menu folder, no menu XML staged.
         (
@@ -2633,6 +2635,7 @@ fn game_and_measure_tools_need_a_live_session() {
         "game_frame",
         "game_place",
         "game_exec",
+        "game_asi",
         "game_freecam",
         "measure_presentmon",
         "measure_trace",

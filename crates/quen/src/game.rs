@@ -1,6 +1,6 @@
-//! The in-game tools: `game_load`, `game_console`, `game_exec`, `game_cvar` and `game_keys`, and the actions `measure_ab`
-//! applies. Keys and console lines go out natively (`input`, ported from w3ctl.py and console_type.py), exec lines
-//! through quen's command channel;
+//! The in-game tools: `game_load`, `game_console`, `game_exec`, `game_cvar`, `game_asi` and `game_keys`, and the actions
+//! `measure_ab` applies. Keys and console lines go out natively (`input`, ported from w3ctl.py and console_type.py),
+//! exec lines through quen's command channel;
 //! cvars are quen's own (quen-core's `cvar` on the game's memory, mem.rs). Every tool needs the live session's
 //! token. An ASI's `*_SetMode` export has no script, so quen calls it in the game on a thread of its own there, as
 //! W3Perf.addon64 calls it from ReShade's.
@@ -158,6 +158,22 @@ pub fn tools() -> Vec<Value> {
             }), &["name"]),
         }),
         json!({
+            "name": "game_asi",
+            "description": "Call an ASI's *_SetMode export once in the running game, as measure_ab's {asi, set_mode} \
+                action does, without its windows: on a thread quen starts in the game, waited for up to 10 s. call: what \
+                ran (asi!export(mode)); returned: the export's value. Journaled and on the boot's patches; taints no \
+                save. quen can't read an ASI's mode, so it can't put one back: a play session's hands_give refuses \
+                after a set in its hand-over, unless keep_writes. Refused, nothing run: wrong token, the user has the \
+                controls, a name that isn't an .asi file, an export that isn't *_SetMode, the ASI not loaded in the \
+                game, not exactly one matching export (name one with export). Failed: no return within 10 s, or a value \
+                other than 1 (our ASIs return 1 when they take the mode).",
+            "inputSchema": schema(json!({
+                "asi": {"type": "string", "description": "the ASI's file name, e.g. W3BoneFix.asi: letters, digits, _, . and -"},
+                "set_mode": {"type": "integer", "minimum": 0, "maximum": 255, "description": "the mode: our ASIs take 0 (off) and 1 (on), even where their ini writes another value for on"},
+                "export": {"type": "string", "description": "which *_SetMode export, when the ASI has several"},
+            }), &["asi", "set_mode"]),
+        }),
+        json!({
             "name": "game_keys",
             "description": "Send keys to the game: SendInput scancodes to the game's own window, only while it is \
                 in front, checked before every key. Tokens: a-z 0-9 f1-f12 space enter escape tab backspace arrows \
@@ -191,6 +207,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         | "game_frame" | "game_place") => crate::scene::call(session, call, n, args),
         "game_scriptlog" => scriptlog(session, args),
         "game_cvar" => cvar(session, call, args),
+        "game_asi" => asi(session, call, args),
         "game_keys" => keys(session, call, args),
         "game_screenshot" => capture::screenshot(session, call, args),
         "game_camera" => crate::camera::camera(session, call, args),
@@ -1316,6 +1333,27 @@ fn cvar(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     fields
 }
 
+/// game_asi: one call of an ASI's `*_SetMode` export, as measure_ab's `{asi, set_mode}` action makes it.
+fn asi(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let cx = ctx(session, args, &["asi", "export", "set_mode"])?;
+    let (asi, export, mode) = mode_args(args)?;
+    let fields = cx.set_mode(&asi, export.as_deref(), mode);
+    call.lap("asi");
+    fields
+}
+
+/// `{asi, set_mode}` with an optional `export`: measure_ab's ASI action and game_asi's arguments.
+fn mode_args(v: &Value) -> Result<(String, Option<String>, u32), String> {
+    let asi = text(v, "asi")?.to_string();
+    let export = v.get("export").map(|_| text(v, "export")).transpose()?;
+    let mode = v["set_mode"]
+        .as_u64()
+        .and_then(|m| u32::try_from(m).ok())
+        .filter(|m| *m <= 255)
+        .ok_or("set_mode must be a whole number 0-255")?;
+    Ok((asi, export.map(Into::into), mode))
+}
+
 fn keys(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let cx = ctx(session, args, &["tokens", "dry_run", "focus"])?;
     let tokens: Vec<String> = args
@@ -1392,19 +1430,10 @@ impl Action {
                     .and_then(|t| t.iter().map(|t| t.as_str().map(String::from)).collect())
                     .ok_or("keys must be an array of strings")?,
             )),
-            ["asi", "set_mode"] | ["asi", "export", "set_mode"] => Ok(Action::SetMode {
-                asi: text(v, "asi")?.into(),
-                export: v
-                    .get("export")
-                    .map(|_| text(v, "export"))
-                    .transpose()?
-                    .map(Into::into),
-                mode: v["set_mode"]
-                    .as_u64()
-                    .and_then(|m| u32::try_from(m).ok())
-                    .filter(|m| *m <= 255)
-                    .ok_or("set_mode must be a whole number 0-255")?,
-            }),
+            ["asi", "set_mode"] | ["asi", "export", "set_mode"] => {
+                let (asi, export, mode) = mode_args(v)?;
+                Ok(Action::SetMode { asi, export, mode })
+            }
             ["console"] | ["console", "expect_log"] => {
                 let line = text(v, "console")?;
                 quen_core::input::console_line(line, GRAVE, &quen_core::input::us_scancode, true)?;
@@ -2673,6 +2702,41 @@ if os.path.exists(act): exec(open(act).read())
             Err(Done::Refused(_))
         ));
         assert!(cx.live.patches.borrow().is_empty());
+    }
+
+    /// game_asi calls set_mode with measure_ab's action checks: refused, nothing run or journaled, for a wrong token, a
+    /// bad argument, a name that isn't an .asi file, an export that isn't *_SetMode, an ASI the game hasn't loaded.
+    #[test]
+    fn game_asi_checks_as_measure_ab_s_action_and_runs_nothing_when_refused() {
+        let fx = Fake::new("game-asi");
+        let call = |more: Value| {
+            let mut args = json!({"token": "tok", "asi": "W3X.asi", "set_mode": 1});
+            args.as_object_mut()
+                .unwrap()
+                .extend(more.as_object().unwrap().clone());
+            args
+        };
+        for (args, why) in [
+            (call(json!({"token": "nope"})), "wrong or missing token"),
+            (
+                json!({"token": "tok", "asi": "W3X.asi"}),
+                "set_mode must be",
+            ),
+            (call(json!({"set_mode": 256})), "set_mode must be"),
+            (call(json!({"mode": 1})), "unknown argument"),
+            (call(json!({"asi": "kernel32.dll"})), "not an .asi"),
+            (call(json!({"export": "ExitProcess"})), "only a *_SetMode"),
+            (call(json!({"asi": "W3NoSuch.asi"})), "not loaded"),
+        ] {
+            let out = fx.run("game_asi", args.clone());
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(
+                out["refused"] == true && reason.contains(why),
+                "{args}: {out}"
+            );
+        }
+        let journal = fs::read_to_string(fx.dir.join("data/state/journal.jsonl")).unwrap();
+        assert!(journal.is_empty(), "{journal}");
     }
 
     #[test]
