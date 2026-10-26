@@ -859,11 +859,7 @@ fn cli_add() -> Result<Value, String> {
 fn cli_migrate(args: &[String]) -> Result<Value, String> {
     let config = config::load()?;
     let (mut dry_run, mut docs) = (false, Vec::new());
-    let mut harness = config
-        .harness
-        .as_deref()
-        .and_then(|h| h.parent())
-        .map(PathBuf::from);
+    let mut harness = config.harness_dir().map(PathBuf::from);
     let mut game_exe = config
         .game_dir
         .as_ref()

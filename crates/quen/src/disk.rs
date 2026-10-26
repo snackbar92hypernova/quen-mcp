@@ -50,8 +50,8 @@ pub fn tools() -> Vec<Value> {
             "description": "Read-only: what quen's capture root holds (screenshots, PresentMon CSVs, profiler \
                 outputs, files you copied there): files and GB by boot, kind and age, every file over 1 GB, the \
                 budget (capture_budget_gb in quen's config, default 20), and the capture rows whose file is gone \
-                (missing). leftovers: quen's other files under the data root, the same way, by kind: session_logs, \
-                settings_backups, query_spills, ledger_backups, packages (zips but the installed package's) and \
+                (missing: under neither the capture root nor the harness's cap folder). leftovers: quen's other \
+                files under the data root, the same way, by kind: session_logs, settings_backups, query_spills, ledger_backups, packages (zips but the installed package's) and \
                 to_delete (what earlier cleanups moved there); their paths are relative to the data root. With a \
                 selection (boots, older_than_days, kinds, capture_ids, missing; every filter given must match, \
                 capture_ids are taken anyway): what capture_clean would take (recycle_bin, ask_delete), the cited \
@@ -85,9 +85,9 @@ struct Found {
     files: Vec<File>,
     /// quen's other leftovers under the data root ([`disk::leftovers`]).
     leftovers: Vec<File>,
-    /// Capture rows marked on disk whose file isn't under the capture root, and how many are of quen's boots, of
-    /// imported boots and of no boot ([`disk::missing`]).
-    missing: (Vec<i64>, [usize; 3]),
+    /// Capture rows marked on disk whose file isn't under the capture root, nor under the harness's `cap` folder
+    /// ([`disk::missing`]).
+    missing: disk::Missing,
     /// The folder names that belong to a boot (`Ledger::boot_folders`).
     folders: Vec<(String, i64)>,
     /// The ledger's error, when it can't be read.
@@ -116,8 +116,10 @@ fn files(config: &Config) -> Found {
     let package = doctor::package_version(config).map(|v| format!("{}.zip", v.replace(' ', "-")));
     let quen = format!("quen-{}-windows-x64.zip", env!("CARGO_PKG_VERSION"));
     let keep: Vec<String> = [Some(quen), package].into_iter().flatten().collect();
+    // The harness's history: where `quen ledger migrate` imports it from by default.
+    let harness = config.harness_dir().map(|d| d.join("cap"));
     Found {
-        missing: disk::missing(&rows, &files),
+        missing: disk::missing(&rows, &files, harness.as_deref()),
         leftovers: disk::leftovers(&config.data_root, now, &folders, &keep),
         files,
         folders,
@@ -263,7 +265,7 @@ pub fn usage(shared: &Shared, args: &Value) -> Value {
             .map_err(|e| format!("quen's config: {e}"))?;
         let select = selection(args, &[])?;
         let found = files(config);
-        let (files, (missing, by)) = (&found.files, &found.missing);
+        let (files, missing) = (&found.files, &found.missing);
         let mut out = budget(config, files.iter().map(|f| f.bytes).sum());
         let usage = disk::usage(files);
         out.extend(usage.as_object().cloned().unwrap_or_default());
@@ -287,21 +289,26 @@ pub fn usage(shared: &Shared, args: &Value) -> Value {
             cleanup["folders"] = json!(folders);
             cleanup["leftover_folders"] = json!(leftover_folders);
             if select.missing {
-                cleanup["missing"] = json!(missing.len());
+                cleanup["missing"] = json!(missing.ids.len());
             }
             out.insert("cleanup".into(), cleanup);
         }
-        if !missing.is_empty() {
-            let note = "capture rows the ledger says are on disk, with no file under the capture root (removed by \
-                        hand, or under another capture root), by origin: quen_boots, imported_boots (harness_info) \
-                        and no_boot (recorded without a boot: the harness import records each file of its cap \
-                        folder so, its boot logs aside, by its path in that folder); ids lists the first 50, \
-                        quen's boots' first";
-            let ids = &missing[..missing.len().min(50)];
+        if missing.ids.len() + missing.in_harness + missing.unresolved > 0 {
+            let note = "rows: capture rows the ledger says are on disk, with no file under the capture root (removed \
+                        by hand, or under another capture root) nor under the harness's cap folder (the folder of \
+                        harness in quen's config, as quen ledger migrate imports from), by origin: quen_boots, \
+                        imported_boots (harness_info) and no_boot (recorded without a boot: the harness import \
+                        records each file of its cap folder so, its boot logs aside, by its path in that folder); \
+                        ids lists the first 50, quen's boots' first. in_harness: rows whose file is in that cap \
+                        folder, not missing. unresolved: rows of imported boots and of no boot not counted in rows, \
+                        as that folder holds none of them (or harness is unset)";
+            let by = missing.by;
+            let ids = &missing.ids[..missing.ids.len().min(50)];
             out.insert(
                 "missing".into(),
-                json!({"rows": missing.len(), "quen_boots": by[0], "imported_boots": by[1],
-                       "no_boot": by[2], "ids": ids, "note": note}),
+                json!({"rows": missing.ids.len(), "quen_boots": by[0], "imported_boots": by[1],
+                       "no_boot": by[2], "in_harness": missing.in_harness,
+                       "unresolved": missing.unresolved, "ids": ids, "note": note}),
             );
         }
         if let Some(note) = &found.note {
@@ -490,7 +497,7 @@ fn take(
     let leftover_folders = removed(&config.data_root, leftovers_emptied);
     // Rows whose file was gone already, marked in one transaction (feature tests 2c: batches 1-2's 3,887).
     let missing = match select.missing {
-        true => found.missing.0.as_slice(),
+        true => found.missing.ids.as_slice(),
         false => &[],
     };
     let mut fields = Map::new();
@@ -632,10 +639,21 @@ mod tests {
             .unwrap();
         // Feature tests 2b: a row whose file is gone is counted by capture_usage.
         let gone = ledger.add_capture(&row("old/gone.png")).unwrap();
+        // A row the harness import wrote (no boot), its file in the harness's cap folder: not missing.
+        let harness = config.harness_dir().unwrap().join("cap").join("old");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("kept.png"), "x").unwrap();
+        let imported = Capture {
+            boot_id: None,
+            pinned: false,
+            ..row("old/kept.png")
+        };
+        let imported = ledger.add_capture(&imported).unwrap();
         drop(ledger);
         let used = usage(&fx.shared, &json!({}));
         assert_eq!(used["missing"]["rows"], 1, "{used}");
         assert_eq!(used["missing"]["ids"], json!([gone]), "{used}");
+        assert_eq!(used["missing"]["in_harness"], 1, "{used}");
         // Finding 36: counted by origin; this row is a quen boot's.
         let by = ["quen_boots", "imported_boots", "no_boot"].map(|k| used["missing"][k].clone());
         assert_eq!(by, [json!(1), json!(0), json!(0)], "{used}");
@@ -759,7 +777,16 @@ mod tests {
             .unwrap();
         assert_eq!(row.rows, [[json!("missing")]]);
         let after = usage(&fx.shared, &json!({}));
-        assert!(after.get("missing").is_none(), "{after}");
+        assert_eq!(after["missing"]["rows"], 0, "{after}");
+        let sql = format!("SELECT removed_at FROM captures WHERE id = {imported}");
+        let row = ledger
+            .query(&sql, &[], std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            row.rows,
+            [[Value::Null]],
+            "the harness's file stays unmarked"
+        );
     }
 
     /// The owner's rule, on the real shell: a permanent delete only on the user's yes in Windows' own dialog, which

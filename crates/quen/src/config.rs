@@ -114,6 +114,11 @@ impl Config {
         self.data_root.join("state")
     }
 
+    /// The harness's folder, `harness`'s: `quen ledger migrate` imports its history from its `cap` folder by default.
+    pub fn harness_dir(&self) -> Option<&Path> {
+        self.harness.as_deref().and_then(Path::parent)
+    }
+
     pub fn capture_root(&self) -> PathBuf {
         self.capture_root
             .clone()

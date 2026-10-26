@@ -6,9 +6,9 @@
 //!   on an HDR display.
 //! - `hdr`: Windows.Graphics.Capture of the window in FP16 (scRGB). Where WGC is unavailable or fails (not every
 //!   Windows install has it working), DXGI Desktop Duplication of the window's monitor, cropped to the window. A
-//!   float16 `.npy` (scRGB as captured) and a 16-bit PQ BT.2020 PNG with cICP, through quen-core's encoder. The
-//!   capture session is closed before the tool returns: none may stay open into a PresentMon window. The config's
-//!   test switch `force_duplication` skips WGC, so a live boot exercises the fallback.
+//!   16-bit PQ BT.2020 PNG with cICP, through quen-core's encoder, and with `npy` a float16 `.npy` too (scRGB as
+//!   captured, 66 MB at 4K). The capture session is closed before the tool returns: none may stay open into a
+//!   PresentMon window. The config's test switch `force_duplication` skips WGC, so a live boot exercises the fallback.
 //! - `renderdoc`: a RenderDoc frame capture in a `renderdoc:NAME` session (profile.rs).
 //!
 //! quen picks the method; the agent can't ask for the screen. Desktop Duplication shows whatever
@@ -100,8 +100,8 @@ pub fn tool() -> Value {
         "description": "One frame of the game's window (found from the session's job, never by title) into the \
             session's capture folder, a ledger capture row per file. method sdr (default): an 8-bit sRGB PNG (srgb8), \
             clipped on an HDR display: for OCR, UI checks and SDR A/B. method hdr: Windows.Graphics.Capture in FP16 \
-            (wgc_fp16), written as a float16 .npy of linear scRGB (scrgb_f16, 1.0 = 80 nits) and a 16-bit PQ BT.2020 \
-            PNG with cICP (pq_bt2020_u16: code values). If WGC fails (wgc_error says why), quen falls back to Desktop \
+            (wgc_fp16), written as a 16-bit PQ BT.2020 PNG with cICP (pq_bt2020_u16: code values), with npy also \
+            as a .npy (scrgb_f16). If WGC fails (wgc_error says why), quen falls back to Desktop \
             Duplication of the game's screen area (desktop_duplication, includes_desktop true: an overlay can \
             show), only while the game is in front; a focus change drops the frame and refuses. method renderdoc / ngfx: \
             one RenderDoc / Nsight Graphics capture, minutes (see method). Compare only captures of one method, \
@@ -115,6 +115,7 @@ pub fn tool() -> Value {
                 "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "the file name, unique in the session (A1, B2, ...)"},
                 "method": {"type": "string", "enum": ["sdr", "hdr", "renderdoc", "ngfx"], "description": "default sdr. renderdoc, only in a session launched with profiler renderdoc:NAME: one RenderDoc capture (F12) as <capture root>\\<boot>\\<tag>.rdc (3-5 GB; 12 GB free needed), the game in front; it sends nothing more and returns once the capture is written (up to minutes: the game freezes while RenderDoc writes it), never without the Streamline swap in place. ngfx, only in a session launched with profiler ngfx-capture:NAME: one Nsight Graphics capture (F11) as <capture root>\\<boot>\\<NAME>\\<tag>.ngfx-capture (moved there when Nsight wrote it into its own folder: moved_from), the game in front; it sends nothing more and returns once the file holds still (up to minutes), with its captures row (kind ngfx-capture: ngfx_extract takes its capture_id) and the capture root's total (capture_root_gb). Refused while the capture root is over capture_budget_gb or under 12 GB free, unless user_ok"},
                 "user_ok": {"type": "boolean", "description": "method ngfx only: true only after telling the user that the capture root is over its budget or low on space and that a capture can take several GB, and they agreed"},
+                "npy": {"type": "boolean", "description": "method hdr only: true also writes a float16 .npy of linear scRGB as captured (scrgb_f16, 1.0 = 80 nits; 66 MB at 4K); default false, the PNG alone"},
             },
             "required": ["token", "tag"],
             "additionalProperties": false,
@@ -130,6 +131,8 @@ struct Shot {
     ngfx: bool,
     /// method ngfx: the user agreed to a capture over the budget or low on space.
     user_ok: bool,
+    /// method hdr: the `.npy` too.
+    npy: bool,
 }
 
 impl Shot {
@@ -152,23 +155,29 @@ impl Shot {
             Some(_) if !ngfx => return Err("user_ok goes with method ngfx".into()),
             Some(v) => v.as_bool().ok_or("user_ok must be true or false")?,
         };
+        let npy = match args.get("npy") {
+            None => false,
+            Some(_) if !hdr => return Err("npy goes with method hdr".into()),
+            Some(v) => v.as_bool().ok_or("npy must be true or false")?,
+        };
         Ok(Shot {
             tag: tag.into(),
             hdr,
             renderdoc,
             ngfx,
             user_ok,
+            npy,
         })
     }
 
     /// The file extensions this shot writes.
     fn extensions(&self) -> &'static [&'static str] {
-        if self.hdr { &["npy", "png"] } else { &["png"] }
+        if self.npy { &["npy", "png"] } else { &["png"] }
     }
 }
 
 pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["tag", "method", "user_ok"])?;
+    let cx = game::ctx(session, args, &["tag", "method", "user_ok", "npy"])?;
     let shot = Shot::parse(args)?;
     if shot.renderdoc {
         return crate::profile::capture(&cx, call, &shot.tag);
@@ -232,7 +241,8 @@ pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Re
         wgc_error,
     } = grabbed.map_err(|why| format!("grab failed, nothing written: {why}"))?;
     let includes_desktop = method == DESKTOP_DUPLICATION;
-    let files = encode(image).map_err(|why| format!("{method}: {why}; nothing written"))?;
+    let files =
+        encode(image, shot.npy).map_err(|why| format!("{method}: {why}; nothing written"))?;
     call.lap("encode");
     let t = ledger
         .utc(at)
@@ -292,8 +302,8 @@ enum Px {
 /// One encoded file: its extension, encoding and bytes.
 type Encoded = (&'static str, Encoding, Vec<u8>);
 
-/// SDR: an RGB PNG. HDR: the `.npy` of the half floats as captured, and the 16-bit PQ BT.2020 PNG.
-fn encode(image: Image) -> Result<Vec<Encoded>, String> {
+/// SDR: an RGB PNG. HDR: the 16-bit PQ BT.2020 PNG, after the `.npy` of the half floats as captured with `npy`.
+fn encode(image: Image, npy: bool) -> Result<Vec<Encoded>, String> {
     let Image {
         width,
         height,
@@ -309,7 +319,9 @@ fn encode(image: Image) -> Result<Vec<Encoded>, String> {
             let mut encoder = png::Encoder::new(&mut png, width, height);
             encoder.set_color(png::ColorType::Rgb);
             encoder.set_depth(png::BitDepth::Eight);
-            // Live boot 1: the default deflate took 1.4 s on a real 4K frame.
+            // ponytail: Fast. One real 4K frame re-encoded in memory (release build, 2026-10-26): Fast 0.04 s, 62.3 % of
+            // the raw bytes; Balanced 1.0 s, 62.4 %; High 1.4 s, 62.3 %; zlib level 1 0.16 s, 63.7 %. Live boot 1:
+            // Balanced (the default) took 1.4 s.
             encoder.set_compression(png::Compression::Fast);
             encoder
                 .write_header()
@@ -320,15 +332,18 @@ fn encode(image: Image) -> Result<Vec<Encoded>, String> {
         Px::ScrgbF16(halves) => {
             let frame =
                 Frame::new(width, height, Pixels::ScrgbF16(halves)).map_err(|e| e.to_string())?;
-            let (mut npy, mut png) = (Vec::new(), Vec::new());
-            frame.write_npy(&mut npy).map_err(|e| e.to_string())?;
+            let mut files = Vec::new();
+            if npy {
+                let mut npy = Vec::new();
+                frame.write_npy(&mut npy).map_err(|e| e.to_string())?;
+                files.push(("npy", Encoding::ScrgbF16, npy));
+            }
+            let mut png = Vec::new();
             frame
                 .write_png_pq(Cursor::new(&mut png))
                 .map_err(|e| e.to_string())?;
-            Ok(vec![
-                ("npy", Encoding::ScrgbF16, npy),
-                ("png", Encoding::PqBt2020U16, png),
-            ])
+            files.push(("png", Encoding::PqBt2020U16, png));
+            Ok(files)
         }
     }
 }
@@ -1187,8 +1202,12 @@ mod tests {
         let shot = Shot::parse(&json!({"tag": "A1-b_2"})).unwrap();
         assert_eq!((shot.hdr, shot.extensions()), (false, &["png"][..]));
         let shot = Shot::parse(&json!({"tag": "B", "method": "hdr"})).unwrap();
+        assert_eq!((shot.hdr, shot.extensions()), (true, &["png"][..]));
+        let shot = Shot::parse(&json!({"tag": "B", "method": "hdr", "npy": true})).unwrap();
         assert_eq!((shot.hdr, shot.extensions()), (true, &["npy", "png"][..]));
         for bad in [
+            json!({"tag": "A", "npy": true}),
+            json!({"tag": "A", "method": "hdr", "npy": 1}),
             json!({}),
             json!({"tag": "../x"}),
             json!({"tag": "a.png"}),
@@ -1266,7 +1285,7 @@ mod tests {
             pixels: Px::Bgra8(vec![30, 20, 10, 255, 3, 2, 1, 255]),
         };
         let a1 = |ext: &str| format!("boot1/A1.{ext}");
-        let (stored, failed) = store(&root, &a1, encode(sdr()).unwrap(), &row, ledger());
+        let (stored, failed) = store(&root, &a1, encode(sdr(), false).unwrap(), &row, ledger());
         assert_eq!(failed, None);
         assert_eq!(stored[0].rel, "boot1/A1.png");
         let png = fs::read(root.join("boot1/A1.png")).unwrap();
@@ -1276,23 +1295,28 @@ mod tests {
         reader.next_frame(&mut rgb).unwrap();
         assert_eq!(rgb, [10, 20, 30, 1, 2, 3], "BGRA becomes RGB");
 
-        let halves = [1.0, 0.5, 0.25, 1.0].map(f16::from_f32).to_vec();
-        let hdr = Image {
+        let hdr = || Image {
             width: 1,
             height: 1,
-            pixels: Px::ScrgbF16(halves),
+            pixels: Px::ScrgbF16([1.0, 0.5, 0.25, 1.0].map(f16::from_f32).to_vec()),
         };
         let b2 = |ext: &str| format!("boot1/B2.{ext}");
-        let (stored, failed) = store(&root, &b2, encode(hdr).unwrap(), &row, ledger());
+        let (stored, failed) = store(&root, &b2, encode(hdr(), true).unwrap(), &row, ledger());
         assert_eq!(failed, None);
         let encodings: Vec<Encoding> = stored.iter().map(|s| s.encoding).collect();
         assert_eq!(encodings, [Encoding::ScrgbF16, Encoding::PqBt2020U16]);
+        // Without npy, an HDR shot is its PNG alone.
+        let b3 = |ext: &str| format!("boot1/B3.{ext}");
+        let (stored, failed) = store(&root, &b3, encode(hdr(), false).unwrap(), &row, ledger());
+        assert_eq!(failed, None);
+        assert_eq!(stored[0].rel, "boot1/B3.png");
+        assert_eq!(stored.len(), 1);
         // Each row's kind is its file's extension (feature tests 1: one meaning for captures.kind).
         let sql = "SELECT path, kind FROM captures WHERE path NOT LIKE '%.' || kind";
         let odd = ledger().query(sql, &[], Duration::from_secs(5)).unwrap();
         assert!(odd.rows.is_empty(), "{:?}", odd.rows);
 
-        let (again, failed) = store(&root, &a1, encode(sdr()).unwrap(), &row, ledger());
+        let (again, failed) = store(&root, &a1, encode(sdr(), false).unwrap(), &row, ledger());
         assert!(again.is_empty() && failed.unwrap().contains("A1.png"));
 
         // A shot's rows go in together or not at all: the second row's path is taken, so the first isn't added.
@@ -1309,7 +1333,7 @@ mod tests {
             height: 1,
             pixels: Px::ScrgbF16(vec![f16::ONE; 4]),
         };
-        let (stored, failed) = store(&root, &c3, encode(one).unwrap(), &row, ledger());
+        let (stored, failed) = store(&root, &c3, encode(one, true).unwrap(), &row, ledger());
         assert!(failed.unwrap().contains("no ledger rows"));
         assert_eq!(stored.len(), 2);
         assert!(stored.iter().all(|s| s.id.is_none()));
@@ -1325,6 +1349,7 @@ mod tests {
             ["boot1/A1.png", "srgb8"],
             ["boot1/B2.npy", "scrgb_f16"],
             ["boot1/B2.png", "pq_bt2020_u16"],
+            ["boot1/B3.png", "pq_bt2020_u16"],
             ["boot1/C3.png", "pq_bt2020_u16"],
         ];
         assert_eq!(rows.len(), want.len());
