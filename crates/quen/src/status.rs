@@ -10,7 +10,8 @@
 //! movie of its own where the game draws its HUD, which no game notification replaces, and on the notification
 //! elsewhere (w3/README.md, HUD line); the replies are the same.
 //! - **working:** a call of the connection that launched starts, with the agent's controls ([`start`], hands_take);
-//! - **measuring:** a measure call, a sweep or a run_plan, from its checks to its end ([`measuring`], [`poll`]);
+//! - **measuring:** a measure call, a session's first sweep_play or a run_plan, from its checks to its end
+//!   ([`measuring`], [`poll`]);
 //! - **yours:** whenever the user has the controls: a play session from its launch, hands_give .. hands_take ([`poll`]);
 //! - **waiting:** no call from that connection for [`IDLE`] with the agent's controls, until its next call ([`poll`]).
 //!
@@ -171,6 +172,8 @@ pub(crate) struct Status {
     measuring_at: Cell<Option<(Instant, Duration)>>,
     /// quen's package in the game, read once ([`doctor::package_version`]).
     package: OnceCell<Option<&'static str>>,
+    /// A sweep_play's measuring line went out in this session: later ones send none, so wait for none.
+    pub(crate) swept: Cell<bool>,
 }
 
 /// Tools that capture or measure frames: each takes the line down first, so none is sent just before one.

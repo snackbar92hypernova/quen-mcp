@@ -137,7 +137,7 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": schema(json!({
                 "sweep": {"type": "string", "description": "the sweep's name (sweep_save)"},
                 "mode": {"type": "string", "enum": ["realtime", "step"], "description": "realtime, or step: frame by frame, each captured"},
-                "fps": {"type": "integer", "minimum": 1, "maximum": 240, "description": "step only: frames per second of sweep time"},
+                "fps": {"type": "integer", "minimum": 1, "maximum": 240, "description": "step only: frames per second of sweep time. The result's frames_gb_est (also the job's progress before frame 0): about the GB the frames write, the game window's pixels x 1.86 bytes sdr, 4.26 hdr"},
                 "method": {"type": "string", "enum": ["sdr", "hdr"], "description": "step: game_screenshot's method (default sdr)"},
                 "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,58}$", "description": "step: names the frames, unique in the session (default sweep<id>-<time>)"},
                 "settle_ms": {"type": "integer", "minimum": 0, "maximum": SETTLE_MAX_MS, "description": "step: a wait after each frame is set, for denoisers and TAA to settle (default 0; the capture's pin adds 250 ms)"},
@@ -597,13 +597,31 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
     if let Some(back) = back {
         fields.insert("game_back".into(), json!(back));
     }
+    let frames = match p.mode {
+        Mode::Realtime => 0,
+        Mode::Step => path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0),
+    };
     // Step mode took about 0.5 s a frame (feature tests 2).
     let secs = match p.mode {
         Mode::Realtime => path.duration(),
-        Mode::Step => f64::from(path.frame_count(p.fps.unwrap_or_default()).unwrap_or(0)) / 2.0,
+        Mode::Step => f64::from(frames) / 2.0,
     };
-    // On the connection the checks opened: a second one beside it finds the ASI's pipe busy (finding 80).
-    if let Some(shown) = status::measuring(&cx, call, secs.ceil() as u64, None, &mut first) {
+    if p.mode == Mode::Step {
+        let _dpi = capture::Dpi::per_monitor();
+        if let Ok((_, r)) = capture::game_window(&cx.live.job.pids().unwrap_or_default()) {
+            let (w, h) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
+            let gb = quen_core::disk::gb(frames_bytes(frames, w, h, p.method));
+            fields.insert("frames_gb_est".into(), json!(gb));
+            call.progress(&format!("{frames} frames, about {gb} GB"));
+        }
+    }
+    // The owner, 0.1.28: the line and its wait before a session's first sweep_play only; later ones start at once. On
+    // the connection the checks opened: a second one beside it finds the ASI's pipe busy (finding 80).
+    let st = &cx.live.status;
+    if !st.swept.get()
+        && let Some(shown) = status::measuring(&cx, call, secs.ceil() as u64, None, &mut first)
+    {
+        st.swept.set(true);
         fields.insert("status".into(), json!(shown));
     }
     let pause = p.mode == Mode::Step || p.sweep.world.paused;
@@ -715,6 +733,17 @@ fn play(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
         done.insert("undo_left".into(), json!(left));
     }
     Err(Done::Failed(why, done))
+}
+
+/// About how many bytes `frames` captures of `method` write at `w` x `h`: the PNG's share of its raw bytes on real 4K
+/// frames (2026-10-26: sdr 62 % of 3 a pixel, hdr 71 % of 6; the scene changes it).
+fn frames_bytes(frames: u32, w: u32, h: u32, method: &str) -> u64 {
+    let per_px = if method == "hdr" {
+        6.0 * 0.71
+    } else {
+        3.0 * 0.62
+    };
+    (f64::from(frames) * f64::from(w) * f64::from(h) * per_px).round() as u64
 }
 
 fn why(done: &Done) -> &str {
@@ -829,8 +858,8 @@ fn step(
     Ok(done)
 }
 
-/// One frame: game_screenshot tagged `tag`, and its first capture row (the .npy of an hdr shot, else the .png) and that
-/// file. The screenshot's own timing and artifacts stay out of sweep_play's envelope: its run and frames name them.
+/// One frame: game_screenshot tagged `tag` (its PNG alone: no npy), and its capture row and file. The screenshot's own
+/// timing and artifacts stay out of sweep_play's envelope: its run and frames name them.
 pub(crate) fn grab(
     session: &Session,
     token: &str,
@@ -1465,6 +1494,51 @@ pub(crate) mod tests {
             "no pause, no path: {verbs:?}"
         );
         assert!(rows(&fx, "SELECT id FROM sweep_runs").is_empty());
+    }
+
+    /// The owner, 0.1.28: the measuring line, and its wait, before a session's first sweep_play only; later ones start
+    /// the path at once. The stand-in refuses notices, so the first waits for none either.
+    #[test]
+    fn only_a_session_s_first_sweep_play_sends_the_measuring_line() {
+        let fx = served("sweep-line");
+        photo_mode(&fx, true);
+        fx.shared.set_hands(Some(crate::hands::Hands::Agent));
+        let session = fx.session();
+        let keys = json!([
+            {"t": 0, "pos": [0, 0, 0], "rot": [0, 0, 0], "fov": 60},
+            {"t": 0.1, "pos": [1, 0, 0], "rot": [0, 10, 0], "fov": 60},
+        ]);
+        let saved = run(
+            &session,
+            "sweep_save",
+            json!({"name": "short", "keyframes": keys}),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        // Each play: cam.set, cam.path, cam.get, cam.stop; the first one's notice before them.
+        let (server, _) = camera_game(&fx, 1 + 4 + 4, 0.0);
+        let args = json!({"token": "tok", "sweep": "short", "mode": "realtime"});
+        let first = run(&session, "sweep_play", args.clone());
+        let second = run(&session, "sweep_play", args);
+        assert!(
+            first["ok"] == true && first["status"].is_string(),
+            "{first}"
+        );
+        assert!(
+            second["ok"] == true && second.get("status").is_none(),
+            "{second}"
+        );
+        let verbs: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
+        let notices = verbs
+            .iter()
+            .filter(|v| matches!(v, Verb::Notice { .. }))
+            .count();
+        assert!(
+            notices == 1 && matches!(verbs[0], Verb::Notice { .. }),
+            "{verbs:?}"
+        );
+        // And step mode's size estimate: 121 4K frames.
+        assert_eq!(frames_bytes(121, 3840, 2160, "hdr"), 4_275_431_424);
+        assert_eq!(frames_bytes(121, 3840, 2160, "sdr"), 1_866_737_664);
     }
 
     /// A package that refuses cam.path, after sweep_play paused the game, once answered `refused` though the
