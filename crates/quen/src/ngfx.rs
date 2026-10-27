@@ -1003,6 +1003,9 @@ fn replay(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields
         }
         let capture = t.file.display().to_string();
         let path = |p: &Path| p.display().to_string();
+        // --no-multithreaded-init: a W3 5.01 capture failed 6 of 6 replays at one DEFAULT heap ("Failed to Create
+        // Resource", Driver Internal Error) and replayed 5 of 5 with it, its heaps still at their capture-time GPU
+        // addresses (Nsight 2026.3.1, 2026-10-27); it only slows the load (about 35 s there).
         let mut argv: Vec<String> = match op {
             "perf" => vec![
                 path(&exe),
@@ -1014,6 +1017,7 @@ fn replay(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields
                 "20".into(),
                 "--present-hidden".into(),
                 "--no-block-on-incompatibility".into(),
+                "--no-multithreaded-init".into(),
                 "--collect-gpu-frametimes".into(),
                 "--temp-resource-dir".into(),
                 path(&tmp),
@@ -1025,7 +1029,9 @@ fn replay(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields
                 "--exe".into(),
                 path(&exe),
                 "--args".into(),
-                format!("\"{capture}\" -n 10 --no-block-on-incompatibility --no-user-input"),
+                format!(
+                    "\"{capture}\" -n 10 --no-block-on-incompatibility --no-multithreaded-init --no-user-input"
+                ),
                 "--start-on-replay-begin".into(),
                 "--stop-on-replay-end".into(),
                 "--auto-export".into(),
