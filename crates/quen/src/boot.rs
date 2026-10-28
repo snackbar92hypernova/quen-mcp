@@ -843,6 +843,7 @@ pub(crate) fn play(
     let config = session.config()?.clone();
     let live = session.live.as_ref().ok_or("no live session")?;
     let (job, launched, token) = (live.job.clone(), live.launched, live.token.clone());
+    let game_log = live.logs.join("game.log");
     let bin = config.bin_dir().unwrap_or_default();
     // Before every key, as the harness did: never into a dialog (a script compile error), never after the game left. A
     // stop first: its kill empties the job, which isn't the game exiting.
@@ -854,10 +855,12 @@ pub(crate) fn play(
         if pids.is_empty() {
             // Under a profiler the job's first process is its launcher, which can exit before the game starts.
             return Err(match spec.profiler {
-                Some(_) => "the game or the profiler's launcher exited during the launch (the launcher's output is in the session's game.log)",
-                None => "the game exited during the launch (a script compile error can close it)",
-            }
-            .into());
+                Some(_) => match fs::read(&game_log).ok().and_then(|log| exit_code(&String::from_utf8_lossy(&log))) {
+                    Some(code) => format!("the game exited during the launch with code {code} ({code:#X}), as the profiler's launcher logged (its output is in the session's game.log)"),
+                    None => "the game or the profiler's launcher exited during the launch (the launcher's output is in the session's game.log)".into(),
+                },
+                None => "the game exited during the launch (a script compile error can close it)".into(),
+            });
         }
         if let Some(title) = capture::dialog(&pids) {
             // The game's text, cut short: its title, never more.
@@ -1204,6 +1207,18 @@ pub(crate) fn reason(done: &Done) -> String {
     }
 }
 
+/// The exit code ngfx-capture's launcher logs for the game ("Launched process exited with code 3221225477; ...", boot
+/// 289), its last one.
+fn exit_code(log: &str) -> Option<u32> {
+    const AT: &str = "exited with code ";
+    let rest = &log[log.rfind(AT)? + AT.len()..];
+    rest[..rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len())]
+        .parse()
+        .ok()
+}
+
 /// session_plan's fields: the save, every file change, what dx12user.settings gets (asked, and each line written: the
 /// forced keys and the overrides) and the command.
 pub(crate) fn plan_fields(config: &Config, spec: &Spec) -> Map<String, Value> {
@@ -1259,6 +1274,13 @@ pub(crate) fn plan_fields(config: &Config, spec: &Spec) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_launchers_exit_code_is_read() {
+        let log = "Launching witcher3.exe ...\r\n\0Launched process exited with code 3221225477; expected terminate-after-capture code 119.\r\n";
+        assert_eq!(exit_code(log), Some(0xC000_0005));
+        assert_eq!(exit_code("Launching witcher3.exe ...\r\n"), None);
+    }
 
     #[test]
     fn keys_near_or_after_gameplay_are_reported() {
