@@ -401,7 +401,7 @@ checksum = "1d8f70e07b9c3962945a74e59ca1c511bba65b6419468acc217c457d93f3c740"
 
 [[package]]
 name = "quen"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "crc32fast",
  "half",
