@@ -24,7 +24,9 @@ pub const DOCUMENTS: &str = "The Witcher 3";
 
 /// The builds quen is verified on, as quen_core::build::KnownBuilds parses them; the config's `known_builds`
 /// adds to them. Add an entry for a new build once it is verified, and keep the old one while quen still supports it.
-pub const KNOWN_BUILDS: &str = "steam 2df765398a3d1f165db418271be7200178320a4466817379f2fa0dc0001fb101 5.01 (Steam build 25773555)";
+pub const KNOWN_BUILDS: &str = "\
+    steam 2df765398a3d1f165db418271be7200178320a4466817379f2fa0dc0001fb101 5.01 (Steam build 25773555); \
+    steam 05948d7238e1c9620a1cb9b3125520f1c143ce04a8e5718a3735120c37d7bae0 5.0.0.1090142 (Steam build 26238013)";
 
 /// Whether `dir` is the game folder: its `bin\x64_dx12` holds `game_exe`.
 pub fn is_game_dir(dir: &Path, game_exe: &str) -> bool {
@@ -33,7 +35,7 @@ pub fn is_game_dir(dir: &Path, game_exe: &str) -> bool {
 
 /// What quen_setup and quen_doctor tell the user about a GOG install.
 pub const GOG_UNTESTED: &str = "GOG install: untested. quen's ASIs, RE knowledge base and checks are verified on Steam \
-    5.01 only, GOG's exe may differ from Steam's, and Steam-built mods are reported not to work on GOG. Tell the user \
+    builds only, GOG's exe may differ from Steam's, and Steam-built mods are reported not to work on GOG. Tell the user \
     before they pick it.";
 
 /// Whether `dir` is a GOG install: GOG puts its `goggame-<id>.info` in the game folder.

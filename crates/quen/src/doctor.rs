@@ -71,6 +71,32 @@ const PINS: &[Pin] = &[
         sha256: "3b52cc9c77f4e4604a1814158342a4e830cd39134e5128abd10ddbd63e60f53b",
         exact: false,
     },
+    // 0.1.19: the ASI's exe addresses (Tracy hooks, the exec verb's console executor) are Steam build 26238013's, not
+    // 5.01's (hooks.inc, trace.h); its quen.ws is 0.1.18's and its HUD bundle 0.1.16's, byte for byte.
+    Pin {
+        file: PACKAGE_ASI,
+        version: "quen-w3 0.1.19",
+        sha256: "da5b7f3e2fa44c02a40fb15344f88ca0836579a74fadadab9ca29a5cbc6eefca",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_SCRIPT,
+        version: "quen-w3 0.1.19",
+        sha256: "5e13694065b6c00fc4fa49a190116480a540569bc611c3ac419e1c7cf5196997",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[0],
+        version: "quen-w3 0.1.19",
+        sha256: "7592bfafef3c54ff258940f0c732a47e90903b3c4e5e74537a858d7269a1f2c1",
+        exact: true,
+    },
+    Pin {
+        file: PACKAGE_HUD[1],
+        version: "quen-w3 0.1.19",
+        sha256: "7d05a5ee2297d231e71afe10a567a499ff23d78a769d5fa2df01804d120dab7c",
+        exact: true,
+    },
     // 0.1.18: scene.frame projects from the free camera while it is on (world_frame, boot 238), in quen.ws; the ASI
     // differs from 0.1.17's only in its version, the HUD bundle is 0.1.16's, byte for byte.
     Pin {
@@ -584,11 +610,12 @@ pub(crate) struct Dep {
 }
 
 pub(crate) const GAME: Dep = Dep {
-    name: "The Witcher 3 5.01 (DX12)",
+    name: "The Witcher 3 (DX12)",
     required: true,
     enables: "every session and in-game tool",
-    how_to_get: "The Witcher 3: Wild Hunt from Steam or GOG, at game version 5.01; with Steam, set its Properties > \
-        Updates to 'Only update this game when I launch it'. quen_setup records where it is.",
+    how_to_get: "The Witcher 3: Wild Hunt from Steam or GOG, at a build quen knows: Steam build 26238013 (the one \
+        quen-w3 0.1.19's exe addresses are for) or 5.01; with Steam, set its Properties > Updates to 'Only update \
+        this game when I launch it'. quen_setup records where it is.",
     check: game,
 };
 
@@ -623,7 +650,8 @@ pub(crate) const PACKAGE: Dep = Dep {
         measure_ab's console actions without typing); from quen-w3 0.1.14, world_frame's and game_frame's share and \
         x, y from a box around an actor's body; from quen-w3 0.1.15, the lasting status line in a test session's game and \
         its 0.5 s hide before captures and windows; from quen-w3 0.1.16, that line in the game's HUD where it is drawn; \
-        from quen-w3 0.1.17, game_freecam; from quen-w3 0.1.18, world_frame under the free camera",
+        from quen-w3 0.1.17, game_freecam; from quen-w3 0.1.18, world_frame under the free camera; from quen-w3 \
+        0.1.19, profiler tracy:NAME and game_exec on Steam build 26238013 (up to quen-w3 0.1.18: on 5.01 only)",
     how_to_get: "quen-w3-<version>.zip from the GitHub Releases of quen-mcp, unzipped into the game folder: \
         bin\\x64_dx12\\W3Quen.asi and Mods\\modQuen. Move an old Mods\\modQuen and any Mods\\modQuenRpc to the \
         Recycle Bin first. It needs the Witcher Native Bridge.",
@@ -1337,7 +1365,7 @@ fn kb_table(cx: &Cx, file: &str) -> State {
         State {
             status: "wrong_version",
             note: Some(
-                "its per-build tables (RVAs, layouts) are Steam 5.01's: not applied to a GOG install"
+                "its per-build tables (RVAs, layouts) are Steam's: not applied to a GOG install"
                     .into(),
             ),
             ..State::found(table)
@@ -1932,7 +1960,7 @@ pub fn tool() -> Value {
         "name": "quen_doctor",
         "description": "Read-only, no lock, fast: every dependency quen uses, each with status (found, missing, \
             wrong_version), path, what it enables and where to get it (quen installs nothing). Required \
-            for a session: the game at a build quen knows (5.01), the Witcher Native Bridge, and quen's in-game package \
+            for a session: the game at a build quen knows, the Witcher Native Bridge, and quen's in-game package \
             (W3Quen.asi + modQuen, from one release; half of it, a mismatched pair or a leftover of the old layout is \
             the wrong version, and session_launch refuses it). The W3 Game State Bridge isn't needed. Optional, each \
             enabling tools: PresentMon, ReShade (RenoDX's host), the RenoDX add-on and devkit, Nsight Systems / \
@@ -2196,7 +2224,7 @@ mod tests {
         let Err(Done::Needs(why, _)) = require(&KB_PATCHES, &config, "mem_patch") else {
             panic!("the KB was used on a GOG install");
         };
-        assert!(why.contains("Steam 5.01"), "{why}");
+        assert!(why.contains("are Steam's"), "{why}");
     }
 
     /// Live boot 1: the KB folder was there without its tables, and the doctor called it found. Each table is checked.
@@ -2632,7 +2660,8 @@ mod tests {
         let mut older: Vec<&str> = PINS
             .iter()
             .filter(|p| {
-                p.file == PACKAGE_ASI && !["quen-w3 0.1.17", "quen-w3 0.1.18"].contains(&p.version)
+                p.file == PACKAGE_ASI
+                    && !["quen-w3 0.1.17", "quen-w3 0.1.18", "quen-w3 0.1.19"].contains(&p.version)
             })
             .map(|p| p.version)
             .collect();

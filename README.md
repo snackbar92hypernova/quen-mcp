@@ -98,7 +98,7 @@ quen makes that the agent's job, with guard rails:
 ## What you need
 
 - **Windows 10 or 11, 64-bit.**
-- **The Witcher 3: Wild Hunt 5.01, DX12.** quen checks the exe's build and refuses one it doesn't know. Only the Steam copy has been tested; GOG is untested.
+- **The Witcher 3: Wild Hunt, DX12, Steam build 26238013 (the 2026-10-29 Steam update) or 5.01.** quen checks the exe's build and refuses one it doesn't know. Only the Steam copy has been tested; GOG is untested.
 - **The Witcher Native Bridge 2.0** (with its ASI loader), from Nexus Mods.
 - **An MCP client.**
   - Claude Code (the CLI or the desktop app) is the one quen is built and tested with.

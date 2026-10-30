@@ -70,9 +70,9 @@ Your config, ledger, logs and captures stay. When a new quen changes the ledger'
 
 **Windows 10 or 11, 64-bit.** quen runs only on Windows.
 
-**The Witcher 3: Wild Hunt, game version 5.01, DX12** (`bin\x64_dx12\witcher3.exe`).
+**The Witcher 3: Wild Hunt, DX12, Steam build 26238013** (the 2026-10-29 Steam update; `bin\x64_dx12\witcher3.exe`). quen's in-game package from quen-w3 0.1.19 targets that build; 0.1.18 and earlier target 5.01.
 - quen starts `witcher3.exe` directly, not through Steam. With Steam, set the game's *Properties → Updates* to "Only update this game when I launch it", so the game stays on the build you test against.
-- **quen checks the build itself.** Before a launch changes anything, it hashes `witcher3.exe`: a build it doesn't know (a game update, another store's copy) is refused, and the reason gives the exe's sha256 and its PE stamp. quen knows Steam's 5.01. To test another build anyway, the agent passes `allow_unknown_build` for that launch (the boot's record says so); once you have checked a build works, you can add it to the config's `known_builds` (§3).
+- **quen checks the build itself.** Before a launch changes anything, it hashes `witcher3.exe`: a build it doesn't know (a game update, another store's copy) is refused, and the reason gives the exe's sha256 and its PE stamp. quen knows Steam's build 26238013 and 5.01. To test another build anyway, the agent passes `allow_unknown_build` for that launch (the boot's record says so); once you have checked a build works, you can add it to the config's `known_builds` (§3).
 - Only the Steam copy has been used so far. GOG is untested: its exe counts as unknown until someone verifies it there.
 
 **An MCP client** to talk to quen: Claude Code (the CLI or the desktop app) is the one quen is built and tested with. VS Code, Cursor and Gemini CLI should work: quen passes protocol checks with the official MCP tools, but nobody has tried them with a model yet. Codex CLI needs `quen serve --stay` started in a terminal first (section 4). What each client does with quen's long calls: [docs/clients.md](docs/clients.md).
@@ -200,7 +200,7 @@ presentmon = 'C:\Program Files\Intel\PresentMon\PresentMonConsoleApplication\Pre
 # while the line is down. Unset by default: no sound. gui_global_panel_open is the game's panel-open sound.
 # window_sound = 'gui_global_panel_open'
 
-# Optional: game builds you have verified, beside the ones quen knows (Steam 5.01). Each entry is
+# Optional: game builds you have verified, beside the ones quen knows (Steam build 26238013 and 5.01). Each entry is
 # <platform> <sha256 of witcher3.exe> <label>, platform steam or gog, ';' between entries. A refused launch's reason
 # gives the entry to add. Listing a build quen already knows under another label is refused.
 # known_builds = 'steam <64 hex digits> <label, e.g. 5.02 (Steam build <buildid>)>'
@@ -443,7 +443,7 @@ Everything quen produces lives under the data root, by default `%USERPROFILE%\.q
   - Don't send the rest of the log folder: `backup\` holds your settings files, and `game.log` and the `game-logs\` copies can hold your Steam id.
 - **Config keys may still change.**
 - **A check still pending:** whether a window grab gives the same values as the game's own frame, which `game_screenshot`'s HDR mode depends on. Until it passes, treat HDR screenshot values as untested.
-- **One game:** The Witcher 3 5.01, DX12. One session at a time, on Windows only.
+- **One game:** The Witcher 3, DX12 (Steam build 26238013 or 5.01). One session at a time, on Windows only.
 - **PresentMon:**
   - with frame generation on, every present counts, generated frames included. `presentmon_flags: ["--track_pc_latency"]` adds the column that tells them apart to the CSV, but quen's numbers don't use it yet;
   - a frame-rate cap or VSync hides frame-time changes, so measure below the cap with `vsync: false`;

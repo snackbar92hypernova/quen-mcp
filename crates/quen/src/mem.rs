@@ -103,7 +103,7 @@ pub fn tools() -> Vec<Value> {
                 the KB's patches.tsv, boundaries-checked not set, a row that breaks the rules (1 to 8 bytes inside one \
                 aligned qword, old and new the same length), or live bytes other than expected (another build or \
                 another writer); with needs: no KB in the local config or no patches.tsv in it, or a GOG install \
-                (the KB is Steam 5.01's). \
+                (the KB is Steam's). \
                 The write is journaled first and taints saves the game writes after it. Numbers and provenance as \
                 mem_read's."),
             "inputSchema": schema(json!({"name": name}), &["name"]),

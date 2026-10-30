@@ -21,7 +21,7 @@ The same tools serve more than testing:
 - **Development:** an agent can drive a mod's build-and-try loop beside the modder's other tools: stage a new build, relaunch at the same spot, switch the mod through its own exec functions, and read what the game does.
 - **Troubleshooting:** it can narrow down a mod list's conflicts, or a sudden loss of frame rate, boot by boot, parking a different set of mods each time, with every loadout and its measurements recorded.
 
-quen supports one game: The Witcher 3 5.01 (DX12) on Windows. Its core logic is game-neutral.
+quen supports one game: The Witcher 3 (DX12, Steam build 26238013 or 5.01) on Windows. Its core logic is game-neutral.
 
 ## Principles
 

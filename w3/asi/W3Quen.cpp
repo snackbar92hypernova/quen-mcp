@@ -7,7 +7,7 @@
 // "". Outside a tracy launch it changes no exe code and reads no exe address but for the exec verb (from 0.1.13): before
 // each one it checks the exe's PE stamp and the console executor's 16 entry bytes (hooks.inc's W3_CALL row), then calls
 // it from QUEN_Next on the game thread. In a tracy launch (quen sets W3_QUEN_TRACY=1 beside the token) it also hooks
-// witcher3.exe 5.01's functions for Tracy (trace.h).
+// witcher3.exe's functions for Tracy (trace.h). Every exe address it uses is Steam build 26238013's (hooks.inc).
 // The static import of WitcherNativeBridge.asi makes Windows load and initialise it before this module.
 #define NOMINMAX
 #include <windows.h>
@@ -34,7 +34,7 @@
 
 // quen-w3's release, named on W3Quen.log's natives line (in a tracy launch the hook lines come before it) and by pack.py's
 // zip. Each release's ASI then differs from the last, which quen's doctor needs: it tells a release by its ASI's sha256.
-constexpr char kVersion[] = "0.1.18";
+constexpr char kVersion[] = "0.1.19";
 
 // The caps of quen-core protocol.rs (MAX_REQUEST_BYTES, MAX_REPLY_BYTES), newline excluded.
 constexpr size_t kMaxRequest = 4096;
@@ -1020,8 +1020,8 @@ struct EngineString {
 using RunCommand = bool (*)(void*, const EngineString*, EngineString*);
 
 // Why the executor can't be called now, or "": quen's state shows no game loaded, a fade or a load (a function using
-// thePlayer would find none), the exe isn't 5.01 (its PE stamp), or its 16 entry bytes aren't 5.01's (another mod
-// patched it). Reads the exe's headers and the 16 bytes only.
+// thePlayer would find none), the exe isn't build 26238013 (its PE stamp), or its 16 entry bytes aren't hooks.inc's
+// (another mod patched it). Reads the exe's headers and the 16 bytes only.
 static std::string ExecGate(int flags) {
   if (flags < 0 || !(flags & 1) || (flags & 256))
     return "quen's state shows no loaded game (" + (flags < 0 ? std::string("no state yet") : "flags " + std::to_string(flags)) +
@@ -1031,7 +1031,8 @@ static std::string ExecGate(int flags) {
   char hex[64];
   if (nt->FileHeader.TimeDateStamp != trace::kTimeDateStamp) {
     snprintf(hex, sizeof hex, "0x%08lX", static_cast<unsigned long>(nt->FileHeader.TimeDateStamp));
-    return std::string("the exe's PE stamp is ") + hex + ", not witcher3.exe 5.01's: the executor's address is 5.01's";
+    return std::string("the exe's PE stamp is ") + hex +
+           ", not witcher3.exe build 26238013's: the executor's address is that build's";
   }
   if (kRemoteConsole_RunCommandRva + 16 > nt->OptionalHeader.SizeOfImage) return "the executor's RVA is outside the image";
   const uint8_t* live = base + kRemoteConsole_RunCommandRva;
@@ -1041,8 +1042,9 @@ static std::string ExecGate(int flags) {
       snprintf(hex, sizeof hex, "%s%02x", k ? " " : "", live[k]);
       got += hex;
     }
-    return "the console executor's 16 entry bytes (RVA 0x24DD370) are " + got +
-           ", not witcher3.exe 5.01's: another mod changed it, nothing called";
+    snprintf(hex, sizeof hex, "0x%X", kRemoteConsole_RunCommandRva);
+    return std::string("the console executor's 16 entry bytes (RVA ") + hex + ") are " + got +
+           ", not witcher3.exe build 26238013's: another mod changed it, nothing called";
   }
   return "";
 }

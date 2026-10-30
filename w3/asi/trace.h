@@ -1,5 +1,5 @@
 // W3Quen.asi's Tracy instrumentation (w3\README.md, Tracy), ported from the W3Trace ASI: a Tracy zone on each witcher3.exe
-// 5.01 function in hooks.inc, frame marks, per-frame plots and call counters. Dormant unless quen's tracy launch profile
+// function in hooks.inc, frame marks, per-frame plots and call counters. Dormant unless quen's tracy launch profile
 // triggered it (Triggered): only then does trace::Init, from DllMain, hook the functions (Detours) and start Tracy on a
 // thread of its own. Otherwise nothing here runs: no hook, no thread, no socket, no allocation. Tracy's client is built
 // to record only while a capture is connected, on 127.0.0.1 only, without broadcast (asi\build.bat). W3Quen.cpp
@@ -69,13 +69,16 @@ using D = double;
 // completed (W3Trace, from W3BoneFix: unfenced zones closed early on uncached reads).
 #define W3_ZONE_FENCE() _mm_lfence()
 
-constexpr uint32_t kTimeDateStamp = 0x6AC555A3;  // witcher3.exe 5.01's PE stamp (W3BoneFix's and W3Trace's gate)
+// The build every RVA here and in hooks.inc is for: witcher3.exe Steam build 26238013's PE stamp (5.01's: 0x6AC555A3).
+// FUN_ and DAT_ addresses in the [O] notes below are 5.01's, where they were observed.
+constexpr uint32_t kTimeDateStamp = 0x6ADFBD7A;
 constexpr int kRingSlowUs = 20;  // RenderRing_Alloc calls at least this slow get a zone of their own (W3Trace's default)
 // [O] (W3Trace, re/cpu_pt_main.md) the global holding the GpuApi pointer whose +0x31b71ac is the engine's fence-wait time
-constexpr uintptr_t kEngineFenceRva = 0x5a58ef8;
+// (5.01: 0x5a58ef8)
+constexpr uintptr_t kEngineFenceRva = 0x5a56ef8;
 // [O] (W3Trace) return addresses of the three calls to JobCounter_Wait in Render_FrameTaskGraph's end-of-frame join
-// (FUN_141d326a0: call at 0x141d335a4 / 0x141d335c2 / 0x141d335f4, E8 to 0x141d53740).
-constexpr uintptr_t kJoinRets[3] = {0x1d335a9, 0x1d335c7, 0x1d335f9};
+// (0x1d321a0: calls at 0x1d330a4 / 0x1d330c2 / 0x1d330f4, E8 to 0x1d53270; 5.01: 0x1d335a9, 0x1d335c7, 0x1d335f9).
+constexpr uintptr_t kJoinRets[3] = {0x1d330a9, 0x1d330c7, 0x1d330f9};
 
 static uintptr_t g_base, g_image_size;  // the image the RVAs and job-name pointers refer to
 static std::atomic<bool> g_live;        // Tracy started: wrappers record; before that they only forward
@@ -124,8 +127,8 @@ static std::atomic<int> g_dispatchers;
 #define W3_HOOK(NAME, RVA, BYTES, SIG, KIND) W3_HOOK_##KIND(NAME, SIG)
 #include "hooks.inc"
 #undef W3_HOOK
-// W3BoneFix.asi swaps GetCustomBoneMatrix 0x1CAC050..0x1CAC10F through its vtable slot (hooks.tsv 0x37AE730).
-#define W3_HOOK(NAME, RVA, BYTES, SIG, KIND) static_assert(RVA + 16 <= 0x1CAC050 || RVA >= 0x1CAC110, #NAME);
+// W3BoneFix.asi swaps GetCustomBoneMatrix 0x1CABAB0..0x1CABB6F through its vtable slot (hooks.tsv 0x37AC6F0).
+#define W3_HOOK(NAME, RVA, BYTES, SIG, KIND) static_assert(RVA + 16 <= 0x1CABAB0 || RVA >= 0x1CABB70, #NAME);
 #include "hooks.inc"
 #undef W3_HOOK
 
@@ -163,7 +166,7 @@ static Hook g_hooks[] = {
 #undef W3_HOOK
 };
 
-// The entry-byte gate. "ok": the live bytes are 5.01's. "chained": another hook replaced the entry with a jmp rel32
+// The entry-byte gate. "ok": the live bytes are hooks.inc's. "chained": another hook replaced the entry with a jmp rel32
 // (Detours, MinHook): Detours copies that jmp into our trampoline with its target fixed up (detours.cpp: E9 is
 // ENTRY_CopyBytes3Or5Target and ends the copy), so both hooks run, ours first. nullptr: anything else.
 static const char* EntryGate(const uint8_t* live, const char* expect) {
@@ -471,11 +474,11 @@ static void GpuCtx_Close_probe(bool post, const U* a, U, uintptr_t, tracy::Scope
   SetZoneText(zone, "barriers %u", n);
 }
 
-// [O] FUN_141f22b70(table) = RTShaderTable::Create: rebuilds when table+0x58 != frame DAT_145c92ae8.
+// [O] FUN_141f22b70(table) = RTShaderTable::Create: rebuilds when table+0x58 != frame DAT_145c92ae8 (here 0x5c90ae8).
 static void RTSBT_Build_probe(bool post, const U* a, U, uintptr_t, tracy::ScopedZone* zone) {
   int32_t built, now, chunks = 0, extra = -1, chunks2 = 0;
   uint8_t per = 0;
-  if (post || !ReadAt(a[0] + 0x58, &built) || !ReadAt(g_base + 0x5c92ae8, &now) || built == now) return;
+  if (post || !ReadAt(a[0] + 0x58, &built) || !ReadAt(g_base + 0x5c90ae8, &now) || built == now) return;
   ReadAt(a[0] + 0x32, &per);
   ReadAt(a[0] + 0x198, &chunks);
   ReadAt(a[0] + 0x19c, &extra);
@@ -493,7 +496,8 @@ static void RTCull_ProximityWalk_probe(bool post, const U* a, U, uintptr_t, trac
   SetZoneText(zone, "records %u", n);
 }
 
-// [O] FUN_141cd6ca0(desc): writes (kinds != 3, or all with DAT_14514cd40) x desc+0x14 x desc+0x20 entries per ring.
+// [O] FUN_141cd6ca0(desc): writes (kinds != 3, or all with DAT_14514cd40, here 0x514ad90) x desc+0x14 x desc+0x20
+// entries per ring.
 static void RTQueue_PushReady_probe(bool post, const U* a, U, uintptr_t, tracy::ScopedZone* zone) {
   uintptr_t kinds;
   uint32_t nk, nb, nc, k = 0;
@@ -501,7 +505,7 @@ static void RTQueue_PushReady_probe(bool post, const U* a, U, uintptr_t, tracy::
   int32_t kind;
   if (post || !ReadAt(a[0], &kinds) || !ReadAt(a[0] + 8, &nk) || !ReadAt(a[0] + 0x14, &nb) || !ReadAt(a[0] + 0x20, &nc))
     return;
-  ReadAt(g_base + 0x514cd40, &all);
+  ReadAt(g_base + 0x514ad90, &all);
   for (uint32_t i = 0; i < nk && i < 64; ++i) k += ReadAt(kinds + 4 * i, &kind) && (kind != 3 || all);
   const int64_t entries = int64_t{k} * nb * nc;
   Count(kQueueEntries, entries);
@@ -580,15 +584,15 @@ static DWORD WINAPI Start(void*) {
 }
 
 // From DllMain, only when Triggered(), before the engine runs any hooked function [I: the loader loads ASIs at process
-// start]: the exe must be 5.01 (its PE stamp), and each function's entry bytes 5.01's (or another hook's jmp, chained
-// over). The matching ones are hooked; then Tracy starts on its own thread (it starts threads and sleeps).
+// start]: the exe must be build 26238013 (its PE stamp), and each function's entry bytes hooks.inc's (or another hook's
+// jmp, chained over). The matching ones are hooked; then Tracy starts on its own thread (it starts threads and sleeps).
 static void Init() {
   g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_base + reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base)->e_lfanew);
   g_image_size = nt->OptionalHeader.SizeOfImage;
   if (nt->FileHeader.TimeDateStamp != kTimeDateStamp) {
-    Log("tracy: REFUSED: the exe's TimeDateStamp is 0x%08X, not witcher3.exe 5.01's 0x%08X: nothing hooked, no Tracy",
-        nt->FileHeader.TimeDateStamp, kTimeDateStamp);
+    Log("tracy: REFUSED: the exe's TimeDateStamp is 0x%08X, not witcher3.exe build 26238013's 0x%08X: nothing hooked, "
+        "no Tracy", nt->FileHeader.TimeDateStamp, kTimeDateStamp);
     return;
   }
   const bool thunks = MakeCountThunks(g_hooks, _countof(g_hooks));

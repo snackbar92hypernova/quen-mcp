@@ -1378,7 +1378,7 @@ fn a_tracy_launch_captures_from_the_launch_to_the_end() {
     fs::copy(fake_tracy_capture(), &tool).unwrap();
     let kb = fx.path("kb");
     fs::create_dir_all(&kb).unwrap();
-    let hooks = "site\tkind\tmod\tversion\tnote\n0x1C224A0\thook\tW3Fake\t1.0\tsynthetic\n";
+    let hooks = "site\tkind\tmod\tversion\tnote\n0x1C22050\thook\tW3Fake\t1.0\tsynthetic\n";
     fs::write(kb.join("hooks.tsv"), hooks).unwrap();
     fx.config(&format!(
         "tracy_capture = '{}'\nkb = '{}'\n",
@@ -1532,7 +1532,7 @@ fn a_launch_needs_the_native_bridge_and_quen_s_package_whole() {
     off_in(&fx, r"Mods\modQuenRpc");
     fs::write(fx.path("game").join(PARTS[4]), "another release").unwrap();
     broken(
-        "quen.ws is not the version quen expects (quen-w3 0.1.18, quen-w3 0.1.17, quen-w3 0.1.16, quen-w3 0.1.15, quen-w3 0.1.14, quen-w3 0.1.13, quen-w3 0.1.12, quen-w3 0.1.11, quen-w3 0.1.10, quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
+        "quen.ws is not the version quen expects (quen-w3 0.1.19, quen-w3 0.1.18, quen-w3 0.1.17, quen-w3 0.1.16, quen-w3 0.1.15, quen-w3 0.1.14, quen-w3 0.1.13, quen-w3 0.1.12, quen-w3 0.1.11, quen-w3 0.1.10, quen-w3 0.1.9, quen-w3 0.1.8, quen-w3 0.1.7, quen-w3 0.1.6, quen-w3 0.1.5, quen-w3 0.1.4, quen-w3 0.1.3, quen-w3 0.1.2, quen-w3 0.1.1, test): unzip one release package",
     );
     off_in(&fx, PARTS[4]); // quen.ws
     broken(r"W3Quen.asi without Mods\modQuen, half the package");

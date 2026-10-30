@@ -6,15 +6,16 @@
 //             and QUEN_CamAt against quen-core sweep.rs's reference vectors; the scene verbs (0.1.13) and their
 //             read-backs; an exec refused before any game state
 //   exec      the exec verb (0.1.13), the console executor's entry bytes and a stand-in for it planted at its RVA: in
-//             test.exe (not 5.01's PE stamp) refused; in tracyhost.exe called, with the line built from the verb, its
+//             test.exe (not the game's PE stamp) refused; in tracyhost.exe called, with the line built from the verb, its
 //             log, not called, refused by the state, refused when the entry bytes differ
 //   notoken   no W3_QUEN_TOKEN: QUEN_Next is "", no pipe, neither log written
 //   badtoken  a token with path characters: no pipe
 //   wrongpid  W3_QUEN_PID names another process: the client is dropped
 //   squat     the pipe name is taken before the ASI loads: it refuses to serve it
 // Tracy (trace.h), each hook's entry bytes planted at its RVA first (Plant):
-//   tracy-stamp    full trigger (W3_QUEN_TRACY=1, token, pid) in this exe, whose PE stamp isn't 5.01's: refused, dormant
-//   mkhost         writes tracyhost.exe: this exe with witcher3.exe 5.01's PE stamp, for the modes below
+//   tracy-stamp    full trigger (W3_QUEN_TRACY=1, token, pid) in this exe, whose PE stamp isn't the game's: refused,
+//                  dormant
+//   mkhost         writes tracyhost.exe: this exe with witcher3.exe build 26238013's PE stamp, for the modes below
 //   tracy-none     tracyhost.exe, no variable at all: dormant
 //   tracy-token    a token and pid, no trigger (a plain quen launch): dormant
 //   tracy-notoken  W3_QUEN_TRACY=1 without a token: dormant
@@ -884,7 +885,7 @@ static const Site kSites[] = {
 #undef W3_HOOK
 };
 alignas(4096) static uint8_t g_image[0x2900000];
-constexpr uint32_t kStamp501 = 0x6AC555A3;  // witcher3.exe 5.01's PE stamp
+constexpr uint32_t kGameStamp = 0x6ADFBD7A;  // witcher3.exe build 26238013's PE stamp (trace.h kTimeDateStamp)
 constexpr uint64_t kSignalAdd = 0x10;
 
 static uint8_t* At(uint32_t rva) {
@@ -1163,7 +1164,7 @@ static void PlantExec() {
 static void ExecMode() {
   const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
-  const bool host = nt->FileHeader.TimeDateStamp == kStamp501;
+  const bool host = nt->FileHeader.TimeDateStamp == kGameStamp;
   PlantExec();
   Load();
   const HANDLE h = Connect();
@@ -1172,7 +1173,7 @@ static void ExecMode() {
   const std::string npcavoid = R"({"id":1,"ttl_ms":5000,"verb":"exec","function":"npcavoid"})";
   if (!host) {
     const std::string got = ExecReply(h, npcavoid);
-    CHECK(got.starts_with(R"({"id":1,"ok":false,"text":"refused: the exe's PE stamp is 0x)") && Has(got, "not witcher3.exe 5.01's"));
+    CHECK(got.starts_with(R"({"id":1,"ok":false,"text":"refused: the exe's PE stamp is 0x)") && Has(got, "not witcher3.exe build 26238013's"));
     if (!Has(got, "PE stamp")) printf("  %s\n", got.c_str());
     CHECK(g_exec_calls == 0);
     return;
@@ -1203,7 +1204,7 @@ static void ExecMode() {
   uint8_t* entry = At(kRemoteConsole_RunCommandRva);
   entry[0] = 0xe9;
   got = ExecReply(h, npcavoid);
-  CHECK(Has(got, R"("ok":false,"text":"refused: the console executor's 16 entry bytes (RVA 0x24DD370) are e9 8b c4 55)"));
+  CHECK(Has(got, R"("ok":false,"text":"refused: the console executor's 16 entry bytes (RVA 0x24DBA50) are e9 8b c4 55)"));
   if (!Has(got, "entry bytes")) printf("  %s\n", got.c_str());
   entry[0] = 0x48;
   CHECK(ExecReply(h, npcavoid).starts_with(R"({"id":1,"ok":true,)"));
@@ -1269,7 +1270,7 @@ int wmain(int argc, wchar_t** argv) {
     CHECK(pe.size() > 0x40);
     memcpy(&lfanew, pe.data() + 0x3c, 4);
     CHECK(lfanew > 0 && size_t(lfanew) + 12 < pe.size());
-    memcpy(pe.data() + lfanew + 8, &kStamp501, 4);  // IMAGE_FILE_HEADER.TimeDateStamp
+    memcpy(pe.data() + lfanew + 8, &kGameStamp, 4);  // IMAGE_FILE_HEADER.TimeDateStamp
     std::ofstream(Here(L"tracyhost.exe"), std::ios::binary) << pe;
   } else if (mode.starts_with(L"tracy-")) {
     TracyMode(mode, token, pid);
