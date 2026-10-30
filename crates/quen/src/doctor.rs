@@ -383,7 +383,7 @@ const PINS: &[Pin] = &[
     // Exact: a renderdoc launch swaps out only this file, and its end must give back the same bytes.
     Pin {
         file: INTERPOSER,
-        version: "NVIDIA Streamline 2.14.1.0, signed production build (5.01)",
+        version: "NVIDIA Streamline 2.14.1.0, signed production build (5.01; unchanged in build 26238013)",
         sha256: "8c87c9499461da561edd529aa9bf7831d67d7b94ebb1c1a5ed54ef4934e1ea4c",
         exact: true,
     },
