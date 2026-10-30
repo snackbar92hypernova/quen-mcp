@@ -5,7 +5,7 @@ rem w3\third_party (its README: versions and licences).
 rem   build.bat        build only
 rem   build.bat test   also builds w3\out\test (test.exe, a copy of the ASI and wnb_stub.cpp as a stand-in
 rem                    WitcherNativeBridge.asi: never install anything from out\test) and runs test.exe in every mode,
-rem                    then the Tracy modes in tracyhost.exe (test.exe with witcher3.exe 5.01's PE stamp)
+rem                    then the Tracy modes in tracyhost.exe (test.exe with witcher3.exe build 26238013's PE stamp)
 rem   WNB_SDK        folder with include\WitcherNativeBridgeApi.h and lib\WitcherNativeBridge.lib (required)
 rem   TRACY_CAPTURE  optional, for build.bat test: Tracy 0.14.1's tracy-capture.exe, which then captures from tracyhost.exe
 setlocal

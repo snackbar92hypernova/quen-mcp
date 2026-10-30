@@ -297,7 +297,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 
 ### Tracy: quen's `tracy` launch profile
 
-- **No extra mod:** the Tracy instrumentation is in quen's own W3Quen.asi from quen-w3 0.1.3 on (zones on 75 functions of witcher3.exe 5.01, ported from the W3Trace ASI; quen's source, `w3/README.md`, section Tracy). It stays dormant (no hook, thread or socket) in every launch but a tracy one. The W3Trace ASI itself is no longer needed.
+- **No extra mod:** the Tracy instrumentation is in quen's own W3Quen.asi from quen-w3 0.1.3 on (zones on 75 functions of witcher3.exe, ported from the W3Trace ASI; from quen-w3 0.1.19 at Steam build 26238013's addresses, before at 5.01's; quen's source, `w3/README.md`, section Tracy). It stays dormant (no hook, thread or socket) in every launch but a tracy one. The W3Trace ASI itself is no longer needed.
 - **Setup:** the user sets `tracy_capture` in quen's config: Tracy 0.14.1's `tracy-capture.exe`, the version of the Tracy client in the package. `quen_doctor` runs it to read its version. A tracy launch also needs quen-w3 0.1.3 or later in the game and `kb` in the config.
 - **Launch:** `profiler: "tracy:<NAME>"`. The plan parks every mod the KB's `hooks.tsv` names at a function W3Quen hooks (`settings_diff.profile.collisions` lists those rows; in hooks.tsv as of 2026-10-18, W3EngineTweaks and W3LightCache). Naming one in `keep` is refused. ReShade stays.
 - **The capture:** quen starts Tracy's capture tool in the session's job just before the game, on a loopback port it picked. The boot waits until `W3Quen.log` says a capture connected; the result's `tracy` gives the hooks installed and the ones skipped. Tracy records only while connected, from then until `session_end`. The end closes the game first, so the tool writes `<capture root>\<boot id>\<NAME>.tracy`, then records its capture row (kind `tracy`, method `tracy`): `tracy` in the end's result. The capture holds the whole session, so it grows with it. The tool's output is `tracy-capture.log` in the session's logs.
@@ -406,7 +406,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 1. **Read the KB first:** `INDEX.md`, then grep `names.tsv`, `hooks.tsv`, `patches.tsv` and `instance_patches.tsv` for the area. If the answer is there with confidence O, cite it (a `re_refs` row) and stop.
    - **Has REA answered it before?** `ledger_about` with the function (`kind` function, `key` its KB name) or `build` (the exe's sha256) and `rva`, and the `operation`. Each extraction it lists is one REA record kept whole in its bundle file (`bundle`, relative to the capture root), found there by `evidence_id`; reading it starts no Ghidra.
    - `exact`: the analysis profile you named (`profile`). `near`: another profile, or none named; the profile's digest covers the Ghidra version, the analysis options and the seed file's path and sha256 (`seeds`). `gone`: the bundle file was removed. `results` over 1: the same query gave different answers. REA's `batch_decompile` records carry their own workflow profile (provider `rea-workflow`, no `analysis_seeds`; its `upstream_analysis_profile` names the Ghidra profile's digest), so with the Ghidra profile named they are `near`, never `exact`.
-2. **Everything is build-pinned:** KB RVAs belong to one game build. The KB is Steam 5.01's, build stamp `0x6AC555A3`. Check the running build (`quen_doctor`, `games.build_stamp`) before using an RVA. A GOG or updated exe is another build.
+2. **Everything is build-pinned:** KB RVAs belong to one game build. The KB is Steam build 26238013's, build stamp `0x6ADFBD7A`. Check the running build (`quen_doctor`, `games.build_stamp`) before using an RVA. A GOG or updated exe is another build.
 3. **Seed the analysis:** REA's `REA_GHIDRA_SEED_FILE` points at the KB's `seeds.tsv` (VA = RVA + `0x140000000`). Changing it is the user's edit to REA's MCP entry, then a new Claude session.
 4. **Keep one REA server for the whole task.** The first query waits about 17 minutes while Ghidra analyses, using about 23 GB. Don't call `binary_session` for a status check: it returns about 243 KB.
 5. **Never during a timing boot:** Ghidra runs as `java` / `analyzeHeadless`, which `strict: true` refuses and which skews CPU numbers anyway.
@@ -504,7 +504,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 4. **Report** the returned `claims_status` row: `proven`, `families`, `contradictions`. With one family, say "unproven: one method".
 
 **Example A: a frame-time claim, PresentMon + Tracy.**
-- **The claim:** "`<Mod>.asi` mode 1 lowers frame time against mode 0 at `<save>` in photo mode, outside drift". Scope: `build 0x6AC555A3; mod_set <id>; devkit 0; profiler tracy:ab1; vsync 0`.
+- **The claim:** "`<Mod>.asi` mode 1 lowers frame time against mode 0 at `<save>` in photo mode, outside drift". Scope: `build 0x6ADFBD7A; mod_set <id>; devkit 0; profiler tracy:ab1; vsync 0`.
 - **Steps:**
   1. Launch with `profiler: "tracy:ab1"`, `devkit: false`, `vsync: false`, `park: "ALL"`, `keep: "<Mod>.asi"` (refused if the tracy profile parks `<Mod>.asi`: hooks.tsv names it at a function W3Quen hooks).
   2. Call `measure_ab` with `tag: "ab1"` and `states: [{"label": "A", "actions": [{"asi": "<Mod>.asi", "set_mode": 0}]}, {"label": "B", "actions": [{"asi": "<Mod>.asi", "set_mode": 1}]}]`. Pass `strict: true`: a tracy boot is its own condition, so it refuses only for a busy machine or the devkit.
@@ -514,7 +514,7 @@ Only M, O and static_re count towards proven. Never tag an inference M.
 - **If they disagree:** Tracy's difference may sit inside its own window-to-window spread. Then link the Tracy rows with `supports: false`. The claim isn't proven: investigate (a GPU-bound change Tracy's CPU zones can't see, say) before any third run.
 
 **Example B: a function's identity, static RE + live memory.**
-- **The claim:** "the function at RVA `<rva>` in build `0x6AC555A3` is `<name>`, which writes `<field>` of `<structure>`". Scope: the build stamp.
+- **The claim:** "the function at RVA `<rva>` in build `0x6ADFBD7A` is `<name>`, which writes `<field>` of `<structure>`". Scope: the build stamp.
 - **Static:**
   1. KB read first (§2, REA), then a seeded REA analysis.
   2. One `static_re` row (`boot_id` null) and a `re_refs` row to the note.

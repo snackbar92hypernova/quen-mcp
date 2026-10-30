@@ -338,7 +338,7 @@ entities share matches neither, and unknown hex never becomes an entity.
 
 | kind | key | e.g. | written by |
 |---|---|---|---|
-| `function` | its KB name; unnamed: `fn_<stamp>_<rva>` | `Post_Tonemap`, `fn_6AC555A3_34D4D0` | KB scan (names.tsv) |
+| `function` | its KB name; unnamed: `fn_<stamp>_<rva>` | `Post_Tonemap`, `fn_6ADFBD7A_34E6D0` | KB scan (names.tsv) |
 | `label` | its KB name (a name inside code or data) | `CRenderSkinningData_vftable_slot10` | KB scan (names.tsv) |
 | `hook` | `<mod>:<hook kind>:<function key>` at a function's start, else `<mod>:<hook kind>:<stamp>_<rva>` | `W3ElementMap:hook:ElementMap_AllocIndex` | KB scan (hooks.tsv) |
 | `patch` | its name in patches.tsv or instance_patches.tsv (an instance patch's rva: its class's vtable) | `cull_disable` | KB scan (patches.tsv, instance_patches.tsv) |
@@ -554,7 +554,7 @@ ORDER BY method_family, metric, state_label;
 ```
 
 **Has this been extracted before?** Every REA answer for one address of one build. `?1`: the exe's sha256; `?2`: the
-RVA (`0x34C880`) or a function's or label's key; `?3`: an operation, or `''` for any. `seeds` is the seed file the
+RVA (`0x34DA80`) or a function's or label's key; `?3`: an operation, or `''` for any. `seeds` is the seed file the
 profile used: the same path and sha256 as the next session's is an exact hit. `results` over 1: the same query once gave
 different answers. `removed_at` set: the bundle file is gone, so the answer must be asked again. `ledger_about` answers
 the same in one call.

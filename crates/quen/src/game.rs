@@ -122,7 +122,8 @@ pub fn tools() -> Vec<Value> {
                 keeps its default and the function still runs. Not journaled, as game_console's lines aren't: what it \
                 changes taints no save in quen's records. Refused, nothing run: wrong token, the user has the \
                 controls, quen's state not gameplay or photo mode, a line it can't read, an older package (with \
-                needs), the exe not 5.01 or the executor's entry bytes not 5.01's (game_text), no exec function of \
+                needs), the exe not the ASI's build (from quen-w3 0.1.19 Steam build 26238013, before 5.01) or the \
+                executor's entry bytes not that build's (game_text), no exec function of \
                 that name taking these arguments. Failed: no reply within 5 s.",
             "inputSchema": schema(json!({
                 "line": {"type": "string", "description": "name or name(arg, ...), e.g. npcavoidpreset(2)"},
@@ -150,7 +151,7 @@ pub fn tools() -> Vec<Value> {
                 after it count as tainted; a write that changes nothing is skipped (unchanged). Refused, \
                 nothing written: no single var of that name (give Group/Name), a value that isn't the var's type, or \
                 no layout row for the running build; with needs: no KB in the local config or no cvar_layout.tsv in \
-                it, or a GOG install (the KB is Steam 5.01's).",
+                it, or a GOG install (the KB is Steam's).",
             "inputSchema": schema(json!({
                 "name": {"type": "string", "description": "Name or Group/Name, e.g. Rendering/RT/PathTracer/PTUseSHARC"},
                 "set": {"type": "string", "description": "the value to write: a number, true / false or text"},

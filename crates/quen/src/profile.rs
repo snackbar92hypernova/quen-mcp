@@ -1985,15 +1985,15 @@ mod tests {
 
     /// A synthetic hooks.tsv: rows at W3Quen's Tracy sites (two of one mod, one of a mod that isn't installed), rows
     /// that change nothing there or are W3Trace's own, a row elsewhere, comments and the build line.
-    const HOOKS_TSV: &str = "# Every witcher3.exe 5.01 site our mods touch\n\
+    const HOOKS_TSV: &str = "# Every witcher3.exe build 26238013 site our mods touch\n\
         site\tkind\tmod\tversion\tnote\n\
-        0x1C224A0\thook\tW3EngineTweaks\t1.12.4\tRT split consumer\n\
-        0x1BF4F60\thook\tW3EngineTweaks\t1.12.4\tRT split per-batch mesh update\r\n\
-        0x352130\thook\tW3LightCache\t1.1\tPT light sort\n\
-        0x1BF9770\tcall\tW3RtWalk\t1.6\tstage join\n\
-        0x1C352F0\thook\tW3Trace\t1.2\tTracy zone\n\
-        0x1CF3860\thook\tW3ElementMap\t1.1\tregister\n\
-        # build: sha256=0000000000000000000000000000000000000000000000000000000000000000 stamp=0x6AC555A3\n";
+        0x1C22050\thook\tW3EngineTweaks\t1.12.4\tRT split consumer\n\
+        0x1BF4AE0\thook\tW3EngineTweaks\t1.12.4\tRT split per-batch mesh update\r\n\
+        0x353330\thook\tW3LightCache\t1.1\tPT light sort\n\
+        0x1BF92E0\tcall\tW3RtWalk\t1.6\tstage join\n\
+        0x1C34E50\thook\tW3Trace\t1.2\tTracy zone\n\
+        0x1CF3370\thook\tW3ElementMap\t1.1\tregister\n\
+        # build: sha256=0000000000000000000000000000000000000000000000000000000000000000 stamp=0x6ADFBD7A\n";
 
     /// A game with W3EngineTweaks and ReShade installed, a KB with [`HOOKS_TSV`], and Tracy's capture tool.
     fn tracy_game(t: &Temp) -> (Config, PathBuf) {
@@ -2158,8 +2158,8 @@ mod tests {
     fn tracy_sites_and_version_are_the_packages() {
         let sites = tracy_sites();
         assert_eq!(sites.len(), 75);
-        assert!(sites.contains(&("RT_UpdateRayTracingData", 0x1C224A0)));
-        assert!(sites.contains(&("Post_Tonemap", 0x34C880)));
+        assert!(sites.contains(&("RT_UpdateRayTracingData", 0x1C22050)));
+        assert!(sites.contains(&("Post_Tonemap", 0x34DA80)));
         let header = include_str!("../../../w3/third_party/tracy/public/common/TracyVersion.hpp");
         let part = |name: &str| {
             let at = header.find(&format!("{name} = ")).unwrap() + name.len() + 3;
@@ -2207,7 +2207,7 @@ mod tests {
             "stale"
         );
         for bad in [
-            "1 tracy: REFUSED: the exe's TimeDateStamp is 0x1, not witcher3.exe 5.01's 0x6AC555A3\n",
+            "1 tracy: REFUSED: the exe's TimeDateStamp is 0x1, not witcher3.exe build 26238013's 0x6ADFBD7A\n",
             "1 tracy: 0 of 75 hooks installed\n",
         ] {
             log(bad);

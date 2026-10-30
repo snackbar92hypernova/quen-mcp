@@ -1016,7 +1016,7 @@ mod tests {
             (&gog["platform"], &gog["status"]),
             (&json!("gog"), &json!("untested"))
         );
-        assert!(gog["note"].as_str().unwrap().contains("Steam 5.01 only"));
+        assert!(gog["note"].as_str().unwrap().contains("Steam builds only"));
     }
 
     #[test]
