@@ -1,5 +1,5 @@
 //! Crash injection for the session journal (docs/intent.md, "The session journal"). A scripted session (back up 4
-//! files, patch 2, park 3 mods and a Vortex mod's DLL, menu XML and DLC folder, place 2 files) is cut at every byte of every step's lines; each replay must give the
+//! files, patch 2, park 3 mods and a Vortex mod's DLL, bin folder, menu XML and DLC folder, place 2 files) is cut at every byte of every step's lines; each replay must give the
 //! user's files back exactly, or report every difference it leaves. All files are synthetic.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,8 +33,8 @@ fn backup_of(path: &str) -> PathBuf {
 }
 
 /// The user's files before the session: 4 config files, 3 mods (one with a non-ASCII name, so cuts split a UTF-8
-/// character), a Vortex mod's DLL (a hardlink of its staging copy), menu XML and DLC folder, and a bin file nobody
-/// touches.
+/// character), a Vortex mod's DLL (a hardlink of its staging copy), bin folder, menu XML and DLC folder, and a bin file
+/// nobody touches.
 fn user_state() -> MemFs {
     let fs = MemFs::default();
     fs.put(
@@ -56,12 +56,13 @@ fn user_state() -> MemFs {
         "STAGING/W3LoadFix/bin/x64_dx12/dsound.dll",
         "GAME/bin/x64/dsound.dll",
     );
+    fs.put("GAME/bin/x64/dataFolder", "data tree");
     fs.put("GAME/menu/w3loadfix.xml", "<menu/>");
     fs.put("GAME/DLC/dlcExtra", "dlc tree");
     fs
 }
 
-/// The scripted session over [`user_state`]: back up 4 files, patch 2, park 3 mods and the Vortex mod's 3 units by
+/// The scripted session over [`user_state`]: back up 4 files, patch 2, park 3 mods and the Vortex mod's 4 units by
 /// `ALL`, place 2 files.
 fn session() -> (MemFs, Vec<Op>) {
     let fs = user_state();
@@ -101,7 +102,11 @@ fn session() -> (MemFs, Vec<Op>) {
         is_link: false,
     };
     let (bin, menu, dlc) = (
-        [file("dsound.dll", false), file("untouched.dll", false)],
+        [
+            file("dsound.dll", false),
+            file("dataFolder", true),
+            file("untouched.dll", false),
+        ],
         [file("w3loadfix.xml", false)],
         [file("dlcExtra", true)],
     );
@@ -110,6 +115,7 @@ fn session() -> (MemFs, Vec<Op>) {
         names: vec!["nexus:13881".into()],
         units: vec![
             (Home::Bin, "dsound.dll".into()),
+            (Home::BinDir, "dataFolder".into()),
             (Home::Menu, "w3loadfix.xml".into()),
             (Home::Dlc, "dlcExtra".into()),
         ],
@@ -304,9 +310,9 @@ fn crash_everywhere(make: fn() -> (MemFs, Vec<Op>)) -> usize {
 
 #[test]
 fn every_crash_point_of_the_session_restores_the_user_files() {
-    assert_eq!(session().1.len(), 14);
+    assert_eq!(session().1.len(), 15);
     let replays = crash_everywhere(session);
-    assert!(replays > 14 * 100, "{replays} replays");
+    assert!(replays > 15 * 100, "{replays} replays");
 }
 
 #[test]
@@ -375,7 +381,7 @@ fn a_full_replay_ends_the_session() {
         report.clean() && report.kept.is_empty() && report.notes.is_empty(),
         "{report:#?}"
     );
-    assert_eq!(report.undone.len(), 2 + 6 + 2, "{report:#?}");
+    assert_eq!(report.undone.len(), 2 + 7 + 2, "{report:#?}");
     // The placed files and the four spent backups went to the Recycle Bin, nothing was deleted.
     assert_eq!(fs.recycled(), report.recycled);
     assert_eq!(report.recycled.len(), 2 + 4);

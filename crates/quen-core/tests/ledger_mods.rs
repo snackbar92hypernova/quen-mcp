@@ -145,6 +145,7 @@ fn only_a_known_build_gets_a_label() {
         kind,
         name: name.into(),
         home: home.into(),
+        tree: kind == Kind::ModsFolder,
         parked: false,
         ignore: vec![],
         config,

@@ -43,7 +43,8 @@ pub enum Kind {
     ReShade,
     /// A folder in `dlc`.
     Dlc,
-    /// Another file in bin that a mod manager's records name as a mod's (a DLL, a data file).
+    /// Another file in bin that a mod manager's records name as a mod's (a DLL, a data file), or a folder in bin holding
+    /// such files.
     Bin,
     /// A mod's menu XML in the menu folder, as a mod manager's records name it.
     Menu,
@@ -71,11 +72,6 @@ impl Kind {
             Kind::Bin => "bin",
             Kind::Menu => "menu",
         }
-    }
-
-    /// Mods and dlc entries are folders, hashed as a tree; the others are one file.
-    pub fn is_folder(self) -> bool {
-        matches!(self, Kind::ModsFolder | Kind::Dlc)
     }
 }
 
@@ -123,8 +119,10 @@ impl HashCache {
 pub struct ModSpec {
     pub kind: Kind,
     pub name: String,
-    /// The mod's file, or its folder for a folder kind ([`Kind::is_folder`]).
+    /// The mod's file or folder.
     pub home: PathBuf,
+    /// `home` is a folder, hashed as a tree: a Mods or dlc entry, a mod manager's folder in bin.
+    pub tree: bool,
     pub parked: bool,
     /// Patterns not hashed in this folder on top of [`IGNORED`]: the adapter's list for this kind. Like those, each is
     /// matched against every segment of a file's relative path, so a cache folder's name skips the whole folder.
@@ -188,7 +186,7 @@ pub fn fingerprint(
     cache: &mut HashCache,
     spec: &ModSpec,
 ) -> io::Result<ModEntry> {
-    let (content_hash, file_count, bytes) = if spec.kind.is_folder() {
+    let (content_hash, file_count, bytes) = if spec.tree {
         let patterns: Vec<String> = IGNORED
             .iter()
             .copied()
@@ -595,6 +593,7 @@ mod tests {
             kind,
             name: name.into(),
             home: home.into(),
+            tree: kind == Kind::ModsFolder,
             parked: false,
             ignore: vec!["shadercache".into()],
             config,
@@ -834,6 +833,7 @@ mod tests {
             kind: Kind::Dlc,
             name: "dlcBeta".into(),
             home: "GAME/dlc/dlcBeta".into(),
+            tree: true,
             parked: false,
             ignore: vec![],
             config: vec![],

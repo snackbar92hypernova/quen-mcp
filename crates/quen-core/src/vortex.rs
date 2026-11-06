@@ -186,6 +186,8 @@ pub enum Kind {
     Mods,
     /// A file in bin\x64_dx12.
     Bin,
+    /// In a folder in bin\x64_dx12, at any depth.
+    BinFolder,
     /// A menu XML in 5.01's menu folder.
     Menu,
     /// In a DLC folder.
@@ -197,8 +199,8 @@ pub enum Kind {
     Inert,
 }
 
-/// The kind of the game-relative path `rel` (either separator) and its unit's path: the Mods or DLC folder it is in,
-/// else the file itself.
+/// The kind of the game-relative path `rel` (either separator) and its unit's path: the Mods, DLC or bin\x64_dx12 folder
+/// it is in, else the file itself.
 pub fn unit(rel: &str) -> (Kind, String) {
     let parts: Vec<&str> = rel.split(['\\', '/']).filter(|p| !p.is_empty()).collect();
     let lower: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
@@ -211,6 +213,9 @@ pub fn unit(rel: &str) -> (Kind, String) {
         (Some("dlc"), 3..) => (Kind::Dlc, format!("DLC\\{}", parts[1])),
         (Some("bin"), 3) if lower[1] == "x64_dx12" => {
             (Kind::Bin, format!("bin\\x64_dx12\\{}", parts[2]))
+        }
+        (Some("bin"), 4..) if lower[1] == "x64_dx12" => {
+            (Kind::BinFolder, format!("bin\\x64_dx12\\{}", parts[2]))
         }
         (Some("bin"), _) if menu => (Kind::Menu, path),
         (Some("bin" | "mods" | "dlc" | "content"), _) => (Kind::Other, path),
@@ -269,13 +274,13 @@ impl Links {
     }
 }
 
-/// A unit of a Vortex mod: a Mods or DLC folder with how many of its files the mod deployed, else one file.
+/// A unit of a Vortex mod: a Mods, DLC or bin folder with how many of its files the mod deployed, else one file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Unit {
     pub kind: Kind,
     pub path: String,
     pub files: usize,
-    /// In a Mods folder: its files no live manifest lists (not counting Vortex's marker, logs and backups).
+    /// In a Mods or bin folder: its files no live manifest lists (not counting Vortex's marker, logs and backups).
     #[serde(skip_serializing_if = "is_zero")]
     pub outside: usize,
 }
@@ -303,7 +308,7 @@ pub struct Mod {
     target: (PathBuf, Option<String>),
 }
 
-/// A path two Vortex mods claim, or a Mods folder holding files of two.
+/// A path two Vortex mods claim, or a Mods or bin folder holding files of two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Shared {
     pub path: String,
@@ -505,7 +510,8 @@ pub fn inventory(
         })
     };
     let mut outside: BTreeMap<String, usize> = BTreeMap::new();
-    for f in inv.files.iter().filter(|f| f.kind == Kind::Mods) {
+    let in_folder = |kind: Kind| matches!(kind, Kind::Mods | Kind::BinFolder);
+    for f in inv.files.iter().filter(|f| in_folder(f.kind)) {
         let unit = f.unit.to_lowercase();
         if outside.contains_key(&unit) {
             continue;
@@ -556,14 +562,14 @@ pub fn inventory(
         names.sort();
         inv.undeployed.extend(names.iter().map(|n| Named::new(n)));
     }
-    // A path two entries claim, and a Mods folder holding files of two mods.
+    // A path two entries claim, and a Mods or bin folder holding files of two mods.
     let mut claims: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
     for f in &inv.files {
         let claim = claims
             .entry(f.key.clone())
             .or_insert((f.rel.clone(), BTreeSet::new()));
         claim.1.insert(f.source.clone());
-        if f.kind == Kind::Mods {
+        if in_folder(f.kind) {
             let folder = claims
                 .entry(format!("{}\\", f.unit.to_lowercase()))
                 .or_insert((f.unit.clone(), BTreeSet::new()));
@@ -627,17 +633,22 @@ impl Inventory {
     }
 
     /// By mod, what a launch that parks `parked` (the moves' sources) leaves loaded: a mod it parks part of keeps its
-    /// other units, and any mod keeps the files quen can't park (`other`).
+    /// other units, and any mod keeps what quen can't park (`other`, a bin folder holding files outside Vortex).
     pub fn left_loaded(&self, parked: &[&Path]) -> BTreeMap<String, Vec<String>> {
         let parked: BTreeSet<String> = parked.iter().map(|p| key(p)).collect();
         let mut out = BTreeMap::new();
         for m in &self.mods {
             let moved = |u: &Unit| parked.contains(&key(&self.game_dir.join(&u.path)));
             let some = m.units.iter().any(moved);
+            let stuck = |u: &Unit| match u.kind {
+                Kind::Other => true,
+                Kind::BinFolder => u.outside > 0,
+                _ => false,
+            };
             let left: Vec<String> = m
                 .units
                 .iter()
-                .filter(|u| !moved(u) && (some || u.kind == Kind::Other))
+                .filter(|u| !moved(u) && (some || stuck(u)))
                 .map(|u| u.path.clone())
                 .collect();
             if !left.is_empty() {
@@ -648,9 +659,10 @@ impl Inventory {
     }
 
     /// Each deployed mod as the park planner names and parks it: by `nexus:<id>`, its name or its Vortex folder, as
-    /// its Mods, bin, menu and DLC units. Tied (not parked as a unit): a file elsewhere (`other`: under content or bin's
-    /// other folders, in documents), a Mods folder holding files outside Vortex, and a unit another mod deployed files
-    /// into too, unless that mod is parked as a unit beside it.
+    /// its Mods, bin, bin folder, menu and DLC units. Tied (not parked as a unit): a file elsewhere (`other`: under
+    /// content or bin's other folders, in documents), a Mods or bin folder holding files outside Vortex, and a unit
+    /// another mod deployed files into too, unless that mod is parked as a unit beside it. A bin folder holding files
+    /// outside Vortex is no unit either, so `ALL` leaves it: those files may be the game's own.
     pub fn managed(&self) -> Vec<Managed> {
         let label = |vortex: &str| {
             let m = self.mods.iter().find(|m| m.id.vortex == vortex);
@@ -666,6 +678,7 @@ impl Inventory {
                 let home = match u.kind {
                     Kind::Mods => Home::Mods,
                     Kind::Bin => Home::Bin,
+                    Kind::BinFolder => Home::BinDir,
                     Kind::Menu => Home::Menu,
                     Kind::Dlc => Home::Dlc,
                     Kind::Other | Kind::Inert => {
@@ -676,6 +689,16 @@ impl Inventory {
                         continue;
                     }
                 };
+                if home == Home::BinDir && u.outside > 0 {
+                    ties.push(Tie {
+                        why: format!(
+                            "{} holds {} files outside Vortex too, and a folder in bin can't be named to park all of it",
+                            u.path, u.outside
+                        ),
+                        with: Vec::new(),
+                    });
+                    continue;
+                }
                 if u.outside > 0 {
                     ties.push(Tie {
                         why: format!(
@@ -1143,8 +1166,18 @@ mod tests {
             ),
             (
                 r"bin\x64_dx12\plugins\p.dll",
+                Kind::BinFolder,
+                r"bin\x64_dx12\plugins",
+            ),
+            (
+                "BIN/X64_DX12/Data/a/b/c.bin",
+                Kind::BinFolder,
+                r"bin\x64_dx12\Data",
+            ),
+            (
+                r"bin\x64\plugins\p.dll",
                 Kind::Other,
-                r"bin\x64_dx12\plugins\p.dll",
+                r"bin\x64\plugins\p.dll",
             ),
             (
                 r"content\content0\scripts\a.ws",
@@ -1507,6 +1540,142 @@ mod tests {
         );
         let json = serde_json::to_value(&inv.mods).unwrap();
         assert!(json[0]["units"][0].get("outside").is_none(), "{json}");
+    }
+
+    const DATA: &str = "Data Mod 9001 1.0 2026-10-21T18-16Z k1";
+    const OTHER: &str = "Other Mod 9002 1.0 2026-10-21T18-16Z k2";
+
+    /// [`game`] with one more manifest: a mod deploying an ASI and a folder in bin (`list` adds to it), with Vortex's
+    /// marker in the folder and a log the mod wrote.
+    fn game_with_bin_folder(list: &[(&str, &str)]) -> Fake {
+        let (mut fs, game, _) = game();
+        let staging = Path::new("S");
+        let mut files = vec![
+            (r"bin\x64_dx12\Data.asi", DATA),
+            (r"bin\x64_dx12\DataFolder\a.bin", DATA),
+            (r"bin\x64_dx12\DataFolder\sub\b.bin", DATA),
+        ];
+        files.extend_from_slice(list);
+        fs.put(
+            &game.join("vortex.deployment.witcher3data.json"),
+            &manifest(staging, HARDLINK, &files),
+            "x",
+            1,
+        );
+        for (i, (rel, source)) in files.iter().enumerate() {
+            let id = format!("data-{i}");
+            fs.linked(&game.join(rel), &staging.join(source).join(rel), &id);
+        }
+        let folder = game.join(r"bin\x64_dx12\DataFolder");
+        fs.put(&folder.join(FOLDER_MARKER), "marker", "mk", 1);
+        fs.put(&folder.join(r"sub\data.log"), "log", "log", 1);
+        fs
+    }
+
+    #[test]
+    fn a_folder_in_bin_is_one_unit_of_its_mod() {
+        let fs = game_with_bin_folder(&[]);
+        let inv = inv(&fs);
+        let data = inv.find("nexus:9001").unwrap();
+        let folder = Unit {
+            kind: Kind::BinFolder,
+            path: r"bin\x64_dx12\DataFolder".into(),
+            files: 2,
+            outside: 0,
+        };
+        assert_eq!(data.units[1], folder, "the marker and the log don't count");
+        let json = serde_json::to_value(&data.units[1]).unwrap();
+        assert_eq!(json["kind"], "binfolder");
+        assert_eq!(
+            inv.owner(Path::new(r"G\bin\x64_dx12\DataFolder")),
+            "Vortex: Data Mod 1.0 (nexus 9001)"
+        );
+        let managed = inv.managed();
+        let find = |label: &str| managed.iter().find(|m| m.label == label).unwrap();
+        let data = find("Data Mod 1.0 (nexus 9001)");
+        assert_eq!(
+            data.units,
+            [
+                (Home::Bin, "Data.asi".to_owned()),
+                (Home::BinDir, "DataFolder".to_owned()),
+            ]
+        );
+        assert!(data.ties.is_empty(), "{:?}", data.ties);
+    }
+
+    /// A file no manifest lists may be the game's: the folder is no unit at all, so neither the mod's name nor `ALL`
+    /// moves it, and what quen can't park is left loaded with any park.
+    #[test]
+    fn a_folder_in_bin_holding_files_outside_vortex_never_parks() {
+        let mut fs = game_with_bin_folder(&[]);
+        let folder = Path::new(r"G\bin\x64_dx12\DataFolder");
+        fs.put(&folder.join("stock.bin"), "s", "s", 1);
+        let inv = inv(&fs);
+        assert_eq!(inv.find("nexus:9001").unwrap().units[1].outside, 1);
+        let managed = inv.managed();
+        let data = managed
+            .iter()
+            .find(|m| m.label == "Data Mod 1.0 (nexus 9001)")
+            .unwrap();
+        assert_eq!(data.units, [(Home::Bin, "Data.asi".to_owned())]);
+        assert_eq!(
+            data.ties,
+            [Tie {
+                why: r"bin\x64_dx12\DataFolder holds 1 files outside Vortex too, and a folder in bin can't be named to park all of it".into(),
+                with: Vec::new()
+            }]
+        );
+        let own = Path::new(r"G\Mods\modOwn");
+        assert_eq!(
+            inv.left_loaded(&[own])["Data Mod 1.0 (nexus 9001)"],
+            [r"bin\x64_dx12\DataFolder"]
+        );
+    }
+
+    #[test]
+    fn a_folder_in_bin_holding_two_mods_files_parks_both_or_neither() {
+        let shared = r"bin\x64_dx12\DataFolder\other.bin";
+        let fs = game_with_bin_folder(&[(shared, OTHER)]);
+        let inv = inv(&fs);
+        assert!(
+            inv.shared.contains(&Shared {
+                path: r"bin\x64_dx12\DataFolder".into(),
+                mods: vec![DATA.into(), OTHER.into()],
+            }),
+            "{:?}",
+            inv.shared
+        );
+        let managed = inv.managed();
+        let find = |label: &str| managed.iter().find(|m| m.label == label).unwrap();
+        let other = "Other Mod 1.0 (nexus 9002)".to_owned();
+        let data = "Data Mod 1.0 (nexus 9001)".to_owned();
+        assert_eq!(
+            find(&data).ties,
+            [Tie {
+                why: format!(
+                    r"bin\x64_dx12\DataFolder holds files of {data} and {other}: park both or neither"
+                ),
+                with: vec![other.clone()]
+            }]
+        );
+        assert_eq!(
+            find(&other).units,
+            [(Home::BinDir, "DataFolder".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_parked_folder_in_bin_counts_as_moved() {
+        let fs = game_with_bin_folder(&[]);
+        let inv = inv(&fs);
+        let data = "Data Mod 1.0 (nexus 9001)";
+        let (asi, folder) = (
+            Path::new(r"G\bin\x64_dx12\Data.asi"),
+            Path::new(r"G\BIN\x64_dx12\datafolder"),
+        );
+        assert_eq!(inv.left_loaded(&[asi])[data], [r"bin\x64_dx12\DataFolder"]);
+        assert_eq!(inv.left_loaded(&[folder])[data], [r"bin\x64_dx12\Data.asi"]);
+        assert!(!inv.left_loaded(&[asi, folder]).contains_key(data));
     }
 
     #[test]
