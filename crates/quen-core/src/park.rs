@@ -1569,7 +1569,10 @@ mod tests {
         assert_eq!(run("nexus:9", "").unwrap(), [asi.clone(), folder.clone()]);
         assert_eq!(run("ALL", "").unwrap(), [own.clone(), asi.clone(), folder]);
         // Kept by its own name or its mod's.
-        assert_eq!(run("nexus:9", "datafolder").unwrap(), [asi.clone()]);
+        assert_eq!(
+            run("nexus:9", "datafolder").unwrap(),
+            std::slice::from_ref(&asi)
+        );
         assert_eq!(run("ALL", "DataFolder").unwrap(), [own.clone(), asi]);
         assert_eq!(run("ALL", "nexus:9").unwrap(), [own]);
         // Named, a unit or not: refused as a name in Mods would be.
