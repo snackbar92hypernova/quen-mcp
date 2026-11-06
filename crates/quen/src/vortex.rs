@@ -194,10 +194,10 @@ pub fn tool() -> Value {
             deployed, stale: why its files count as outside), links over every deployed file (ok: still \
             Vortex's hardlink; deleted, srcdeleted, refchange: what Vortex's next deploy lists) and running. mods: \
             each Vortex mod (name, nexus_id, version: from its folder's name, vortex), units (kind mods, \
-            bin, menu, dlc or other; path; files; outside: a Mods folder's files no manifest lists), inert files, \
-            links. load_order: mods.settings. outside: Mods folders and bin's .asi, .addon64 and dxgi.dll no \
-            manifest lists (without Vortex: all). undeployed: Vortex's mods no manifest lists. shared: a path two \
-            mods claim, a Mods folder with two mods' files. pair [x, y] (nexus:<id>, name or Vortex folder): paths \
+            bin, binfolder, menu, dlc or other; path; files; outside: a folder's files no manifest lists), \
+            inert files, links. load_order: mods.settings. outside: Mods folders and bin's .asi, .addon64 and dxgi.dll \
+            no manifest lists (without Vortex: all). undeployed: Vortex's mods no manifest lists. shared: a path two \
+            mods claim, a folder with two mods' files. pair [x, y] (nexus:<id>, name or Vortex folder): paths \
             both carry, whose copy is deployed, Mods folders both use. A session's parked files show deleted. Any \
             connection, beside a session.",
         "inputSchema": {"type": "object", "properties": {

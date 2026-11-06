@@ -2843,11 +2843,11 @@ fn vortex_s_mods_get_owners_refusals_and_a_link_report_and_nothing_changes_witho
     running.wait().unwrap();
 }
 
-/// Phase 2 of Vortex: a synthetic Vortex mod (a script folder whose import its ASI's bytes hold, the ASI, a data file in
-/// bin, a menu XML, a readme at the game root; hardlinks of their staging copies, made here) parks as a unit by its
-/// Nexus id while the readme stays; one half of the pair learned from the files is refused; a partial park lists what
-/// stays loaded; the boot's mod set holds each unit parked, labelled with the mod's version; the end finds every link
-/// whole.
+/// Phase 2 of Vortex: a synthetic Vortex mod (a script folder whose import its ASI's bytes hold, the ASI, a data file and
+/// a data folder in bin, a menu XML, a readme at the game root; hardlinks of their staging copies, made here) parks as a
+/// unit by its Nexus id while the readme stays; one half of the pair learned from the files is refused; the bin folder
+/// by its own name too; a partial park lists what stays loaded; the boot's mod set holds each unit parked, labelled with
+/// the mod's version; the end finds every link whole.
 #[test]
 fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
     let fx = Fixture::new();
@@ -2866,6 +2866,7 @@ fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
         ),
         (r"bin\x64_dx12\World.asi", "MZ\0BIW_Edge\0"),
         (r"bin\x64_dx12\BIW_edges_0.bin", "edges"),
+        (r"bin\x64_dx12\WorldData\sub\data.bin", "data"),
         (
             r"bin\config\r4game\user_config_matrix\pc\World.xml",
             "<menu/>",
@@ -2896,6 +2897,8 @@ fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
             && why.contains(r#""World.asi" is parked only together with "modWorld""#),
         "{half}"
     );
+    let named = quen.tool("session_plan", json!({"park": "WorldData"}));
+    assert_eq!(named["refused"], true, "{named}");
     let partial = quen.tool(
         "session_plan",
         json!({"park": "nexus:303", "keep": "BIW_edges_0.bin"}),
@@ -2918,16 +2921,16 @@ fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
         .iter()
         .filter(|c| c.as_str().unwrap().starts_with("park "))
         .count();
-    assert_eq!(parks, 4, "{plan}");
+    assert_eq!(parks, 5, "{plan}");
 
     let launched = launch_with(&mut quen, json!({"park": "nexus:303"}));
-    for (rel, _) in &files[..4] {
+    for (rel, _) in &files[..5] {
         assert!(!fx.path("game").join(rel).exists(), "{rel} is in place");
     }
     assert_eq!(fx.read("game/Readme.txt"), "readme");
     let ended = quen.tool("session_end", json!({"token": launched["token"]}));
     assert_eq!(ended["ok"], true, "{ended}");
-    let links = json!({"checked": 5, "ok": 5, "deleted": [], "srcdeleted": [], "refchange": []});
+    let links = json!({"checked": 6, "ok": 6, "deleted": [], "srcdeleted": [], "refchange": []});
     assert_eq!(ended["vortex"], links, "{ended}");
     fx.assert_restored();
     for (rel, bytes) in files {
@@ -2944,6 +2947,7 @@ fn a_vortex_mod_parks_as_a_unit_and_comes_back_as_its_links() {
         [
             entry("asi", "World"),
             entry("bin", "BIW_edges_0.bin"),
+            entry("bin", "WorldData"),
             entry("menu", "World"),
             entry("mods", "modWorld"),
         ]

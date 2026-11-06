@@ -113,7 +113,7 @@ parked flags, so two boots with the same `sha256` ran the same mods.
 
 One mod in a set. Key (`mod_set_id` → mod_sets, `kind`, `name`): the mod's identity, e.g. kind `asi`, name
 `W3ElementMap`. `kind` is `mods` (a Mods folder), `asi`, `addon`, `reshade`, `dlc` (a folder in the game's `DLC`), and
-from schema 15 `bin` (another file in bin a Vortex mod deployed, e.g. `dsound.dll`; its name is the file name) or `menu`
+from schema 15 `bin` (another file in bin a Vortex mod deployed, e.g. `dsound.dll`; its name is the file name; or a folder in bin holding its files, by the folder's name, its `content_hash` a tree hash, no config) or `menu`
 (a Vortex mod's menu XML; its name is the file's stem) (rows imported from schema 1 may keep an older free-text kind). `parked` 1: the mod was moved out for the boot, so it didn't load. `home`: where it
 lives, relative to the game folder (rows written before 2026-10-18 hold the absolute path). `content_hash`: its build (a file's sha256, or a folder's tree hash). `file_count`, `bytes`.
 `config_hash`: the hash of its config files; `config_values` (JSON object): the parsed config keys that change its

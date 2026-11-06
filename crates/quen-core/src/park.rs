@@ -62,6 +62,8 @@ pub struct ParkPlan {
 pub enum Home {
     Mods,
     Bin,
+    /// A folder in bin, parked beside bin's files: only as a managed mod's unit, by that mod's name or `ALL`.
+    BinDir,
     Menu,
     Dlc,
 }
@@ -78,14 +80,14 @@ impl Home {
     pub fn folder(self) -> &'static str {
         match self {
             Self::Mods => "Mods",
-            Self::Bin => "bin",
+            Self::Bin | Self::BinDir => "bin",
             Self::Menu => "menu",
             Self::Dlc => "dlc",
         }
     }
 
     fn is_dir(self) -> bool {
-        matches!(self, Self::Mods | Self::Dlc)
+        matches!(self, Self::Mods | Self::BinDir | Self::Dlc)
     }
 }
 
@@ -96,7 +98,8 @@ pub struct Managed {
     pub label: String,
     /// What names it, any case: `nexus:<id>`, its name, its manager's folder.
     pub names: Vec<String>,
-    /// What of it the game loads: its Mods and DLC folders, its files in bin and the menu folder, by name there.
+    /// What of it the game loads and quen can park: its Mods, DLC and bin folders, its files in bin and the menu folder,
+    /// by name there.
     pub units: Vec<(Home, String)>,
     /// Why it isn't parked as a unit.
     pub ties: Vec<Tie>,
@@ -164,7 +167,8 @@ pub enum ParkError {
     Missing(String, String),
     /// A symbolic link or junction.
     Link(String),
-    /// A file where a folder belongs (Mods, DLC), or a folder where a file does (bin, the menu folder).
+    /// A file where a folder belongs (Mods, DLC, a managed mod's folder in bin), or a folder where a file does (bin, the
+    /// menu folder).
     WrongKind(String, Home),
     /// Named twice (names compare case-insensitively).
     Repeated(String),
@@ -268,14 +272,15 @@ enum Target<'a> {
 /// Plans the moves for `requested`, a comma list of names and `ALL`, matched case-insensitively to the on-disk
 /// spelling. A name is a Mods folder or a bin `.asi` / `.addon64` / `dxgi.dll` (today's names), else a managed mod
 /// (`nexus:<id>`, its name, its manager's folder: all its units, less those kept), else a managed mod's unit by its
-/// file or folder name. `ALL` is every Mods folder, every such bin file and every managed unit that is not a link,
-/// minus `keep` (a comma list of the same names), `never_park` (and every unit of a managed mod holding such a name),
-/// unsettled folders and their candidates, both halves of each of `pairs` it can't take whole, and the names listed
-/// explicitly, which keep their own place in the order. A bin `<stem>.ini` that `ALL` or a unit takes
-/// stays while its `<stem>` binary does.
+/// file or folder name (a folder in bin: only to keep it). `ALL` is every Mods folder, every such bin file and every
+/// managed unit that is not a link, minus `keep` (a comma list of the same names), `never_park` (and every unit of a
+/// managed mod holding such a name), unsettled folders and their candidates, both halves of each of `pairs` it can't
+/// take whole, and the names listed explicitly, which keep their own place in the order. A bin `<stem>.ini` that `ALL`
+/// or a unit takes stays while its `<stem>` binary does.
 /// A Mods folder parked takes along the folder Script Merger merged it into. Refuses the whole plan on a bad, unknown,
-/// repeated or never-park name, a link, a name both requested and kept, one half of a pair, an unsettled folder or
-/// candidate named, a managed mod tied to what it can't park, and when `ALL` would take a name that isn't [`plain`].
+/// repeated or never-park name, a folder in bin named, a link, a name both requested and kept, one half of a pair, an
+/// unsettled folder or candidate named, a managed mod tied to what it can't park, and when `ALL` would take a name that
+/// isn't [`plain`].
 /// Keep names only have to exist: they never move.
 /// Every move goes to `<parking>/<home folder>/<name>`.
 #[allow(clippy::too_many_arguments)]
@@ -293,7 +298,7 @@ pub fn plan<'a>(
     let keep: Vec<&str> = names(keep).collect();
     let listing = |home: Home| match home {
         Home::Mods => Some(mods),
-        Home::Bin => Some(bin),
+        Home::Bin | Home::BinDir => Some(bin),
         Home::Menu => more.menu,
         Home::Dlc => more.dlc,
     };
@@ -383,6 +388,7 @@ pub fn plan<'a>(
         };
         match target(name)? {
             Target::One(..) if !plain(name) => return Err(ParkError::BadName(name.into())),
+            Target::One(Home::BinDir, _) => return Err(ParkError::Unknown(name.into())),
             Target::One(home, n) => {
                 let (listing, e) =
                     entry(home, &n).ok_or_else(|| ParkError::Unknown(name.into()))?;
@@ -559,7 +565,8 @@ pub fn plan<'a>(
 }
 
 /// What `ALL` takes, home by home in name order: Mods folders, bin's `.asi` / `.addon64` / `dxgi.dll` and managed
-/// units, then the menu's and DLC's managed units; none a link, kept, never parked, on `skip` or in `taken`.
+/// units, then the managed units among bin's folders, the menu's and DLC's; none a link, kept, never parked, on `skip`
+/// or in `taken`.
 fn all<'a>(
     listing: &dyn Fn(Home) -> Option<Listing<'a>>,
     more: &More<'a>,
@@ -569,7 +576,7 @@ fn all<'a>(
     taken: &[Item],
 ) -> Result<Vec<Item<'a>>, ParkError> {
     let mut out = Vec::new();
-    for home in [Home::Mods, Home::Bin, Home::Menu, Home::Dlc] {
+    for home in [Home::Mods, Home::Bin, Home::BinDir, Home::Menu, Home::Dlc] {
         let Some(listing) = listing(home) else {
             continue;
         };
@@ -585,7 +592,7 @@ fn all<'a>(
             .filter(|e| !e.is_link && e.is_dir == home.is_dir())
             .filter(|e| match home {
                 Home::Mods | Home::Bin => Home::of(&e.name) == home || managed(e),
-                Home::Menu | Home::Dlc => managed(e),
+                Home::BinDir | Home::Menu | Home::Dlc => managed(e),
             })
             .filter(|e| {
                 !never(home, &e.name)
@@ -1528,6 +1535,73 @@ mod tests {
                 "W3LoadFix".into(),
                 r"bin\dsound.dll".into()
             ))
+        );
+    }
+
+    /// A Vortex mod with an ASI and a data folder in bin, beside a folder that is no mod's. A folder in bin moves only as
+    /// its mod's unit.
+    #[test]
+    fn a_folder_in_bin_moves_as_its_mods_unit_never_by_name() {
+        let mods = [dir("modOwn")];
+        let bin = [
+            file("Data.asi"),
+            file("Data.ini"),
+            dir("DataFolder"),
+            dir("StockFolder"),
+        ];
+        let managed = [Managed {
+            label: "Data".into(),
+            names: vec!["nexus:9".into()],
+            units: vec![
+                (Home::Bin, "Data.asi".into()),
+                (Home::BinDir, "DataFolder".into()),
+            ],
+            ties: Vec::new(),
+        }];
+        let more = More {
+            managed: &managed,
+            ..More::default()
+        };
+        let run = |requested, keep| run_more(&mods, &bin, requested, keep, &more);
+        let asi = pair("GAME/bin/x64/Data.asi", "PARK/bin/Data.asi");
+        let folder = pair("GAME/bin/x64/DataFolder", "PARK/bin/DataFolder");
+        let own = pair("GAME/Mods/modOwn", "PARK/Mods/modOwn");
+        assert_eq!(run("nexus:9", "").unwrap(), [asi.clone(), folder.clone()]);
+        assert_eq!(run("ALL", "").unwrap(), [own.clone(), asi.clone(), folder]);
+        // Kept by its own name or its mod's.
+        assert_eq!(
+            run("nexus:9", "datafolder").unwrap(),
+            std::slice::from_ref(&asi)
+        );
+        assert_eq!(run("ALL", "DataFolder").unwrap(), [own.clone(), asi]);
+        assert_eq!(run("ALL", "nexus:9").unwrap(), [own]);
+        // Named, a unit or not: refused as a name in Mods would be.
+        for name in ["DataFolder", "StockFolder", "ALL,datafolder"] {
+            let culprit = name.rsplit(',').next().unwrap();
+            assert_eq!(run(name, ""), Err(ParkError::Unknown(culprit.into())));
+        }
+        // The wrong kind on disk, both ways, by the mod's name; ALL passes over it. Gone, or a junction.
+        let wrong = [file("Data.asi"), file("DataFolder")];
+        let why = run_more(&mods, &wrong, "nexus:9", "", &more).unwrap_err();
+        assert_eq!(why, ParkError::WrongKind("DataFolder".into(), Home::BinDir));
+        assert_eq!(why.to_string(), "\"DataFolder\" in bin is not a folder");
+        let moves = run_more(&mods, &wrong, "ALL", "", &more).unwrap();
+        assert!(
+            !moves.iter().any(|m| m.0.contains("DataFolder")),
+            "{moves:?}"
+        );
+        let wrong = [dir("Data.asi"), dir("DataFolder")];
+        let why = run_more(&mods, &wrong, "nexus:9", "", &more).unwrap_err();
+        assert_eq!(why, ParkError::WrongKind("Data.asi".into(), Home::Bin));
+        assert_eq!(why.to_string(), "\"Data.asi\" in bin is a folder");
+        assert_eq!(
+            run_more(&mods, &[file("Data.asi")], "nexus:9", "", &more),
+            Err(ParkError::Missing("Data".into(), r"bin\DataFolder".into()))
+        );
+        let linked = [file("Data.asi"), link("DataFolder")];
+        assert_eq!(
+            run_more(&mods, &linked, "nexus:9", "", &more),
+            Err(ParkError::Link("DataFolder".into()))
         );
     }
 

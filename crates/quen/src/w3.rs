@@ -71,8 +71,8 @@ pub fn parked(game_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// quen's parking folders: parked Mods folders, then parked bin files, then parked menu XMLs (finding 49), then parked
-/// DLC folders; each beside the game folder it holds parked items of.
+/// quen's parking folders: parked Mods folders, then parked bin files and folders, then parked menu XMLs (finding 49),
+/// then parked DLC folders; each beside the game folder it holds parked items of.
 fn parking(game_dir: &Path) -> [(PathBuf, PathBuf); 4] {
     let parked = game_dir.join(boot::PARKED);
     let homes = [
@@ -109,8 +109,9 @@ pub fn tidy_parking(game_dir: &Path) {
 /// name is loaded: a staged copy took its place). An ASI's or
 /// add-on's config is its `<name>.ini` beside it, then ReShade.ini `[<name>]`, which overrides it (W3Perf's toggles).
 /// With Vortex's records (`inv`), also what they name a mod's: its other files in bin (kind `bin`, by file name, its
-/// config its `<stem>.ini`; an ini whose stem another file in bin has is that file's config), its menu XMLs (kind
-/// `menu`, by stem) and its folders in `DLC` (kind `dlc`).
+/// config its `<stem>.ini`; an ini whose stem another file in bin has is that file's config), its folders in bin (kind
+/// `bin`, by folder name, hashed as a tree, no config), its menu XMLs (kind `menu`, by stem) and its folders in `DLC`
+/// (kind `dlc`).
 /// An add-on's config also has ReShade.ini `[<name>-preset1]` (RenoDX's preset 1 under the add-on's own `global_name`,
 /// which our build sets), and ReShade's has `[renodx]` and `[renodx-preset1]` (the global settings and preset 1 under
 /// RenoDX's default `global_name`, no one add-on's); these keys are recorded as `<section>.<key>`. renodx's
@@ -150,10 +151,10 @@ pub fn mod_set(
         }
     }
     let owned = |path: &Path| inv.is_some_and(|inv| !inv.owners(path).is_empty());
-    // The stems of bin's mods but inis, loaded or parked: an ini of one of them is that mod's config.
+    // The stems of bin's mod files but inis, loaded or parked: an ini of one of them is that mod's config.
     let stems: BTreeSet<String> = found
         .iter()
-        .filter(|(_, at, _)| at.parent() == Some(bin.as_path()))
+        .filter(|(home, at, _)| at.parent() == Some(bin.as_path()) && !home.is_dir())
         .filter_map(|(_, at, _)| {
             let name = at.file_name()?.to_string_lossy().to_lowercase();
             let (stem, ext) = name.rsplit_once('.')?;
@@ -166,11 +167,14 @@ pub fn mod_set(
         let file = home.file_name().unwrap_or_default().to_string_lossy();
         let lower = file.to_lowercase();
         let stem = home.file_stem().unwrap_or_default().to_string_lossy();
-        let (kind, name) = if home.is_dir() {
+        let tree = home.is_dir();
+        let (kind, name) = if tree {
             if dir == mods {
                 (Kind::ModsFolder, file.into_owned())
             } else if dir == dlc && owned(&at) {
                 (Kind::Dlc, file.into_owned())
+            } else if dir == bin && owned(&at) {
+                (Kind::Bin, file.into_owned())
             } else {
                 continue;
             }
@@ -216,7 +220,7 @@ pub fn mod_set(
             Kind::ReShade => ["renodx", "renodx-preset1"]
                 .map(|s| reshade(s.into(), true))
                 .into(),
-            Kind::Bin if !lower.ends_with(".ini") => vec![ConfigSource {
+            Kind::Bin if !tree && !lower.ends_with(".ini") => vec![ConfigSource {
                 path: bin.join(Path::new(&name).with_extension("ini")),
                 section: None,
                 keys: Vec::new(),
@@ -228,6 +232,7 @@ pub fn mod_set(
             kind,
             name,
             home,
+            tree,
             parked,
             ignore: Vec::new(),
             config,
@@ -246,6 +251,7 @@ pub fn mod_set(
                 kind: Kind::Addon,
                 name,
                 home,
+                tree: false,
                 parked: false,
                 ignore: Vec::new(),
                 config: Vec::new(),
@@ -543,6 +549,88 @@ mod tests {
         // A devkit in bin itself is the entry bin's listing already has.
         let in_bin = set(Some("other.addon64"));
         assert_eq!(in_bin.len(), before.len());
+        let _ = fs::remove_dir_all(&dir); // this test's own temp folder
+    }
+
+    /// With Vortex's records, a folder of its in bin is one entry, loaded or parked: kind `bin` by the folder's name,
+    /// hashed as a tree whose data changes the set, no config (an ini of its stem stays an entry of its own). A folder
+    /// no manifest names is none, as today.
+    #[test]
+    fn a_vortex_folder_in_bin_is_one_entry_hashed_as_a_tree() {
+        use quen_core::journal::sha256_hex;
+        use quen_core::vortex::{FOLDER_MARKER, HARDLINK, STAGING_MARKER};
+        let dir = std::env::temp_dir().join(format!("quen-w3-bin-folder-{}", std::process::id()));
+        let bin = boot::bin_dir(&dir);
+        let data = bin.join("Data.folder");
+        let staging = dir.join("staging");
+        fs::create_dir_all(data.join("sub")).unwrap();
+        fs::create_dir_all(bin.join("StockFolder")).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(data.join("a.bin"), "a").unwrap();
+        fs::write(data.join(r"sub\b.bin"), "b").unwrap();
+        fs::write(data.join(FOLDER_MARKER), "marker").unwrap();
+        fs::write(bin.join(r"StockFolder\stock.bin"), "stock").unwrap();
+        fs::write(bin.join("Data.ini"), "[A]\nB=1\n").unwrap();
+        let source = "Data 9001 1.0 2026-10-21T18-16Z k1";
+        fs::write(
+            staging.join(STAGING_MARKER),
+            r#"{"instance":"i1","game":"witcher3"}"#,
+        )
+        .unwrap();
+        let files: Vec<Value> = [
+            r"bin\x64_dx12\Data.folder\a.bin",
+            r"bin\x64_dx12\Data.folder\sub\b.bin",
+            r"bin\x64_dx12\Data.ini",
+        ]
+        .iter()
+        .map(|rel| json!({"relPath": rel, "source": source}))
+        .collect();
+        let manifest = json!({"instance": "i1", "deploymentMethod": HARDLINK, "stagingPath": staging,
+            "files": files});
+        fs::write(dir.join("vortex.deployment.json"), manifest.to_string()).unwrap();
+        let config = Config {
+            game_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        let inv = crate::vortex::read(&config).unwrap();
+        let set = || mod_set(&dir, &mut HashCache::default(), Some(&inv), None).unwrap();
+        let entry = |set: &[ModEntry]| {
+            let bin = |e: &&ModEntry| e.kind == Kind::Bin && e.name == "Data.folder";
+            set.iter().find(bin).cloned().unwrap()
+        };
+
+        let loaded = set();
+        assert_eq!(loaded.len(), 2, "{loaded:?}");
+        assert!(
+            loaded.iter().any(|e| e.id() == "bin:Data.ini"),
+            "{loaded:?}"
+        );
+        let folder = entry(&loaded);
+        let lines = format!(
+            "a.bin\t{}\nsub/b.bin\t{}\n",
+            sha256_hex(b"a"),
+            sha256_hex(b"b")
+        );
+        assert_eq!(folder.content_hash, sha256_hex(lines.as_bytes()));
+        assert_eq!((folder.file_count, folder.bytes), (2, 2));
+        assert_eq!(folder.home, Path::new(r"bin\x64_dx12\Data.folder"));
+        assert_eq!((folder.parked, folder.config_hash.clone()), (false, None));
+        assert!(folder.config_values.is_empty());
+
+        fs::write(data.join("a.bin"), "changed").unwrap();
+        let rebuilt = set();
+        assert_ne!(entry(&rebuilt).content_hash, folder.content_hash);
+        assert_ne!(mods::set_hash(&rebuilt), mods::set_hash(&loaded));
+        fs::write(data.join("a.bin"), "a").unwrap();
+
+        let parked = dir.join(boot::PARKED).join("bin");
+        fs::create_dir_all(&parked).unwrap();
+        fs::rename(&data, parked.join("Data.folder")).unwrap();
+        let moved = entry(&set());
+        assert!(moved.parked);
+        assert_eq!(moved.home, Path::new(r"quen-parked\bin\Data.folder"));
+        assert_eq!(moved.content_hash, folder.content_hash);
+        assert_eq!(moved.config_hash, None);
         let _ = fs::remove_dir_all(&dir); // this test's own temp folder
     }
 

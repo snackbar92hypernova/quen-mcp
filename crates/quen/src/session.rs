@@ -3127,14 +3127,15 @@ mod tests {
         out
     }
 
-    /// Crash injection on the real file system: the native boot (quen-core's plan: settings, general.ini, two mods
-    /// parked, steam_appid.txt placed; three files staged, one over a file it parks, one over a mod the plan parks) on a
-    /// synthetic game folder through `JournalFs` (MoveFileEx without replace, file ids, folder hashes), killed before
-    /// each of its writes in turn; every replay through it gives the folders back byte for byte, the staged mod's log
-    /// and the parking folders gone and the spent backups recycled.
+    /// Crash injection on the real file system: the native boot (quen-core's plan: settings, general.ini, two mods and a
+    /// Vortex mod's folder in bin parked, steam_appid.txt placed; three files staged, one over a file it parks, one over
+    /// a mod the plan parks) on a synthetic game folder through `JournalFs` (MoveFileEx without replace, file ids, folder
+    /// hashes), killed before each of its writes in turn; every replay through it gives the folders back byte for byte,
+    /// the staged mod's log and the parking folders gone and the spent backups recycled.
     #[test]
     fn a_native_boot_killed_before_any_write_replays_back_on_disk() {
         use quen_core::boot::{self, Inputs};
+        use quen_core::park::{Home, Managed, More};
         let root = std::env::temp_dir().join(format!("quen-native-crash-{}", std::process::id()));
         let entry = |name: &str, is_dir| Entry {
             name: name.into(),
@@ -3142,7 +3143,17 @@ mod tests {
             is_link: false,
         };
         let mods = [entry("modAlpha", true)];
-        let bin = [entry("Tweaks.asi", false), entry("Tweaks.ini", false)];
+        let bin = [
+            entry("Tweaks.asi", false),
+            entry("Tweaks.ini", false),
+            entry("DataFolder", true),
+        ];
+        let managed = [Managed {
+            label: "Data".into(),
+            names: vec!["nexus:9".into()],
+            units: vec![(Home::BinDir, "DataFolder".into())],
+            ties: Vec::new(),
+        }];
         let mut limit = 0;
         loop {
             let dir = root.join(limit.to_string());
@@ -3151,7 +3162,7 @@ mod tests {
             for folder in [
                 game.join("Mods/modAlpha/content"),
                 game.join("bin/config/base"),
-                bin_dir.clone(),
+                bin_dir.join("DataFolder/sub"),
                 docs.clone(),
                 quen.join("backup"),
             ] {
@@ -3164,6 +3175,7 @@ mod tests {
             fs::write(game.join("Mods/modAlpha/content/blob0.bundle"), "alpha").unwrap();
             fs::write(bin_dir.join("Tweaks.asi"), "tweaks").unwrap();
             fs::write(bin_dir.join("Tweaks.ini"), "the user's ini").unwrap();
+            fs::write(bin_dir.join("DataFolder/sub/a.bin"), "data").unwrap();
             let pc = dir.join("pc");
             fs::create_dir_all(&pc).unwrap();
             let staged: Vec<PathBuf> = ["W3Test.asi", "Tweaks.asi", "Tweaks.ini"]
@@ -3199,7 +3211,10 @@ mod tests {
                 pairs: &[["modW3GameStateBridge", "W3GameStateBridge.asi"]],
                 mods: &mods,
                 bin: &bin,
-                more: Default::default(),
+                more: More {
+                    managed: &managed,
+                    ..Default::default()
+                },
                 renodx: None,
                 load_from_dll_main: None,
                 play: false,
@@ -3208,7 +3223,7 @@ mod tests {
             let never = w3::never_park(false);
             let stage = boot::stage(&JournalFs, &game, &staged, &never, &bin, &[], &changes);
             changes.extend(stage.unwrap());
-            assert_eq!(changes.len(), 2 + 1 + 2 + 1 + 4 + 2, "{changes:?}");
+            assert_eq!(changes.len(), 3 + 1 + 2 + 1 + 4 + 2, "{changes:?}");
             w3::make_parking(&changes).unwrap();
             let trash = quen.join("trash");
             let dying = Dying {
@@ -3248,7 +3263,7 @@ mod tests {
             );
             if applied.is_ok() {
                 assert!(limit > 15, "{limit} writes");
-                assert_eq!(report.undone.len(), 6 + 4 + 1, "{report:#?}");
+                assert_eq!(report.undone.len(), 7 + 4 + 1, "{report:#?}");
                 break;
             }
             limit += 1;
