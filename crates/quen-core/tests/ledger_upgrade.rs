@@ -80,6 +80,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "0016_provenance_other.sql",
         "2f7a24556b0f560a0230b029305dab98ed5e61262590daa7da0044c8f71e833b",
     ),
+    (
+        "0017_pose_world.sql",
+        "a1d96716fd950124b504c2fd69604fc7ff65997e2b9ca0cb0f0d40e47d661643",
+    ),
 ];
 
 /// The migrations in `schema/`, in order: (file name, text).
@@ -576,6 +580,20 @@ fn a_ledger_from_every_older_version_upgrades_after_a_backup() {
         for bad in [
             "UPDATE mod_versions SET provenance = 'fork'",
             "UPDATE mod_set_entries SET provenance = 'fork' WHERE name = 'modAlpha'",
+        ] {
+            assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
+        }
+        // 0017: the pose kept, its game time and weather NULL; it takes a day and hour together, and a weather.
+        let world = "SELECT game_day, game_hour, weather FROM poses WHERE id = 1";
+        assert_eq!(rows(&l, world, &[]), vec![vec![Value::Null; 3]], "v{k}");
+        now.execute_batch(
+            "UPDATE poses SET game_day = 3, game_hour = 22, weather = 'WT_Clear' WHERE id = 1",
+        )
+        .unwrap();
+        for bad in [
+            "UPDATE poses SET game_hour = NULL WHERE id = 1",
+            "UPDATE poses SET game_hour = 24 WHERE id = 1",
+            "UPDATE poses SET weather = '' WHERE id = 1",
         ] {
             assert!(now.execute(bad, []).is_err(), "v{k}: {bad}");
         }

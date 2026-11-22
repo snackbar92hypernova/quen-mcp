@@ -82,16 +82,16 @@ const TEXT_MAX: usize = 200;
 pub fn tool() -> Value {
     json!({
         "name": "run_plan",
-        "description": "Run a plan of quen's own tool calls as one call (quen_guide: run_plan). plan: JSON text (an \
-            object serves too) {tag, setup, steps, teardown, max_s}; each step {\"<tool>\": {its arguments, no \
-            token}} or {\"wait\": seconds}. Tools: the game_, world_ and measure_ tools a test session calls without \
-            the client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Every step is checked \
-            against its tool's schema before any runs. Setup steps that succeed are replayed by session_launch again. \
-            A step that doesn't succeed ends the run (aborted); teardown then runs, also after a cancel. A free camera \
-            the plan turned on goes off after it (freecam). estimate_s: \
-            from measured costs, fade waits left out; refused over max_s (default 600, at most 3600), and over 300 \
-            unless wait: false. check: the checks and estimate, nothing run. Files: <tag>-plan.json and <tag>-result.json (every step's \
-            envelope), each with a captures row. Refused, nothing run: a bad plan or step, a tag taken, the user's \
+        "description": "Run a plan of quen's own tool calls as one call (quen_guide: run_plan). plan: JSON text or an \
+            object {tag, setup, steps, teardown, max_s}; each step {\"<tool>\": {its arguments, no token}} or \
+            {\"wait\": seconds}. Tools: the game_, world_ and measure_ tools a test session calls without the \
+            client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Every step is checked against \
+            its tool's schema before any runs. session_launch again replays setup steps that succeed. A step not ok ends the \
+            run (aborted); teardown then runs, also after a cancel. A free camera it turned on goes off \
+            (freecam). estimate_s: from measured costs, fade waits left out; refused over max_s (default 600, at most \
+            3600), and over 300 unless wait: false. check: checks and estimate only. Files, each with a \
+            captures row: <tag>-plan.json, <tag>-result.json (every step's envelope). started (UTC) and each step's \
+            start_s (seconds from it). Refused, nothing run: a bad plan or step, a tag taken, the user's \
             controls, a play session.",
         "inputSchema": game::schema(json!({
             "plan": {"type": "string", "description": "the plan: JSON text of {tag, setup, steps, teardown, max_s}"},
@@ -545,7 +545,9 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
         );
         return Err(why.into());
     }
-    let start = Instant::now();
+    let (start, started) = (Instant::now(), session::utc_ms(SystemTime::now()));
+    // A step's start: seconds from the run's (started, UTC).
+    let start_s = |t: Instant| json!(((t - start).as_secs_f64() * 100.0).round() / 100.0);
     let mut aborted = None;
     let freecam_before = {
         let cx = ctx(session, &token, &[])?;
@@ -607,12 +609,14 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
                 envelope["game_back"] = json!(back);
             }
             let mut row = row(phase, i + 1, step, &envelope, t.elapsed().as_secs_f64());
+            row["start_s"] = start_s(t);
             // The checks before it: a fade waited out, the game brought back (not in its s).
             if waited >= 0.1 {
                 row["before_s"] = json!((waited * 100.0).round() / 100.0);
             }
             envelope["phase"] = json!(phase);
             envelope["n"] = json!(i + 1);
+            envelope["start_s"] = start_s(t);
             envelopes.push(envelope);
             let failed =
                 (row["ok"] != true).then(|| row["reason"].as_str().unwrap_or_default().to_string());
@@ -643,20 +647,24 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
             let own = session.call(call.conn.clone(), Value::Null, None);
             let _ = cx.wait_for(&own, game::READY_MAX, game::in_game);
         }
+        let begun = Instant::now();
         let mut step_args = step.args.clone();
         step_args["token"] = token["token"].clone();
         let (done, each) = session.nested(call, &step.tool, &step_args, false, false);
         let mut envelope = session.envelope(&step.tool, each, done);
         call.merge(&envelope);
-        torn.push(row(
+        let mut torn_row = row(
             "teardown",
             i + 1,
             step,
             &envelope,
             t.elapsed().as_secs_f64(),
-        ));
+        );
+        torn_row["start_s"] = start_s(begun);
+        torn.push(torn_row);
         envelope["phase"] = json!("teardown");
         envelope["n"] = json!(i + 1);
+        envelope["start_s"] = start_s(begun);
         envelopes.push(envelope);
     }
     if ran {
@@ -678,6 +686,7 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
     if let Some(live) = &session.live {
         live.in_plan.set(false);
     }
+    fields.insert("started".into(), json!(started));
     fields.insert("took_s".into(), json!(took));
     fields.insert("steps".into(), json!(table));
     if !torn.is_empty() {
@@ -686,8 +695,8 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
     if let Some(why) = &aborted {
         fields.insert("aborted".into(), json!(why));
     }
-    let result = json!({"tag": plan.tag, "plan_sha256": sha, "estimate_s": estimate, "took_s": took,
-                        "aborted": aborted, "steps": envelopes});
+    let result = json!({"tag": plan.tag, "plan_sha256": sha, "estimate_s": estimate, "started": started,
+                        "took_s": took, "aborted": aborted, "steps": envelopes});
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     let written = ctx(session, &token, &[]).and_then(|cx| file(&cx, call, &result_path, &text));
     match written {
@@ -876,6 +885,18 @@ mod tests {
         let steps = result["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 7, "every envelope, the teardown's too");
         assert_eq!(steps[2]["sides"][1]["side"], "left");
+        // When each step started: seconds from the run's start (UTC), in order, in the rows and the file alike.
+        assert_eq!(result["started"], out["started"]);
+        assert!(
+            result["started"].as_str().unwrap().ends_with('Z'),
+            "{result}"
+        );
+        let starts: Vec<f64> = steps
+            .iter()
+            .map(|s| s["start_s"].as_f64().unwrap())
+            .collect();
+        assert!(starts.is_sorted(), "{starts:?}");
+        assert_eq!(out["steps"][1]["start_s"], steps[1]["start_s"], "{out}");
         let db =
             quen_core::ledger::Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
         let sql = "SELECT path, method, id FROM captures WHERE id > ?1 ORDER BY id";
