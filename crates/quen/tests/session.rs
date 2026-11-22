@@ -104,6 +104,8 @@ fn launch_then_end_restores_and_kills_the_game() {
     assert_eq!(ended["saves"]["changed"], json!(["AutoSave_1.sav"]));
     assert_eq!(ended["saves"]["unexpected"], json!([]));
     assert_eq!(ended["saves"]["tainted"], json!([]));
+    let next = json!({"file": "AutoSave_1.sav", "tainted": false});
+    assert_eq!(ended["saves"]["continue"], next, "{ended}");
     // The boot's own logs in the game folder, copied beside its journal (the stand-in's state log among them).
     let logs = ended["artifacts"].to_string();
     assert!(
@@ -239,6 +241,9 @@ fn saves_written_after_a_memory_write_are_tainted() {
     let ended = quen.tool("session_end", json!({"token": token}));
     assert_eq!(ended["ok"], true, "{ended}");
     assert_eq!(ended["saves"]["tainted"], json!(["AutoSave_2.sav"]));
+    // Boot 370's ask: the game's Continue loads that tainted save next.
+    let next = json!({"file": "AutoSave_2.sav", "tainted": true});
+    assert_eq!(ended["saves"]["continue"], next, "{ended}");
     let boot = &ended["ledger"]["boots"][0];
     let saves = fx.ledger(
         "SELECT file, tainted_by_boot FROM saves WHERE file LIKE 'AutoSave%' ORDER BY file",

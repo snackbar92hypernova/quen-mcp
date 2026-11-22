@@ -2057,8 +2057,12 @@ impl<'a> Session<'a> {
             json!({"file": file, "present": now.contains_key(file),
                 "unchanged": before.is_some() && now.get(file) == before})
         });
+        // What the game's Continue loads next, and whether it is a test state (boot 370's ask): saves stay as they are.
+        let next = boot::newest_save(&live.saves)
+            .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .map(|file| json!({"file": file, "tainted": tainted.contains(&&file)}));
         let saves = json!({"loaded": loaded, "tainted": tainted, "changed": changed, "deleted": deleted,
-            "unexpected": unexpected, "quen": quen, "user": user});
+            "unexpected": unexpected, "quen": quen, "user": user, "continue": next});
         fields.insert("saves".into(), saves);
         // What the session left in the capture root, against the budget.
         if let Ok(config) = self.config() {

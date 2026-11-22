@@ -348,7 +348,25 @@ pub fn replay_with(
             .notes
             .push(format!("step {id} has no done line: it was interrupted"));
     }
+    // Calls of one export (an ASI's mode sets: boot 370's session_end had about 140 notes of them) share one note, the
+    // newest's: the export, its note's index, the newest call's what, and how many.
+    let mut calls: Vec<(&str, usize, &str, usize)> = Vec::new();
     for (i, (id, action)) in steps.iter().enumerate().rev() {
+        if let Action::GameMemory { what, .. } = action
+            && let Some(export) = export_called(what)
+        {
+            match calls.iter_mut().find(|c| c.0 == export) {
+                Some((_, at, last, n)) => {
+                    *n += 1;
+                    report.notes[*at] = format!(
+                        "{export}: {n} calls, the last {}: nothing to undo, they ended with the game",
+                        &last[export.len()..]
+                    );
+                    continue;
+                }
+                None => calls.push((export, report.notes.len(), what, 1)),
+            }
+        }
         if let Err(Why(why)) = undo(fs, &steps[..i], action, elsewhere, &mut report) {
             report.left.push(Left {
                 step: *id,
@@ -398,6 +416,13 @@ pub fn replay_with(
         }
     }
     report
+}
+
+/// The export a game-memory step called: `<module>!<export>` of a `what` that starts so, then `(`, with no space before
+/// it (quen's ASI mode sets: `W3X.asi!W3X_SetMode(1) returned 1`). None for any other step.
+fn export_called(what: &str) -> Option<&str> {
+    let (export, _) = what.split_once('(')?;
+    (export.contains('!') && !export.contains(' ')).then_some(export)
 }
 
 /// Why a step was left as found.
@@ -1032,6 +1057,44 @@ mod tests {
         assert_eq!(
             report.notes,
             ["Vortex purged it; deploy in Vortex to put it back"]
+        );
+    }
+
+    /// Boot 370: about 140 notes, one per ASI mode set. The calls of one export share one note, at the newest's place,
+    /// with their count and the newest call; one call and every other game write keep their own.
+    #[test]
+    fn calls_of_one_export_share_one_note() {
+        let fs = MemFs::default();
+        let path = Path::new("J");
+        let mut journal = Journal::create(&fs, path).unwrap();
+        for what in [
+            "W3X.asi!W3X_SetMode(1) returned 1",
+            "mem_patch a at 0x10",
+            "W3X.asi!W3X_SetMode(0) returned 1",
+            "W3Y.asi!W3Y_SetMode(1) returned 1",
+            "W3X.asi!W3X_SetMode(1) returned 1",
+            "W3X.asi!W3X_SetMode(0) returned 1",
+            "channel {\"verb\":\"items.add\",\"name\":\"a!b(c)\"}",
+        ] {
+            let id = journal
+                .step(Action::GameMemory {
+                    what: what.into(),
+                    t: 1,
+                })
+                .unwrap();
+            journal.done(id).unwrap();
+        }
+        let report = replay(&fs.read(path).unwrap(), &fs);
+        let ended = |what: &str| format!("{what}: nothing to undo, it ended with the game");
+        assert_eq!(
+            report.notes,
+            [
+                ended("channel {\"verb\":\"items.add\",\"name\":\"a!b(c)\"}"),
+                "W3X.asi!W3X_SetMode: 4 calls, the last (0) returned 1: nothing to undo, they ended with the game"
+                    .into(),
+                ended("W3Y.asi!W3Y_SetMode(1) returned 1"),
+                ended("mem_patch a at 0x10"),
+            ]
         );
     }
 
