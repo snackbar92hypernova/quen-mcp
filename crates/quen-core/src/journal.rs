@@ -38,6 +38,18 @@ pub trait Fs {
     /// A file's last write time, in nanoseconds since 1970.
     fn mtime(&self, path: &Path) -> io::Result<u64>;
     fn set_mtime(&self, path: &Path, nanos: u64) -> io::Result<()>;
+    /// The files (no folders, no links) at the top level of `dir`: name and size.
+    fn files(&self, dir: &Path) -> io::Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            if meta.is_file() {
+                out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -123,6 +135,16 @@ pub enum Action {
     /// A mod folder about to be copied to `path` (`Mods\<name>`) from this PC, where nothing was at the launch
     /// (finding 38). Undo: recycle it if it is there, a copy cut off by a crash included: its source stays on the PC.
     NewDir { path: PathBuf },
+    /// What staged files' programs may write beside them in `dir` (a staged ASI's probe logs and dumps): the files at
+    /// its top level that [`output_of`] `stems`, but `skip` (in `dir` at the launch, the staged files, each `<stem>.log`).
+    /// Undo: move each into `to` (the boot's game-logs folder; [`ReplayReport::moved`]). One that won't move stays, with
+    /// a note.
+    Outputs {
+        dir: PathBuf,
+        stems: Vec<String>,
+        skip: Vec<String>,
+        to: PathBuf,
+    },
     /// A file the game rewrites by itself during the session, backed up earlier in the journal, with its sha and write
     /// time then: Witcher 3 recompiles its scripts into `content\content0\x64.final.redscripts` when a script mod is
     /// parked (first experiment boot), and reorders the lines of input.settings at every launch (live boot 1). Undo:
@@ -243,6 +265,9 @@ pub struct ReplayReport {
     pub left: Vec<Left>,
     /// Placed files and spent backups, sent to the Recycle Bin.
     pub recycled: Vec<PathBuf>,
+    /// What staged files' programs wrote beside them, moved out ([`Action::Outputs`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub moved: Vec<Moved>,
     /// Complete journal lines (1-based) that don't parse: any step on them was not undone.
     pub unreadable: Vec<usize>,
     /// A torn last line, interrupted steps, backups kept.
@@ -254,6 +279,26 @@ impl ReplayReport {
     pub fn clean(&self) -> bool {
         self.left.is_empty() && self.unreadable.is_empty()
     }
+}
+
+/// A file [`Action::Outputs`] moved, and its size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Moved {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub bytes: u64,
+}
+
+/// Whether the file `name` is one of `stems`' outputs: a stem, then `.`, `_`, `-` or a space and more, in any case;
+/// never a file quen's own writes leave (`.quen-stage`, `.quen-tmp`), which the replay handles itself.
+pub fn output_of(name: &str, stems: &[String]) -> bool {
+    let name = name.to_lowercase();
+    !name.ends_with(".quen-stage")
+        && !name.ends_with(".quen-tmp")
+        && stems.iter().any(|stem| {
+            name.strip_prefix(&stem.to_lowercase())
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with(['.', '_', '-', ' ']))
+        })
 }
 
 /// A step replay left alone, and why.
@@ -556,6 +601,31 @@ fn undo(
                 ));
             }
         }
+        Action::Outputs {
+            dir,
+            stems,
+            skip,
+            to,
+        } => {
+            let files = fs.files(dir).unwrap_or_else(|e| {
+                report.notes.push(format!("{}: {e}", dir.display()));
+                Vec::new()
+            });
+            let outputs = files.into_iter().filter(|(name, _)| {
+                output_of(name, stems) && !skip.iter().any(|s| s.eq_ignore_ascii_case(name))
+            });
+            for (name, bytes) in outputs {
+                let (from, dest) = (dir.join(&name), to.join(&name));
+                match move_out(fs, &from, &dest) {
+                    Ok(()) => report.moved.push(Moved {
+                        from,
+                        to: dest,
+                        bytes,
+                    }),
+                    Err(Why(why)) => report.notes.push(format!("kept {}: {why}", from.display())),
+                }
+            }
+        }
         Action::Place { dest, sha, file_id } => {
             if verifies(fs, dest, sha, file_id)? {
                 fs.recycle(dest)?;
@@ -572,6 +642,23 @@ fn undo(
             }
         }
     }
+    Ok(())
+}
+
+/// Moves the file `from` to `to`, where nothing is: a rename, else (another volume) a copy, then `from` recycled. A file
+/// at `to` with `from`'s bytes (the end's game_logs copy of a log) stays, and `from` is recycled.
+/// ponytail: the copy holds the whole file in memory; stream it if outputs of several GB come up.
+fn move_out(fs: &dyn Fs, from: &Path, to: &Path) -> Result<(), Why> {
+    if fs.exists(to) {
+        if fs.sha256(to)? != fs.sha256(from)? {
+            return Err(format!("{} holds other bytes", to.display()).into());
+        }
+    } else if fs.rename(from, to).is_ok() {
+        return Ok(());
+    } else {
+        fs.write_atomic(to, &fs.read(from)?)?;
+    }
+    fs.recycle(from)?;
     Ok(())
 }
 
@@ -754,6 +841,19 @@ impl Fs for MemFs {
         let file = state.files.get_mut(path).ok_or_else(|| missing(path))?;
         file.2 = nanos;
         Ok(())
+    }
+
+    fn files(&self, dir: &Path) -> io::Result<Vec<(String, u64)>> {
+        let state = self.state.borrow();
+        let here = state.files.iter().filter(|(p, _)| p.parent() == Some(dir));
+        Ok(here
+            .filter_map(|(p, (_, data, _))| {
+                Some((
+                    p.file_name()?.to_string_lossy().into_owned(),
+                    data.len() as u64,
+                ))
+            })
+            .collect())
     }
 }
 

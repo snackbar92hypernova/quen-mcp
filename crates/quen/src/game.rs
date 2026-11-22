@@ -1942,6 +1942,7 @@ if os.path.exists(act): exec(open(act).read())
                 game: 1,
                 saves: self.dir.join("gamesaves"),
                 saves_before: Default::default(),
+                loaded: None,
                 quen_saves: Default::default(),
                 patches: Default::default(),
                 launched: std::time::UNIX_EPOCH,
