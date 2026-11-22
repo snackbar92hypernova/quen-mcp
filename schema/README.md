@@ -171,8 +171,9 @@ A named camera position for repeatable captures. `id`; `name` (unique, e.g. `P1`
 rotation `cam_pitch`, `cam_yaw`, `cam_roll` (degrees), `fov`; the player's `player_x`, `player_y`, `player_z` (all set
 or all NULL) and `player_yaw` (degrees; never set without the position; since schema 0012 it may be NULL with one,
 before it was set exactly when they were); `save_id` → saves: the save the pose is in; `ref_capture_id` → captures: its
-reference image; since schema 0017 the world it was seen in, NULL when not recorded: `game_day`, `game_hour` (0-23; both
-set or both NULL: game_settime's arguments) and `weather` (its name).
+reference image. quen's captures name theirs `<session>/<name>` after their first file (`<tag>`, `<tag>-00`,
+`<tag>-boxes`). Since schema 0017 the world it was seen in, NULL when not recorded: `game_day`, `game_hour` (0-23;
+both set or both NULL: game_settime's arguments) and `weather` (its name).
 
 ### captures (table)
 
@@ -182,15 +183,19 @@ files whose boot isn't known); `path` (relative to the capture root, `/` separat
 every tool. Exceptions, from before this was the rule: the history import names five of the earlier tool's files by their role
 (`boot_log`, `presentmon_csv`, `camera_ref`, `camera_cal`, `boots_jsonl`), and quen's own screenshot rows written before
 `quen_guide` existed say `screenshot`. So tell what took a file by `method`, not `kind`. `method` (how it was taken,
-e.g. `printwindow`, `wgc_fp16`, `presentmon`; a mem tool's name, e.g. `mem_walk`, for its result too big to answer
-inline, kind `json`; `world_map` for its map's JSON and its PNG, a drawing without `encoding`, `frame_state` holding
+e.g. `printwindow`, `wgc_fp16`, `presentmon`; `wgc_fp16_mean` for a `game_screenshot` burst's mean, `frame_state`
+`frames` and `present_ms`, a burst's frames `wgc_fp16` with `frame` and `present_ms`; `wgc_boxes` for `measure_boxes`'
+CSV, `frame_state` holding its `boxes`, `frames` and `values`; a mem tool's name, e.g. `mem_walk`, for its result too
+big to answer inline, kind `json`; `world_map` for its map's JSON and its PNG, a drawing without `encoding`, `frame_state` holding
 the map's mode, at, size, cell, source capture ids and world; `ngfx_capture` for an Nsight Graphics frame capture, kind
 `ngfx-capture`, `frame_state` the facts of its metadata once `ngfx_extract` read it; `ngfx_extract` and `ngfx_replay`
 for their output files, on the capture's boot and on none); `encoding` (a display image's pixels: `srgb8`, `pq_bt2020_u16`,
 `pq_codes_f16`, `scrgb_f16`; any other buffer, e.g. scene-linear data or a G-buffer target, leaves it NULL and gives its
 format in `frame_state`); `includes_overlay`, `includes_desktop`; `display_state` and `frame_state` (JSON objects: the
 display and the frame when it was taken; quen's `display_state` names the monitor by `monitor_sha`, a short hash of its model name,
-since 2026-10-18, by `monitor` before); `pose_id` → poses; `t` (when it was taken); `pinned` (1: never a cleanup candidate);
+since 2026-10-18, by `monitor` before); `pose_id` → poses (quen's screenshots and `measure_boxes` fill it, and
+`frame_state` `photo` and `time`, when the game's channel answers after the grab); `t` (when it was taken); `pinned` (1:
+never a cleanup candidate);
 `removed_at` (when `capture_clean` took the file off the disk, NULL while it is there) and `removed_to` (`recycle_bin`,
 `to_delete`: `<data root>\_to_delete\<date>\`, for the user to empty, until quen 0.1.5, `missing`: the file was gone
 already, removed by hand, and `capture_clean` with `missing: true` marked the row, since 2026-10-18, or `deleted`: the

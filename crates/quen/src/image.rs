@@ -75,6 +75,14 @@ pub fn tool() -> Value {
     })
 }
 
+/// A metric name prefix (measure_image's name, measure_boxes' box names): 1-40 of a-z, 0-9 and _, from a letter.
+pub(crate) fn name_ok(n: &str) -> bool {
+    n.len() <= 40
+        && n.starts_with(|c: char| c.is_ascii_lowercase())
+        && n.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// A screenshot's captures row, its file read and decoded.
 struct Shot {
     id: i64,
@@ -257,14 +265,8 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
         text("run_id")?,
         text("note")?,
     );
-    if let Some(n) = &name {
-        let ok = n.len() <= 40
-            && n.starts_with(|c: char| c.is_ascii_lowercase())
-            && n.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-        if !ok {
-            return Err(format!("name {n:?}: 1-40 of a-z, 0-9 and _, from a letter").into());
-        }
+    if let Some(n) = name.as_deref().filter(|n| !name_ok(n)) {
+        return Err(format!("name {n:?}: 1-40 of a-z, 0-9 and _, from a letter").into());
     }
     let config = session.config()?;
     let mut ledger = session::open_ledger(config)?;

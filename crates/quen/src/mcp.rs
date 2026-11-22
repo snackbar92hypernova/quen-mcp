@@ -39,7 +39,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// call.
 const JOB_BUDGET: Duration = Duration::from_secs(20);
 /// The tools that can run past [`JOB_BUDGET`]: their schemas offer `wait`.
-const LONG: [&str; 20] = [
+const LONG: [&str; 21] = [
     "session_launch",
     "capture_clean",
     "session_end",
@@ -47,6 +47,7 @@ const LONG: [&str; 20] = [
     "game_save",
     "game_keys",
     "game_screenshot",
+    "measure_boxes",
     "measure_presentmon",
     "measure_trace",
     "measure_ab",
@@ -965,6 +966,7 @@ pub(crate) fn tools() -> Value {
     list.push(freecam::tool());
     list.extend(measure::tools());
     list.push(image::tool());
+    list.push(capture::boxes_tool());
     list.push(plan::tool());
     list.extend(mem::tools());
     list.extend(data::tools());

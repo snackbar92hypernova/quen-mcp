@@ -1,6 +1,7 @@
 //! Image metrics over quen's own screenshots (finding 39): each encoding `game_screenshot` writes, decoded, a crop of
 //! it, and the numbers agents wrote into measurement rows by hand: channel means and medians, luminance, the share of
-//! pixels in a hue range, and the difference from a reference against a noise floor.
+//! pixels in a hue range, and the difference from a reference against a noise floor. Also `measure_boxes`' per-frame
+//! box means and their CSV.
 //!
 //! Every number keeps its encoding's meaning. The 8-bit sRGB PNG (`srgb8`) has no absolute scale, so its light is
 //! relative (linear sRGB, white = 1), never nits. The 16-bit PQ BT.2020 PNG (`pq_bt2020_u16`) and the scRGB `.npy`
@@ -73,41 +74,9 @@ impl Image {
         self.encoding
     }
 
-    /// The crop `[x, y, width, height]` in whole pixels from the top-left, or with `fraction` in fractions of the
-    /// frame's width and height (each edge rounded to the nearest pixel); None: the whole frame.
+    /// [`crop_region`] of this frame.
     pub fn region(&self, crop: Option<[f64; 4]>, fraction: bool) -> Result<Region, String> {
-        let (w, h) = (self.width, self.height);
-        let Some([x, y, cw, ch]) = crop else {
-            return Ok(Region {
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
-            });
-        };
-        let [x0, y0, x1, y1] = if fraction {
-            if [x, y, cw, ch].iter().any(|v| !(0.0..=1.0).contains(v)) {
-                return Err("a fraction crop is 4 numbers from 0 to 1".into());
-            }
-            let edge = |f: f64, n: u32| (f * f64::from(n)).round();
-            [edge(x, w), edge(y, h), edge(x + cw, w), edge(y + ch, h)]
-        } else {
-            if [x, y, cw, ch].iter().any(|v| *v < 0.0 || v.fract() != 0.0) {
-                return Err("a pixel crop is 4 whole numbers from 0".into());
-            }
-            [x, y, x + cw, y + ch]
-        };
-        if x1 <= x0 || y1 <= y0 || x1 > f64::from(w) || y1 > f64::from(h) {
-            return Err(format!(
-                "crop [{x}, {y}, {cw}, {ch}] is empty or leaves the {w}x{h} frame"
-            ));
-        }
-        Ok(Region {
-            x: x0 as u32,
-            y: y0 as u32,
-            width: (x1 - x0) as u32,
-            height: (y1 - y0) as u32,
-        })
+        crop_region(self.width, self.height, crop, fraction)
     }
 
     /// Refuses a region that is empty or leaves the frame (one not from [`Image::region`]).
@@ -335,6 +304,93 @@ impl Image {
             n => Ok(sum / n as f64),
         }
     }
+}
+
+/// The crop `[x, y, width, height]` of a `w` x `h` frame in whole pixels from the top-left, or with `fraction` in
+/// fractions of the frame's width and height (each edge rounded to the nearest pixel); None: the whole frame.
+pub fn crop_region(
+    w: u32,
+    h: u32,
+    crop: Option<[f64; 4]>,
+    fraction: bool,
+) -> Result<Region, String> {
+    let Some([x, y, cw, ch]) = crop else {
+        return Ok(Region {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        });
+    };
+    let [x0, y0, x1, y1] = if fraction {
+        if [x, y, cw, ch].iter().any(|v| !(0.0..=1.0).contains(v)) {
+            return Err("a fraction crop is 4 numbers from 0 to 1".into());
+        }
+        let edge = |f: f64, n: u32| (f * f64::from(n)).round();
+        [edge(x, w), edge(y, h), edge(x + cw, w), edge(y + ch, h)]
+    } else {
+        if [x, y, cw, ch].iter().any(|v| *v < 0.0 || v.fract() != 0.0) {
+            return Err("a pixel crop is 4 whole numbers from 0".into());
+        }
+        [x, y, x + cw, y + ch]
+    };
+    if x1 <= x0 || y1 <= y0 || x1 > f64::from(w) || y1 > f64::from(h) {
+        return Err(format!(
+            "crop [{x}, {y}, {cw}, {ch}] is empty or leaves the {w}x{h} frame"
+        ));
+    }
+    Ok(Region {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    })
+}
+
+/// The mean R, G and B of RGBA half floats, leaving out the pixels with a NaN or infinity (None: no pixel left), and
+/// how many it left out.
+pub fn mean_rgb(rgba: &[f16]) -> (Option<[f64; 3]>, usize) {
+    let (mut sum, mut n, mut odd) = ([0.0f64; 3], 0usize, 0usize);
+    for p in rgba.chunks_exact(4) {
+        let p = [p[0], p[1], p[2]].map(f16::to_f32);
+        if !finite(p) {
+            odd += 1;
+            continue;
+        }
+        for (s, v) in sum.iter_mut().zip(p) {
+            *s += f64::from(v);
+        }
+        n += 1;
+    }
+    ((n > 0).then(|| sum.map(|s| s / n as f64)), odd)
+}
+
+/// One frame of a box recording: its present time in ms after the first frame's, and each box's [`mean_rgb`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxFrame {
+    pub present_ms: f64,
+    pub means: Vec<Option<[f64; 3]>>,
+}
+
+/// A box recording as CSV: `frame,present_ms,<box>_r,<box>_g,<box>_b,...`, a row per frame, a box's cells empty where
+/// it had no finite pixel.
+pub fn boxes_csv(names: &[String], frames: &[BoxFrame]) -> String {
+    let mut out = String::from("frame,present_ms");
+    for n in names {
+        out += &format!(",{n}_r,{n}_g,{n}_b");
+    }
+    out.push('\n');
+    for (i, f) in frames.iter().enumerate() {
+        out += &format!("{i},{}", f.present_ms);
+        for m in &f.means {
+            match m {
+                Some([r, g, b]) => out += &format!(",{r},{g},{b}"),
+                None => out += ",,,",
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn row(metric: String, value: f64, unit: &'static str) -> Row {
@@ -757,5 +813,39 @@ mod tests {
         ));
         let only = img.region(Some([1.0, 0.0, 1.0, 1.0]), false).unwrap();
         assert!(img.channels(only).unwrap_err().contains("finite"));
+    }
+
+    /// measure_boxes' pieces: a fraction box rounds to pixels as measure_image's crop does, a box's mean leaves out
+    /// non-finite pixels, and the CSV has a row per frame with empty cells for a box without a finite pixel.
+    #[test]
+    fn box_means_and_their_csv() {
+        let r = crop_region(1920, 1080, Some([0.1, 0.5, 0.25, 0.1]), true).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (192, 540, 480, 108));
+        assert!(crop_region(10, 10, Some([0.0, 0.0, 0.01, 0.5]), true).is_err());
+        let px = [
+            [1.0, 2.0, 3.0, 1.0],
+            [3.0, 4.0, 5.0, 1.0],
+            [f32::NAN, 0.0, 0.0, 1.0],
+        ];
+        let half: Vec<f16> = px.iter().flatten().map(|v| f16::from_f32(*v)).collect();
+        assert_eq!(mean_rgb(&half), (Some([2.0, 3.0, 4.0]), 1));
+        assert_eq!(mean_rgb(&half[8..]), (None, 1));
+        let frames = [
+            BoxFrame {
+                present_ms: 0.0,
+                means: vec![Some([2.0, 3.0, 4.5]), None],
+            },
+            BoxFrame {
+                present_ms: 16.667,
+                means: vec![Some([1.0, 1.0, 1.0]), Some([0.25, 0.5, 0.0])],
+            },
+        ];
+        let csv = boxes_csv(&["sky".into(), "geralt".into()], &frames);
+        assert_eq!(
+            csv,
+            "frame,present_ms,sky_r,sky_g,sky_b,geralt_r,geralt_g,geralt_b\n\
+             0,0,2,3,4.5,,,\n\
+             1,16.667,1,1,1,0.25,0.5,0\n"
+        );
     }
 }
