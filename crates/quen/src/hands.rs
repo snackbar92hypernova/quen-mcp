@@ -90,20 +90,21 @@ pub(crate) fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "hands_give",
-            "description": "Give the controls of the game to the user: back in a play session, or in a test session \
-                for the user to do something in the game. No prompt. applied: memory patches and cvar writes still \
+            "description": "Give the game's controls to the user: back in a play session, or in a test session \
+                for the user to act in the game. No prompt. applied: memory patches and cvar writes still \
                 applied; asi_modes: ASI mode sets, the last per export (quen can't undo one); in a play session, this \
-                hand-over's. A play session refuses while there is one, unless keep_writes with the user's OK. Then \
+                hand-over's. A play session refuses while one is, unless keep_writes (the user's OK). Then \
                 the free camera, quen's pause and a camera path end (freecam, pause, path: the game's replies); unless \
                 to_client, the game comes to the front as focus to game brings it, tried twice (to_game: what it did, \
-                or why not); the game shows that the user has the controls (status). kept: this \
+                or why not); the game shows that the user has the controls, with note (status). kept: this \
                 hand-over's teleports, settime, weather and items; unexpected_saves: saves written while the agent had \
-                them. in_front: the window in front at the end (game, client or other). Refused: the user has them \
-                already, a wrong token, to_client with no client window found at connect. Failed: one wasn't undone \
+                them. in_front: the window in front at the end (game, client, other). Refused: the user has them \
+                already, a wrong token, a note over 64 bytes, to_client with no client window found at connect. Failed: one wasn't undone \
                 (left); the controls went to the user.",
             "inputSchema": schema(json!({
                 "keep_writes": {"type": "boolean", "description": "play session: give the controls back with this hand-over's memory patches, cvar writes and ASI mode sets still applied, the user having agreed. Default false: refused while any is"},
                 "to_client": {"type": "boolean", "description": "true: bring this client's window to the front last, as focus to client does, so the user sees the chat (to_client in the result: why it didn't). Default false: the game comes to the front"},
+                "note": {"type": "string", "description": "what the user should do next, shown in the game's notice that they have the controls, until hands_take: control characters stripped, at most 64 bytes"},
             }), &[]),
         }),
     ]
@@ -119,6 +120,7 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
         "game_pose" => args["action"] == "save",
         "game_photo" => matches!(args["action"].as_str(), Some("get" | "list")),
         "game_freecam" => args["action"] == "status",
+        "run_plan" => args["check"] == true,
         "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
         | "world_ground" | "world_ray" | "world_nav" | "world_map" | "game_scriptlog"
         | "measure_presentmon" | "mem_read" | "mem_scan" | "mem_follow" | "mem_walk"
@@ -177,6 +179,7 @@ fn taken(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
     let user_saves = sort(cx.live, true);
     h.takes.set(h.takes.get() + 1);
     h.since.set(cx.live.patches.borrow().len());
+    cx.live.status.note.take();
     session.shared.set_hands(Some(Hands::Agent));
     call.lap("take");
     let mut fields = Map::from_iter([
@@ -209,11 +212,29 @@ pub(crate) fn give(session: &Session, call: &mut Call, args: &Value) -> Done {
 }
 
 fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["keep_writes", "to_client"])?;
+    let cx = game::ctx(session, args, &["keep_writes", "to_client", "note"])?;
     let h = &cx.live.handovers;
     if cx.hands == Some(Hands::User) {
         return Err("the user has the controls already".to_string().into());
     }
+    // A notice takes no control character (protocol.rs).
+    let note: Option<String> = match args.get("note") {
+        None => None,
+        Some(v) => {
+            let note = v.as_str().ok_or("note must be a string".to_string())?;
+            let note: String = note.chars().filter(|c| !c.is_control()).collect();
+            let note = note.trim();
+            if note.len() > status::NOTE_MAX {
+                let why = format!(
+                    "note is {} bytes without control characters, over {}",
+                    note.len(),
+                    status::NOTE_MAX
+                );
+                return Err(why.into());
+            }
+            (!note.is_empty()).then(|| note.to_string())
+        }
+    };
     let keep = flag(args, "keep_writes")?;
     let client = match flag(args, "to_client")? {
         true => Some(call.conn.client.clone()?),
@@ -302,7 +323,8 @@ fn given(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         fields.insert("to_game".into(), shown);
         call.lap("to_game");
     }
-    // The user may be in the game when the controls go to them: it says so, and where to hand them back.
+    // The user may be in the game when the controls go to them: it says so, the note, and where to hand them back.
+    cx.live.status.note.replace(note);
     if let Some(shown) = status::set(&cx, Some(call), State::Yours) {
         fields.insert("status".into(), json!(shown));
     }
@@ -524,10 +546,13 @@ mod tests {
             ("game_freecam", json!({"action": "on"})),
             ("game_freecam", json!({"action": "set", "relative": {}})),
             ("game_pose", json!({"action": "restore", "name": "P"})),
+            ("run_plan", json!({"plan": "{}"})),
+            ("run_plan", json!({"plan": "{}", "check": false})),
         ] {
             assert!(!user_may(tool, &args), "{tool} {args}");
         }
         for (tool, args) in [
+            ("run_plan", json!({"plan": "{}", "check": true})),
             ("game_pose", json!({"action": "save", "name": "P"})),
             ("game_cvar", json!({"name": "X"})),
             ("game_cvar", json!({"name": "X", "restore": false})),
@@ -787,6 +812,62 @@ mod tests {
             "{out}"
         );
         assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// Boot 370's ask: hands_give's note, control characters stripped, is in the notice that the user has the controls,
+    /// until hands_take; one over NOTE_MAX bytes is refused, nothing done.
+    #[test]
+    fn hands_give_shows_its_note_in_the_notice_until_hands_take() {
+        use crate::channel::tests::{fake_game_until, reply, served, token};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fx = served("give-note");
+        let stop = Arc::new(AtomicBool::new(false));
+        let answer = Box::new(|r: &quen_core::protocol::Request| {
+            vec![reply(r.id, true, "notice shown", None)]
+        });
+        let server = fake_game_until(&token(&fx), answer, stop.clone());
+        let session = handed_over(&fx, false);
+        let live = session.live.as_ref().unwrap();
+        let long = "x".repeat(status::NOTE_MAX + 1);
+        let out = run(
+            &session,
+            "hands_give",
+            json!({"token": "tok", "note": long}),
+        );
+        let reason = out["reason"].as_str().unwrap_or_default();
+        assert!(
+            out["refused"] == true && reason.contains("over 64"),
+            "{out}"
+        );
+        assert_eq!(fx.shared.hands(), Some(Hands::Agent));
+        let note = json!({"token": "tok", "note": " Walk to the\u{7} bridge.\n"});
+        let out = run(&session, "hands_give", note);
+        assert_eq!(out["ok"], true, "{out}");
+        let walk = "Walk to the bridge.";
+        assert_eq!(live.status.note.borrow().as_deref(), Some(walk));
+        let took = run(
+            &session,
+            "hands_take",
+            json!({"token": "tok", "user_ok": true}),
+        );
+        assert_eq!(took["ok"], true, "{took}");
+        assert_eq!(*live.status.note.borrow(), None);
+        stop.store(true, Ordering::Relaxed);
+        let line = |note: &str| {
+            format!(
+                "quen: you have the controls. {note} Then tell the agent in the chat (Alt+Tab)."
+            )
+        };
+        let want = line(walk);
+        let shown = server
+            .join()
+            .unwrap()
+            .into_iter()
+            .any(|r| matches!(r.verb, Verb::Notice { ref text, .. } if *text == want));
+        assert!(shown, "no notice {want:?}");
+        let longest = line(&"x".repeat(status::NOTE_MAX));
+        assert!(longest.len() <= quen_core::protocol::MAX_NOTICE_BYTES);
     }
 
     /// The connection that launched a play session closes while the agent has the controls: this hand-over's two dummy

@@ -17,11 +17,17 @@ use crate::game::Fields;
 use crate::session::{self, Call, Done, Session};
 
 const METRICS: [&str; 4] = ["channels", "luminance", "hue_share", "diff"];
-const KEYS: [&str; 14] = [
+/// At most this many captures, named crops, and table rows (captures by crops) in one call.
+const CAPTURES_MAX: usize = 32;
+const CROPS_MAX: usize = 16;
+const TABLE_MAX: usize = 64;
+const KEYS: [&str; 16] = [
     "token",
     "capture",
+    "captures",
     "metrics",
     "crop",
+    "crops",
     "crop_unit",
     "hue",
     "s_min",
@@ -42,22 +48,34 @@ pub fn tool() -> Value {
     let unit = json!({"type": "number", "minimum": 0, "maximum": 1, "description": "a fraction"});
     json!({
         "name": "measure_image",
-        "description": "Numbers from a screenshot quen took (game_screenshot, game_frame, sweep_play) over a crop, \
-            written as measurement rows: method_family screenshot, tag M, its capture_id and boot (quen_guide: \
-            measure_image). metrics: channels (per R, G, B the mean and median of the file's values, srgb8 0-255, pq \
-            0-1 or scrgb, and the mean of linear light), luminance (BT.709 Y of linear light: mean, median, p95, max; \
-            nits from the HDR files, relative from srgb8: sRGB white = 1), hue_share (the share of pixels in an HSV hue \
-            range), diff (against reference, and noise_ref as the floor). Reads the files only, each checked against \
-            its sha256, on the session thread: never during a window. Refused, nothing written: not quen's screenshot \
-            or not an image (an .rdc, a CSV, Nsight's final.png: its encoding is unknown), the file removed or changed, an argument a metric doesn't take, a crop \
-            off the frame, a reference of another method, encoding, size or display state.",
+        "description": "Numbers from screenshots quen took (game_screenshot, game_frame, sweep_play) over crops, \
+            as measurement rows: method_family screenshot, tag M, capture_id and boot (quen_guide: measure_image). \
+            metrics: channels (per R, G, B the mean and median of the file's values, srgb8 0-255, pq 0-1 or scrgb, \
+            and the mean of linear light), luminance (BT.709 Y of linear light: mean, median, p95, max; nits from \
+            HDR files, relative from srgb8: sRGB white = 1), hue_share (share of pixels in an HSV hue range), diff \
+            (against reference, noise_ref the floor). captures (up to 32), named crops (up to 16), 64 rows at most: \
+            table, a row per capture and crop. Reads files only, each checked against its sha256, on the session \
+            thread: never during a window. Refused, nothing written (any capture): not quen's screenshot or not an \
+            image (an .rdc, a CSV, Nsight's final.png: encoding unknown), the file removed or changed, an argument a \
+            metric doesn't take, a crop off the frame, a reference of another method, encoding, size or display \
+            state.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "token": {"type": "string", "description": "optional: the live session's token (run_plan passes it)"},
-                "capture": capture("the screenshot"),
+                "capture": capture("the screenshot; or captures"),
+                "captures": {"type": "array", "minItems": 1, "maxItems": CAPTURES_MAX, "items": capture("a screenshot"), "description": "instead of capture: several, each measured as capture; every row checked before a file is read. The result: captures (each as capture) and table"},
                 "metrics": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": METRICS, "description": "a metric"}, "description": "which numbers"},
                 "crop": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number", "description": "x, y, width or height"}, "description": "[x, y, width, height] from the top-left; default the whole frame"},
+                "crops": {"type": "array", "minItems": 1, "maxItems": CROPS_MAX, "description": "instead of crop: named crops, names unique. The result's table: a row per capture and crop {capture (id), crop (its name), region (as crop in the result), values, non_finite}", "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,39}$", "description": "prefixes its rows' metrics, after name (geralt_hair_r_lin_mean)"},
+                        "crop": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number", "description": "x, y, width or height"}, "description": "as crop, in crop_unit"},
+                    },
+                    "required": ["name", "crop"],
+                    "additionalProperties": false,
+                }},
                 "crop_unit": {"type": "string", "enum": ["px", "fraction"], "description": "px (default): whole pixels. fraction: of the frame's width and height, each edge rounded to a pixel"},
                 "hue": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer", "minimum": 0, "maximum": 360, "description": "degrees"}, "description": "hue_share: [from, to] degrees, both included; from above to wraps through 0"},
                 "s_min": unit.clone(),
@@ -69,7 +87,7 @@ pub fn tool() -> Value {
                 "run_id": {"type": "string", "description": "the rows' run id"},
                 "note": {"type": "string", "description": "added to the rows' note"},
             },
-            "required": ["capture", "metrics"],
+            "required": ["metrics"],
             "additionalProperties": false,
         },
     })
@@ -83,19 +101,20 @@ pub(crate) fn name_ok(n: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// A screenshot's captures row, its file read and decoded.
+/// A screenshot's captures row, checked.
 struct Shot {
     id: i64,
     path: String,
+    sha256: String,
     method: String,
+    encoding: Encoding,
     boot: Option<i64>,
     display: Value,
-    image: Image,
 }
 
 /// The screenshot `v` (an id, as a number or text, or a path) names, for argument `key`: one of quen's own
-/// (capture.rs's methods), an image encoding, on disk and unchanged since its row.
-fn shot(ledger: &Ledger, config: &Config, key: &str, v: &Value) -> Result<Shot, String> {
+/// (capture.rs's methods), an image encoding, not removed. Reads no file ([`Shot::image`] does).
+fn shot(ledger: &Ledger, key: &str, v: &Value) -> Result<Shot, String> {
     let by_id = v
         .as_i64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()));
@@ -144,24 +163,38 @@ fn shot(ledger: &Ledger, config: &Config, key: &str, v: &Value) -> Result<Shot, 
             row[6]
         ));
     }
-    let file = config.capture_root().join(&path);
-    let bytes = fs::read(&file).map_err(|e| format!("{key}: {}: {e}", file.display()))?;
-    if sha256_hex(&bytes) != text(2) {
-        return Err(format!(
-            "{key}: {}: changed since quen wrote it (sha256)",
-            file.display()
-        ));
-    }
-    let image = Image::decode(&bytes, encoding)
-        .map_err(|why| format!("{key}: capture {id} ({path}), {encoding}: {why}"))?;
     Ok(Shot {
         id,
         path,
+        sha256: text(2),
         method,
+        encoding,
         boot: row[5].as_i64(),
         display: row[7].clone(),
-        image,
     })
+}
+
+impl Shot {
+    /// Its file, read, checked against its row's sha256 and decoded (argument `key`).
+    fn image(&self, config: &Config, key: &str) -> Result<Image, String> {
+        let (id, path, encoding) = (self.id, &self.path, self.encoding);
+        let file = config.capture_root().join(path);
+        let bytes = fs::read(&file).map_err(|e| format!("{key}: {}: {e}", file.display()))?;
+        if sha256_hex(&bytes) != self.sha256 {
+            return Err(format!(
+                "{key}: {}: changed since quen wrote it (sha256)",
+                file.display()
+            ));
+        }
+        Image::decode(&bytes, encoding)
+            .map_err(|why| format!("{key}: capture {id} ({path}), {encoding}: {why}"))
+    }
+
+    /// The result's capture entry, with its image's size.
+    fn about(&self, image: &Image) -> Value {
+        json!({"id": self.id, "path": self.path, "method": self.method, "encoding": self.encoding,
+               "size": [image.width(), image.height()]})
+    }
 }
 
 pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
@@ -236,20 +269,72 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
             .to_string()
             .into());
     }
-    let crop = match args.get("crop") {
-        None => None,
-        Some(v) => Some(
-            v.as_array()
-                .filter(|a| a.len() == 4)
-                .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .ok_or("crop is [x, y, width, height]".to_string())?,
-        ),
+    let four = |v: &Value, what: &str| {
+        v.as_array()
+            .filter(|a| a.len() == 4)
+            .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .ok_or(format!("{what} is [x, y, width, height]"))
     };
-    let fraction = match (args.get("crop_unit").map(Value::as_str), crop) {
+    // The captures (capture's one, or captures') and the crops (crop's one, None: the whole frame; or crops' named
+    // ones). With captures or crops the result is a table, a row per capture and crop (boot 370's ask).
+    let captures: Vec<(String, &Value)> = match (args.get("capture"), args.get("captures")) {
+        (Some(v), None) => vec![("capture".into(), v)],
+        (None, Some(v)) => v
+            .as_array()
+            .filter(|a| (1..=CAPTURES_MAX).contains(&a.len()))
+            .ok_or(format!(
+                "captures is a list of 1 to {CAPTURES_MAX} captures"
+            ))?
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("captures[{i}]"), v))
+            .collect(),
+        (Some(_), Some(_)) => return Err("capture or captures, not both".to_string().into()),
+        (None, None) => return Err("capture or captures is required".to_string().into()),
+    };
+    let crops = match (args.get("crop"), args.get("crops")) {
+        (crop, None) => vec![(None, crop.map(|v| four(v, "crop")).transpose()?)],
+        (None, Some(v)) => {
+            let given = v
+                .as_array()
+                .filter(|a| (1..=CROPS_MAX).contains(&a.len()))
+                .ok_or(format!("crops: 1 to {CROPS_MAX} of {{name, crop}}"))?;
+            let mut crops: Vec<(Option<String>, Option<[f64; 4]>)> = Vec::new();
+            for c in given {
+                let map = c.as_object().ok_or("a crop is {name, crop}".to_string())?;
+                if let Some(key) = map.keys().find(|k| *k != "name" && *k != "crop") {
+                    return Err(format!("a crop: unknown field {key:?}").into());
+                }
+                let name = c["name"]
+                    .as_str()
+                    .filter(|n| name_ok(n))
+                    .ok_or("a crop's name: 1-40 of a-z, 0-9 and _, from a letter".to_string())?;
+                if crops.iter().any(|(n, _)| n.as_deref() == Some(name)) {
+                    return Err(format!("crop name {name:?} twice").into());
+                }
+                let crop = four(&c["crop"], &format!("crop {name}"))?;
+                crops.push((Some(name.to_string()), Some(crop)));
+            }
+            crops
+        }
+        (Some(_), Some(_)) => return Err("crop or crops, not both".to_string().into()),
+    };
+    let table = map.contains_key("captures") || map.contains_key("crops");
+    if captures.len() * crops.len() > TABLE_MAX {
+        let why = format!(
+            "{} captures by {} crops is over {TABLE_MAX} rows",
+            captures.len(),
+            crops.len()
+        );
+        return Err(why.into());
+    }
+    let fraction = match (args.get("crop_unit").map(Value::as_str), crops[0].1) {
         (None | Some(Some("px")), _) => false,
         (Some(Some("fraction")), Some(_)) => true,
-        (Some(Some("fraction")), None) => return Err("crop_unit without crop".to_string().into()),
+        (Some(Some("fraction")), None) => {
+            return Err("crop_unit without crop or crops".to_string().into());
+        }
         _ => return Err("crop_unit is px or fraction".to_string().into()),
     };
     let text = |key: &str| match args.get(key) {
@@ -270,84 +355,128 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
     }
     let config = session.config()?;
     let mut ledger = session::open_ledger(config)?;
-    let main = shot(&ledger, config, "capture", &args["capture"])?;
-    call.lap("decode");
-    let region = main.image.region(crop, fraction)?;
-    let mut rows: Vec<Row> = Vec::new();
-    let mut about = vec![format!(
-        "measure_image {} {}x{} crop {},{} {}x{} px",
-        main.image.encoding(),
-        main.image.width(),
-        main.image.height(),
-        region.x,
-        region.y,
-        region.width,
-        region.height
-    )];
+    // Every capture's row is checked before any file is read.
+    let shots = captures
+        .iter()
+        .map(|(key, v)| shot(&ledger, key, v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut refs = Vec::new();
+    for key in ["reference", "noise_ref"] {
+        let Some(v) = args.get(key) else { continue };
+        let other = shot(&ledger, key, v)?;
+        if let Some(main) = shots
+            .iter()
+            .find(|m| (&m.method, &m.display) != (&other.method, &other.display))
+        {
+            return Err(format!(
+                "{key}: capture {} was taken by {} with display state {}, capture {} by {} with {}: compare only \
+                 captures of one method, encoding and display state",
+                other.id, other.method, other.display, main.id, main.method, main.display
+            )
+            .into());
+        }
+        refs.push((key, other));
+    }
+    // What every row's note says after its capture and crop: the hue range, the references.
+    let mut shared: Vec<String> = hue
+        .map(|[from, to]| format!("hue {from}-{to} s>={s_min} v>={v_min}"))
+        .into_iter()
+        .collect();
     let mut compared = Map::new();
-    for metric in &metrics {
-        match *metric {
-            "channels" => rows.extend(main.image.channels(region)?),
-            "luminance" => rows.extend(main.image.luminance(region)?),
-            "hue_share" => {
-                let [from, to] = hue.unwrap_or_default();
-                rows.push(main.image.hue_share(region, [from, to], s_min, v_min)?);
-                about.push(format!("hue {from}-{to} s>={s_min} v>={v_min}"));
-            }
-            _ => {
-                let mut against = Vec::new();
-                for key in ["reference", "noise_ref"] {
-                    let Some(v) = args.get(key) else { continue };
-                    let other = shot(&ledger, config, key, v)?;
-                    if (&other.method, &other.display) != (&main.method, &main.display) {
-                        return Err(format!(
-                            "{key}: capture {} was taken by {} with display state {}, the screenshot by {} with {}: \
-                             compare only captures of one method, encoding and display state",
-                            other.id, other.method, other.display, main.method, main.display
-                        )
-                        .into());
+    let mut against = Vec::new();
+    for (key, other) in &refs {
+        shared.push(format!("{key} capture {}", other.id));
+        compared.insert(key.to_string(), json!({"id": other.id, "path": other.path}));
+        against.push(other.image(config, key)?);
+    }
+    let (mut rows, mut listed, mut table_rows) = (Vec::new(), Vec::new(), Vec::new());
+    for ((key, _), main) in captures.iter().zip(&shots) {
+        if call.stopped() {
+            let why = format!("{} at {key}: nothing written", call.stop_cause());
+            return Err(why.into());
+        }
+        let image = main.image(config, key)?;
+        call.lap_sum("decode");
+        listed.push(main.about(&image));
+        for (crop_name, crop) in &crops {
+            let at = |e: String| match (table, crop_name) {
+                (false, _) => e,
+                (true, Some(n)) => format!("{key} crop {n}: {e}"),
+                (true, None) => format!("{key}: {e}"),
+            };
+            let region = image.region(*crop, fraction).map_err(at)?;
+            let mut values: Vec<Row> = Vec::new();
+            for metric in &metrics {
+                match *metric {
+                    "channels" => values.extend(image.channels(region).map_err(at)?),
+                    "luminance" => values.extend(image.luminance(region).map_err(at)?),
+                    "hue_share" => {
+                        let [from, to] = hue.unwrap_or_default();
+                        values.push(
+                            image
+                                .hue_share(region, [from, to], s_min, v_min)
+                                .map_err(at)?,
+                        );
                     }
-                    about.push(format!("{key} capture {}", other.id));
-                    compared.insert(key.into(), json!({"id": other.id, "path": other.path}));
-                    against.push(other.image);
+                    _ => {
+                        let diff = image.diff_rows(&against[0], against.get(1), region);
+                        values.extend(diff.map_err(at)?);
+                    }
                 }
-                rows.extend(main.image.diff_rows(&against[0], against.get(1), region)?);
             }
+            let non_finite = image.non_finite(region).map_err(at)?;
+            let mut about = vec![format!(
+                "measure_image {} {}x{} crop {},{} {}x{} px",
+                image.encoding(),
+                image.width(),
+                image.height(),
+                region.x,
+                region.y,
+                region.width,
+                region.height
+            )];
+            about.extend(shared.iter().cloned());
+            if non_finite > 0 {
+                about.push(format!(
+                    "{non_finite} pixels with a NaN or infinity left out"
+                ));
+            }
+            about.extend(note.clone());
+            let row_note = about.join("; ");
+            // name, then the crop's name, prefix each metric.
+            for prefix in [crop_name, &name].into_iter().flatten() {
+                for r in &mut values {
+                    r.metric = format!("{prefix}_{}", r.metric);
+                }
+            }
+            rows.extend(values.iter().map(|r| Measurement {
+                boot_id: main.boot,
+                capture_id: Some(main.id),
+                metric: r.metric.clone(),
+                value: Some(r.value),
+                unit: Some(r.unit.into()),
+                state_label: label.clone(),
+                method_family: "screenshot".into(),
+                tag: Tag::M,
+                run_id: run.clone(),
+                note: Some(row_note.clone()),
+                extraction_id: None,
+                world: None,
+            }));
+            let region = json!([region.x, region.y, region.width, region.height]);
+            let mut entry =
+                json!({"capture": main.id, "crop": crop_name, "region": region, "values": values});
+            if non_finite > 0 {
+                entry["non_finite"] = json!(non_finite);
+            }
+            table_rows.push(entry);
         }
-    }
-    let non_finite = main.image.non_finite(region)?;
-    if non_finite > 0 {
-        about.push(format!(
-            "{non_finite} pixels with a NaN or infinity left out"
-        ));
-    }
-    about.extend(note);
-    call.lap("metrics");
-    let note = about.join("; ");
-    if let Some(n) = &name {
-        for r in &mut rows {
-            r.metric = format!("{n}_{}", r.metric);
-        }
+        call.lap_sum("metrics");
     }
     let ids = ledger
         .atomic(|l| {
             rows.iter()
-                .map(|r| {
-                    l.add_measurement(&Measurement {
-                        boot_id: main.boot,
-                        capture_id: Some(main.id),
-                        metric: r.metric.clone(),
-                        value: Some(r.value),
-                        unit: Some(r.unit.into()),
-                        state_label: label.clone(),
-                        method_family: "screenshot".into(),
-                        tag: Tag::M,
-                        run_id: run.clone(),
-                        note: Some(note.clone()),
-                        extraction_id: None,
-                        world: None,
-                    })
-                })
+                .map(|m| l.add_measurement(m))
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(session::ledger_error)?;
@@ -356,19 +485,20 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
     }
     call.lap("ledger");
     let mut fields = Map::new();
-    fields.insert(
-        "capture".into(),
-        json!({"id": main.id, "path": main.path, "method": main.method, "encoding": main.image.encoding(),
-               "size": [main.image.width(), main.image.height()]}),
-    );
-    fields.insert(
-        "crop".into(),
-        json!([region.x, region.y, region.width, region.height]),
-    );
+    if table {
+        fields.insert("captures".into(), json!(listed));
+        fields.extend(compared);
+        fields.insert("table".into(), json!(table_rows));
+        return Ok(fields);
+    }
+    // One capture and one crop: today's fields.
+    let mut row = table_rows.remove(0);
+    fields.insert("capture".into(), listed.remove(0));
+    fields.insert("crop".into(), row["region"].take());
     fields.extend(compared);
-    fields.insert("values".into(), json!(rows));
-    if non_finite > 0 {
-        fields.insert("non_finite".into(), json!(non_finite));
+    fields.insert("values".into(), row["values"].take());
+    if let Some(n) = row.get("non_finite") {
+        fields.insert("non_finite".into(), n.clone());
     }
     Ok(fields)
 }
@@ -664,5 +794,124 @@ pub(crate) mod tests {
             "{out}"
         );
         assert_eq!(db(&fx, "SELECT count(*) FROM measurements"), [[json!(0)]]);
+    }
+
+    /// Boot 370's ask (19 calls for four boxes on six stills): captures and named crops in one call, answered as a table
+    /// whose rows hold what one call per capture and crop gives, the ledger's metrics named <name>_<crop>_<metric>. Every
+    /// capture's row is checked before a file is read, and any refusal writes nothing.
+    #[test]
+    fn captures_and_named_crops_answer_as_a_table() {
+        let fx = Fake::new("image-table");
+        let px = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [128, 128, 128]];
+        let png = |px: &[[u8; 3]]| srgb8(2, 2, px);
+        let a = stored(
+            &fx,
+            "A1.png",
+            &png(&px),
+            "printwindow",
+            Some(Encoding::Srgb8),
+        );
+        let b = stored(
+            &fx,
+            "B1.png",
+            &png(&[[10; 3]; 4]),
+            "printwindow",
+            Some(Encoding::Srgb8),
+        );
+        let changed = stored(
+            &fx,
+            "C1.png",
+            &png(&px),
+            "printwindow",
+            Some(Encoding::Srgb8),
+        );
+        fs::write(fx.dir.join("data/captures/s1/C1.png"), png(&[[0; 3]; 4])).unwrap();
+        let crops = json!([{"name": "top", "crop": [0, 0, 2, 1]}, {"name": "corner", "crop": [1, 1, 1, 1]}]);
+        let ch = json!(["channels"]);
+        let crop = json!([0, 0, 1, 1]);
+        for (args, why) in [
+            // The changed file comes first, the missing capture last: rows are checked before any file is read.
+            (
+                json!({"captures": [changed, 999], "metrics": ch}),
+                "captures[1]: no capture 999",
+            ),
+            (
+                json!({"captures": [changed], "metrics": ch}),
+                "changed since quen wrote it",
+            ),
+            (
+                json!({"capture": a, "captures": [a], "metrics": ch}),
+                "capture or captures",
+            ),
+            (json!({"metrics": ch}), "capture or captures"),
+            (json!({"captures": [], "metrics": ch}), "1 to 32"),
+            (
+                json!({"capture": a, "crop": crop, "crops": crops, "metrics": ch}),
+                "crop or crops",
+            ),
+            (
+                json!({"capture": a, "metrics": ch, "crops": [{"name": "x", "crop": crop}, {"name": "x", "crop": crop}]}),
+                "crop name \"x\" twice",
+            ),
+            (
+                json!({"capture": a, "metrics": ch, "crops": [{"name": "x", "crop": crop, "box": 1}]}),
+                "unknown field",
+            ),
+            (
+                json!({"capture": a, "metrics": ch, "crops": [{"name": "x", "crop": [0, 0, 3, 1]}]}),
+                "capture crop x: crop [0, 0, 3, 1] is empty or leaves the 2x2 frame",
+            ),
+            (
+                json!({"captures": vec![a; 32], "metrics": ch, "crops": [crops[0], crops[1], {"name": "x", "crop": crop}]}),
+                "over 64 rows",
+            ),
+        ] {
+            let out = fx.run("measure_image", args.clone());
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(
+                out["refused"] == true && reason.contains(why),
+                "{args}: {out}"
+            );
+        }
+        assert_eq!(db(&fx, "SELECT count(*) FROM measurements"), [[json!(0)]]);
+
+        let out = fx.run(
+            "measure_image",
+            json!({"captures": [a, b.to_string()], "metrics": ch, "crops": crops, "name": "g"}),
+        );
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["captures"][1]["id"], b, "{out}");
+        assert_eq!(out["captures"][0]["size"], json!([2, 2]), "{out}");
+        let table = out["table"].as_array().unwrap();
+        assert_eq!(
+            table
+                .iter()
+                .map(|r| (r["capture"].clone(), r["crop"].clone()))
+                .collect::<Vec<_>>(),
+            [(a, "top"), (a, "corner"), (b, "top"), (b, "corner")]
+                .map(|(c, n)| (json!(c), json!(n)))
+        );
+        assert_eq!(table[0]["values"][0]["metric"], "g_top_r_srgb8_mean");
+        assert_eq!(table[0]["values"][0]["value"], 127.5);
+        assert_eq!(db(&fx, "SELECT count(*) FROM measurements"), [[json!(36)]]);
+        // Each row is what one call of its capture and crop gives.
+        for row in table {
+            let name = row["crop"].as_str().unwrap();
+            let crop = &crops
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap()["crop"];
+            let one = fx.run(
+                "measure_image",
+                json!({"capture": row["capture"], "metrics": ch, "crop": crop, "name": format!("g_{name}")}),
+            );
+            assert_eq!(
+                (&row["values"], &row["region"]),
+                (&one["values"], &one["crop"]),
+                "{one}"
+            );
+        }
     }
 }

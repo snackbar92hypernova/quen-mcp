@@ -31,7 +31,7 @@
 //! that connection's client forward as `focus` to client does, unless the config's `idle_focus` is off or it can't. The
 //! agent's next call of a tool that needs the game in front brings it back first ([`back`]).
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::protocol::{MAX_NOTICE_MS, Verb};
@@ -174,7 +174,12 @@ pub(crate) struct Status {
     package: OnceCell<Option<&'static str>>,
     /// A sweep_play's measuring line went out in this session: later ones send none, so wait for none.
     pub(crate) swept: Cell<bool>,
+    /// hands_give's note: what the user should do next, in the yours line until hands_take.
+    pub(crate) note: RefCell<Option<String>>,
 }
+
+/// The longest hands_give note, in bytes: the yours line around it stays within a notice's 160.
+pub(crate) const NOTE_MAX: usize = 64;
 
 /// Tools that capture or measure frames: each takes the line down first, so none is sent just before one.
 const CAPTURES: &[&str] = &[
@@ -233,10 +238,13 @@ fn show(
         ),
         false => (None, ONCE),
     };
-    let verb = Verb::Notice {
-        text: state.text(),
-        duration_ms,
+    let text = match st.note.borrow().as_deref() {
+        Some(note) if state == State::Yours => format!(
+            "quen: you have the controls. {note} Then tell the agent in the chat (Alt+Tab)."
+        ),
+        _ => state.text(),
     };
+    let verb = Verb::Notice { text, duration_ms };
     let sent = channel.call(verb, REPLY_MAX);
     // After the call: the game shows the notice on the tick that replies, or, when no reply came, may still show it
     // up to then. A refusal showed nothing; its words are the game's when it gave some.

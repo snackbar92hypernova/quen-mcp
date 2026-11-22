@@ -15,6 +15,7 @@ use quen_core::ledger::Capture;
 use serde_json::{Map, Value, json};
 
 use crate::game::{self, Ctx, Fields, ctx, flag};
+use crate::hands::Hands;
 use crate::session::{self, Call, Done, Session};
 use crate::{doctor, measure, status};
 
@@ -73,7 +74,8 @@ const VERB_S: f64 = 0.2;
 // ponytail: the design's guesses until a live map is timed; replace with the tool's median once plans have run it.
 const MAP_VERB_S: f64 = 0.03;
 const MAP_S: f64 = 0.3;
-/// A measure_image metric: 0.03-1.35 s each on a synthetic 4K frame, a file's decode 0.05-0.11 s (release build).
+/// A measure_image metric, per capture and crop: 0.03-1.35 s each on a synthetic 4K frame, a file's decode 0.05-0.11 s
+/// (release build).
 // ponytail: one timing of synthetic frames; replace with the tool's median once plans have run it.
 const IMAGE_S: f64 = 1.5;
 /// What a step result's table row keeps of a text field (the whole is in the result file).
@@ -82,20 +84,20 @@ const TEXT_MAX: usize = 200;
 pub fn tool() -> Value {
     json!({
         "name": "run_plan",
-        "description": "Run a plan of quen's own tool calls as one call (quen_guide: run_plan). plan: JSON text or an \
-            object {tag, setup, steps, teardown, max_s}; each step {\"<tool>\": {its arguments, no token}} or \
+        "description": "Run quen's own tool calls as one call (quen_guide: run_plan). plan: JSON text or an object \
+            {tag, setup, steps, teardown, max_s}; each step {\"<tool>\": {its arguments, no token}} or \
             {\"wait\": seconds}. Tools: the game_, world_ and measure_ tools a test session calls without the \
-            client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Every step is checked against \
-            its tool's schema before any runs. session_launch again replays setup steps that succeed. A step not ok ends the \
+            client's prompt; no launch, save, hand-over, cleanup, memory patch or focus. Each step is checked against \
+            its tool's schema first. session_launch again replays setup steps that succeed. A step not ok ends the \
             run (aborted); teardown then runs, also after a cancel. A free camera it turned on goes off \
-            (freecam). estimate_s: from measured costs, fade waits left out; refused over max_s (default 600, at most \
-            3600), and over 300 unless wait: false. check: checks and estimate only. Files, each with a \
-            captures row: <tag>-plan.json, <tag>-result.json (every step's envelope). started (UTC) and each step's \
-            start_s (seconds from it). Refused, nothing run: a bad plan or step, a tag taken, the user's \
+            (freecam). estimate_s: measured costs, fade waits left out; refused over max_s (default 600, at most \
+            3600), and over 300 unless wait: false. check: checks and estimate only. Files with captures rows: \
+            <tag>-plan.json, <tag>-result.json (each step's envelope). started (UTC); each step's start_s from it. \
+            Refused, nothing run: a bad plan or step, a tag taken; unless check (then run_refused), the user's \
             controls, a play session.",
         "inputSchema": game::schema(json!({
             "plan": {"type": "string", "description": "the plan: JSON text of {tag, setup, steps, teardown, max_s}"},
-            "check": {"type": "boolean", "description": "true: check and estimate only, run nothing"},
+            "check": {"type": "boolean", "description": "true: check and estimate only, run nothing; also with the user's controls and in a play session"},
         }), &["plan"]),
     })
 }
@@ -366,7 +368,10 @@ fn estimate(tool: &str, args: &Value, exec: bool) -> Result<f64, String> {
         "measure_trace" => num("secs", 30.0) + 0.3 + hide,
         "measure_presentmon" => num("secs", 10.0) + 1.0 + hide,
         "measure_ab" => measure::ab_secs(args, exec).map_err(|e| format!("measure_ab: {e}"))?,
-        "measure_image" => IMAGE_S * args["metrics"].as_array().map_or(1, Vec::len) as f64,
+        "measure_image" => {
+            let n = |key: &str| args[key].as_array().map_or(1, Vec::len) as f64;
+            IMAGE_S * n("metrics") * n("captures") * n("crops")
+        }
         "world_map" => crate::scene::map_calls(args) as f64 * MAP_VERB_S + MAP_S,
         t if t.starts_with("world_") || matches!(t, "game_scriptlog" | "game_listsaves") => READ_S,
         _ => VERB_S,
@@ -484,16 +489,27 @@ fn before(
 fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
     let schemas = crate::mcp::tools();
     let token = json!({"token": args["token"]});
-    let (plan, folder) = {
+    let check = flag(args, "check")?;
+    let (plan, folder, run_refused) = {
         let cx = ctx(session, args, &["plan", "check"])?;
-        if cx.live.play {
-            let why = "run_plan runs in a test session: in a play session the game is the user's";
-            return Err(why.to_string().into());
+        // A check runs nothing, so it answers in a play session and with the user's controls too (boot 370's ask),
+        // saying why a run would be refused; the session thread refuses a run with the user's controls first.
+        let run_refused = match (cx.live.play, cx.hands) {
+            (true, _) => Some(
+                "run_plan runs in a test session: in a play session the game is the user's"
+                    .to_string(),
+            ),
+            (false, Some(Hands::User)) => Some(crate::hands::user_has("run_plan")),
+            _ => None,
+        };
+        if let Some(why) = run_refused.as_ref().filter(|_| !check) {
+            return Err(why.clone().into());
         }
         let exec = doctor::has_exec(doctor::package_version(cx.config));
         (
             parse(args.get("plan"), &schemas, exec)?,
             measure::captures(&cx),
+            run_refused,
         )
     };
     let estimate = (plan.estimate() * 10.0).round() / 10.0;
@@ -533,9 +549,10 @@ fn run(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, D
         ));
     }
     let sha = sha256_hex(plan.canonical.as_bytes());
-    if flag(args, "check")? {
+    if check {
         fields.insert("steps".into(), json!(listed));
         fields.insert("sha256".into(), json!(sha));
+        fields.extend(run_refused.map(|why| ("run_refused".to_string(), json!(why))));
         return Ok(fields);
     }
     if estimate > JOB_S && !call.detached() {
@@ -1127,13 +1144,31 @@ mod tests {
                 {"label": "B", "actions": [{"cvar": "X/Y", "set": 2}]}]}}, {"wait": 1}]});
         let mut check = args(plan);
         check["check"] = json!(true);
-        let out = run(&mut session, check);
+        let out = run(&mut session, check.clone());
         assert_eq!(out["ok"], true, "{out}");
+        assert!(out.get("run_refused").is_none(), "{out}");
         // settime 0.2, 4 windows of 2 + 3 + 0.5 + the status line's 0.5 s hide, each after the line naming its state
         // (0.5 s for the game's answer, and the 1 s its 3 s needs past the settle), the wait 1; and the plan's
         // measuring line, confirmed after 0.5 s, up 5 s before its first window: 0.5 + 4.8 s more after the settime.
         assert_eq!(out["estimate_s"], 36.5, "{out}");
         assert_eq!(out["steps"][1]["est_s"], 30.0, "{out}");
+        // Boot 370's ask: a check also with the user's controls and in a play session, run_refused saying why a run
+        // is refused; the run itself stays refused.
+        for (hands, play, why) in [
+            (Hands::User, false, "the user has the controls"),
+            (Hands::Agent, true, "in a play session"),
+        ] {
+            fx.shared.set_hands(Some(hands));
+            session.live.as_mut().unwrap().play = play;
+            check["check"] = json!(true);
+            let out = run(&mut session, check.clone());
+            let refused = out["run_refused"].as_str().unwrap_or_default();
+            assert!(out["ok"] == true && refused.contains(why), "{out}");
+            check["check"] = json!(false);
+            let out = run(&mut session, check.clone());
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(out["refused"] == true && reason.contains(why), "{out}");
+        }
         assert!(!fx.dir.join("data/captures/s1").exists(), "nothing written");
     }
 }
