@@ -209,6 +209,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "measure_trace" => trace_window(session, call, args),
         "measure_ab" => ab(session, call, args),
         "measure_image" => crate::image::call(session, call, args),
+        "measure_boxes" => crate::capture::boxes(session, call, args),
         _ => Err(Done::Refused(format!("unknown tool {name:?}"))),
     };
     out.map_or_else(|done| done, Done::Ok)

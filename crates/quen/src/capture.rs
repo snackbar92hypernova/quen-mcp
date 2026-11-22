@@ -11,6 +11,10 @@
 //!   PresentMon window. The config's test switch `force_duplication` skips WGC, so a live boot exercises the fallback.
 //! - `renderdoc`: a RenderDoc frame capture in a `renderdoc:NAME` session (profile.rs).
 //!
+//! `hdr` with `count` takes consecutive frames of one WGC session (copies queued as they come, read once the last is
+//! in), and `measure_boxes` holds one for a recording of box means. After the grab, never before it, the rows get the
+//! frame's pose through the game's channel ([`frame_pose`]).
+//!
 //! quen picks the method; the agent can't ask for the screen. Desktop Duplication shows whatever
 //! covers the game too (a toast, an overlay), so it runs only while the game is in front, checked just before and
 //! just after the frame (a frame taken while the focus moved is dropped), and its rows say `includes_desktop`. Every
@@ -25,12 +29,16 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use half::f16;
+use quen_core::bridge_log::VALID;
 use quen_core::hdr::{Encoding, Frame, Pixels};
+use quen_core::image::{BoxFrame, boxes_csv, crop_region, mean_rgb};
 use quen_core::journal::sha256_hex;
-use quen_core::ledger::{Capture, Ledger};
+use quen_core::ledger::{Capture, Ledger, PlayerPose, Pose as PoseRow};
+use quen_core::protocol::Verb;
+use quen_core::trace::Body;
 use serde_json::{Map, Value, json};
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -78,44 +86,62 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, LWA_ALPHA,
-    PW_RENDERFULLCONTENT, SW_SHOWNOACTIVATE, SetLayeredWindowAttributes, ShowWindow, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, LWA_ALPHA, MSG, PM_REMOVE, PW_RENDERFULLCONTENT, PeekMessageW,
+    SW_SHOWNOACTIVATE, SetLayeredWindowAttributes, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
-use crate::game::{self, Fields};
+use crate::game::{self, Ctx, Fields};
 use crate::session::{self, Call, Done, Session};
 
 /// grab.py's settle after showing the pin: a few frames for DWM to compose.
 const PIN_SETTLE: Duration = Duration::from_millis(250);
-/// How long a capture API may take to hand over its first frame.
+/// How long a capture API may take to hand over its first frame (WGC: also each next one).
 const FRAME_WAIT: Duration = Duration::from_secs(2);
+/// game_screenshot count: at most this many frames, holding at most this many bytes (8 a pixel) in memory until the
+/// last: 32 frames at 4K.
+const BURST_MAX: usize = 32;
+const BURST_BYTES: u64 = 1 << 31;
+/// A burst's and a recording's WGC pool: one buffer more than a single shot's, so a frame still held doesn't drop the
+/// next.
+const POOL: i32 = 3;
+/// How long each read of a frame's pose may wait: the game answers on its next tick.
+const POSE_WAIT: Duration = Duration::from_millis(500);
+/// measure_boxes: at most this many boxes, seconds and frames.
+const BOXES_MAX: usize = 16;
+const RECORD_SECS_MAX: f64 = 600.0;
+const RECORD_FRAMES_MAX: u64 = 100_000;
+/// measure_boxes: the frames whose box copies are in flight before the oldest is read, so a read never waits on its
+/// copy.
+const RING: usize = 4;
 
 /// The `tools/list` entry.
 pub fn tool() -> Value {
     json!({
         "name": "game_screenshot",
         "description": "One frame of the game's window (found from the session's job, never by title) into the \
-            session's capture folder, a ledger capture row per file. method sdr (default): an 8-bit sRGB PNG (srgb8), \
+            session's capture folder, a captures row per file. method sdr (default): an 8-bit sRGB PNG (srgb8), \
             clipped on an HDR display: for OCR, UI checks and SDR A/B. method hdr: Windows.Graphics.Capture in FP16 \
             (wgc_fp16), written as a 16-bit PQ BT.2020 PNG with cICP (pq_bt2020_u16: code values), with npy also \
-            as a .npy (scrgb_f16). If WGC fails (wgc_error says why), quen falls back to Desktop \
+            a .npy (scrgb_f16). If WGC fails (wgc_error says why), quen falls back to Desktop \
             Duplication of the game's screen area (desktop_duplication, includes_desktop true: an overlay can \
             show), only while the game is in front; a focus change drops the frame and refuses. method renderdoc / ngfx: \
-            one RenderDoc / Nsight Graphics capture, minutes (see method). Compare only captures of one method, \
-            encoding and display state \
-            (each row records them). Refused, nothing changed: wrong token, the tag taken in this session, no visible \
-            game window, no frame; with needs: method hdr while HDR is off (take sdr).",
+            see method. count: a burst. The rows' pose_id and frame_state: see tag. Compare only captures of one \
+            method, encoding and display state (each row records them). Refused, nothing changed: wrong token, the tag \
+            taken in this session, no visible game window, no frame; with needs: method hdr while HDR is off (take sdr).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "token": {"type": "string", "description": "the token session_launch returned"},
-                "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "the file name, unique in the session (A1, B2, ...)"},
+                "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "the file name, unique in the session (A1, B2, ...). After the grab, the rows get pose_id, a poses row <session>/<its first file's name> (the camera as game_camera reads it, the player as world_get), and frame_state time (the game time) and photo, read through the game's channel (up to 0.5 s a read); null when it doesn't answer"},
                 "method": {"type": "string", "enum": ["sdr", "hdr", "renderdoc", "ngfx"], "description": "default sdr. renderdoc, only in a session launched with profiler renderdoc:NAME: one RenderDoc capture (F12) as <capture root>\\<boot>\\<tag>.rdc (3-5 GB; 12 GB free needed), the game in front; it sends nothing more and returns once the capture is written (up to minutes: the game freezes while RenderDoc writes it), never without the Streamline swap in place. ngfx, only in a session launched with profiler ngfx-capture:NAME: one Nsight Graphics capture (F11) as <capture root>\\<boot>\\<NAME>\\<tag>.ngfx-capture (moved there when Nsight wrote it into its own folder: moved_from), the game in front; it sends nothing more and returns once the file holds still (up to minutes), with its captures row (kind ngfx-capture: ngfx_extract takes its capture_id) and the capture root's total (capture_root_gb). Refused while the capture root is over capture_budget_gb or under 12 GB free, unless user_ok"},
                 "user_ok": {"type": "boolean", "description": "method ngfx only: true only after telling the user that the capture root is over its budget or low on space and that a capture can take several GB, and they agreed"},
                 "npy": {"type": "boolean", "description": "method hdr only: true also writes a float16 .npy of linear scRGB as captured (scrgb_f16, 1.0 = 80 nits; 66 MB at 4K); default false, the PNG alone"},
+                "count": {"type": "integer", "minimum": 2, "maximum": BURST_MAX, "description": "method hdr only: that many consecutive frames of one Windows.Graphics.Capture session (no fallback), held in memory until the last (8 bytes a pixel, at most 2 GiB: 32 at 4K), then written as <tag>-00, <tag>-01, ... (frame_state frame, present_ms); present_ms: each frame's present time after the first's"},
+                "mean": {"type": "boolean", "description": "with count: write the frames' per-pixel mean of linear scRGB instead, as <tag> (method wgc_fp16_mean; frame_state frames, present_ms)"},
             },
             "required": ["token", "tag"],
             "additionalProperties": false,
@@ -133,16 +159,16 @@ struct Shot {
     user_ok: bool,
     /// method hdr: the `.npy` too.
     npy: bool,
+    /// method hdr: a burst of this many frames of one WGC session.
+    count: Option<usize>,
+    /// With count: their mean instead of each frame.
+    mean: bool,
 }
 
 impl Shot {
     /// The arguments besides the token, which `game::ctx` checks.
     fn parse(args: &Value) -> Result<Shot, String> {
-        let tag = game::text(args, "tag")?;
-        let fine = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-        if tag.is_empty() || tag.len() > 64 || !tag.chars().all(fine) {
-            return Err("tag: 1-64 letters, digits, _ or - (it names the file)".into());
-        }
+        let tag = tag_of(args)?;
         let (hdr, renderdoc, ngfx) = match args.get("method").map(Value::as_str) {
             None | Some(Some("sdr")) => (false, false, false),
             Some(Some("hdr")) => (true, false, false),
@@ -160,6 +186,22 @@ impl Shot {
             Some(_) if !hdr => return Err("npy goes with method hdr".into()),
             Some(v) => v.as_bool().ok_or("npy must be true or false")?,
         };
+        let count = match args.get("count") {
+            None => None,
+            Some(_) if !hdr => return Err("count goes with method hdr".into()),
+            Some(v) => Some(
+                v.as_u64()
+                    .filter(|n| (2..=BURST_MAX as u64).contains(n))
+                    .ok_or(format!(
+                        "count must be a whole number from 2 to {BURST_MAX}"
+                    ))? as usize,
+            ),
+        };
+        let mean = match args.get("mean") {
+            None => false,
+            Some(_) if count.is_none() => return Err("mean goes with count".into()),
+            Some(v) => v.as_bool().ok_or("mean must be true or false")?,
+        };
         Ok(Shot {
             tag: tag.into(),
             hdr,
@@ -167,6 +209,8 @@ impl Shot {
             ngfx,
             user_ok,
             npy,
+            count,
+            mean,
         })
     }
 
@@ -174,10 +218,48 @@ impl Shot {
     fn extensions(&self) -> &'static [&'static str] {
         if self.npy { &["npy", "png"] } else { &["png"] }
     }
+
+    /// The names its files take, before the extension: the tag, or a burst's frames `<tag>-00`, `<tag>-01`, ...
+    fn names(&self) -> Vec<String> {
+        match self.count {
+            Some(n) if !self.mean => (0..n).map(|i| format!("{}-{i:02}", self.tag)).collect(),
+            _ => vec![self.tag.clone()],
+        }
+    }
+}
+
+/// The `tag` argument: 1-64 letters, digits, _ or -.
+fn tag_of(args: &Value) -> Result<&str, String> {
+    let tag = game::text(args, "tag")?;
+    let fine = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if tag.is_empty() || tag.len() > 64 || !tag.chars().all(fine) {
+        return Err("tag: 1-64 letters, digits, _ or - (it names the file)".into());
+    }
+    Ok(tag)
+}
+
+/// Refuses a burst of `count` frames of the window `rect` over [`BURST_BYTES`].
+fn burst_fits(count: usize, rect: &RECT) -> Result<(), String> {
+    let px = (rect.right - rect.left).max(0) as u64 * (rect.bottom - rect.top).max(0) as u64;
+    let most = (BURST_BYTES / (px * 8).max(1)).min(BURST_MAX as u64);
+    match count as u64 <= most {
+        true => Ok(()),
+        false => Err(format!(
+            "count {count}: a {}x{} window's frames take {:.2} GB in memory, over {:.2} GB; at most {most} here",
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            (count as u64 * px * 8) as f64 / 1e9,
+            BURST_BYTES as f64 / 1e9
+        )),
+    }
 }
 
 pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["tag", "method", "user_ok", "npy"])?;
+    let cx = game::ctx(
+        session,
+        args,
+        &["tag", "method", "user_ok", "npy", "count", "mean"],
+    )?;
     let shot = Shot::parse(args)?;
     if shot.renderdoc {
         return crate::profile::capture(&cx, call, &shot.tag);
@@ -187,29 +269,25 @@ pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Re
     }
     let root = cx.config.capture_root();
     // Windows' separator, so the artifact's absolute path has one kind; the ledger stores `/` either way.
-    let rel = |ext: &str| format!("{}\\{}.{ext}", cx.live.id, shot.tag);
-    if let Some(taken) = shot
-        .extensions()
-        .iter()
-        .map(|ext| root.join(rel(ext)))
-        .find(|p| p.exists())
-    {
-        let why = format!(
-            "{} exists: tag {:?} is taken in this session",
-            taken.display(),
-            shot.tag
-        );
-        return Err(why.into());
-    }
+    let rel = |name: &str, ext: &str| format!("{}\\{name}.{ext}", cx.live.id);
+    taken(&root, &rel, &shot.names(), shot.extensions(), &shot.tag)?;
     let pids = cx.live.job.pids().unwrap_or_default();
     let _dpi = Dpi::per_monitor();
     let (window, rect) = game_window(&pids)?;
+    if let Some(count) = shot.count {
+        burst_fits(count, &rect)?;
+        if cx.config.force_duplication {
+            let why = "count needs Windows.Graphics.Capture, which force_duplication in the local config (a test \
+                       switch) skips";
+            return Err(why.to_string().into());
+        }
+    }
     if call.stopped() {
         return Err(Done::Refused(
             "cancelled before anything was changed".into(),
         ));
     }
-    let ledger =
+    let mut ledger =
         Ledger::open(cx.config.state_dir().join("quen.db")).map_err(|e| format!("ledger: {e}"))?;
     call.lap("check");
     crate::status::hide(&cx, call, false).map_err(Done::Refused)?;
@@ -225,61 +303,692 @@ pub(crate) fn screenshot(session: &Session, call: &mut Call, args: &Value) -> Re
     let pin = Pin::show(&rect).map_err(|e| format!("pin window: {e}"))?;
     sleep(PIN_SETTLE);
     call.lap("pin");
-    let grabbed = grab(
-        &shot,
-        window,
-        &rect,
-        &|| in_front(&pids),
-        cx.config.force_duplication,
-    );
-    let at = session::now() as i64;
-    drop(pin);
-    call.lap("grab");
-    let Grab {
-        image,
-        method,
-        wgc_error,
-    } = grabbed.map_err(|why| format!("grab failed, nothing written: {why}"))?;
-    let includes_desktop = method == DESKTOP_DUPLICATION;
-    let files =
-        encode(image, shot.npy).map_err(|why| format!("{method}: {why}; nothing written"))?;
-    call.lap("encode");
-    let t = ledger
-        .utc(at)
-        .map_err(|e| format!("ledger: {e}; nothing written"))?;
-    let row = Capture {
+    let row = |method: &str, state: Map<String, Value>, pose_id, t| Capture {
         boot_id: Some(cx.live.boot),
         method: Some(method.into()),
         includes_overlay: Some(true),
-        includes_desktop: Some(includes_desktop),
+        includes_desktop: Some(method == DESKTOP_DUPLICATION),
         display_state: Some(display.clone()),
+        frame_state: (!state.is_empty()).then_some(state),
+        pose_id,
         t,
         ..Capture::default()
     };
-    let (stored, failed) = store(&root, &rel, files, &row, ledger);
-    call.lap("store");
-    let mut captures = Vec::new();
-    for s in &stored {
-        let path = root.join(&s.rel);
-        call.artifact(&path);
-        captures.push(json!({"path": path, "encoding": s.encoding, "id": s.id}));
-        if let Some(id) = s.id {
-            call.row("captures", id);
-        }
-    }
     let mut fields = Map::new();
+    let (captures, failed) = match shot.count {
+        None => {
+            let grabbed = grab(
+                &shot,
+                window,
+                &rect,
+                &|| in_front(&pids),
+                cx.config.force_duplication,
+            );
+            let at = session::now() as i64;
+            drop(pin);
+            call.lap("grab");
+            let Grab {
+                image,
+                method,
+                wgc_error,
+            } = grabbed.map_err(|why| format!("grab failed, nothing written: {why}"))?;
+            let (pose_id, state) = posed(&cx, call, &mut ledger, &shot.tag);
+            let files = encode(image, shot.npy)
+                .map_err(|why| format!("{method}: {why}; nothing written"))?;
+            call.lap("encode");
+            let t = ledger
+                .utc(at)
+                .map_err(|e| format!("ledger: {e}; nothing written"))?;
+            let row = row(method, state, pose_id, t);
+            let name = |ext: &str| rel(&shot.tag, ext);
+            let (stored, failed) = store(&root, &name, files, &row, &mut ledger);
+            call.lap("store");
+            fields.insert("method".into(), json!(method));
+            fields.insert(
+                "includes_desktop".into(),
+                json!(method == DESKTOP_DUPLICATION),
+            );
+            if let Some(why) = wgc_error {
+                fields.insert("wgc_error".into(), json!(why));
+            }
+            (listed(call, &root, &stored, &Map::new()), failed)
+        }
+        Some(count) => {
+            let d3d = D3d::for_window(window).map_err(|e| format!("D3D11: {e}"))?;
+            let grabbed = d3d.burst(window, count);
+            let at = session::now() as i64;
+            drop(pin);
+            call.lap("grab");
+            let (frames, size) = grabbed.map_err(|e| {
+                format!("grab failed, nothing written: Windows.Graphics.Capture (no fallback with count): {e}")
+            })?;
+            let (pose_id, state) = posed(&cx, call, &mut ledger, &shot.names()[0]);
+            let t = ledger
+                .utc(at)
+                .map_err(|e| format!("ledger: {e}; nothing written"))?;
+            let method = if shot.mean { WGC_FP16_MEAN } else { WGC_FP16 };
+            let present = present_ms(frames.iter().map(|f| f.1));
+            let row = row(method, state, pose_id, t);
+            fields.insert("method".into(), json!(method));
+            fields.insert("includes_desktop".into(), json!(false));
+            fields.insert("present_ms".into(), json!(present));
+            let out = burst_files(
+                call,
+                &shot,
+                &d3d,
+                frames,
+                size,
+                &present,
+                &row,
+                &mut ledger,
+                &root,
+                &rel,
+            )?;
+            call.lap("store");
+            out
+        }
+    };
     fields.insert("captures".into(), json!(captures));
-    fields.insert("method".into(), json!(method));
-    fields.insert("includes_desktop".into(), json!(includes_desktop));
-    if let Some(why) = wgc_error {
-        fields.insert("wgc_error".into(), json!(why));
-    }
     fields.insert(
         "window".into(),
         json!([rect.right - rect.left, rect.bottom - rect.top]),
     );
     fields.insert("display_state".into(), json!(display));
     match failed {
+        None => Ok(fields),
+        Some(why) => Err(Done::Failed(why, fields)),
+    }
+}
+
+/// Refuses when a file of `names` with one of `exts` exists: `tag` is taken in this session.
+fn taken(
+    root: &Path,
+    rel: &dyn Fn(&str, &str) -> String,
+    names: &[String],
+    exts: &[&str],
+    tag: &str,
+) -> Result<(), String> {
+    for name in names {
+        for ext in exts {
+            let path = root.join(rel(name, ext));
+            if path.exists() {
+                return Err(format!(
+                    "{} exists: tag {tag:?} is taken in this session",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stored files in the envelope (artifacts, captures rows) and as the result's `captures`, each with `extra`.
+fn listed(
+    call: &mut Call,
+    root: &Path,
+    stored: &[Stored],
+    extra: &Map<String, Value>,
+) -> Vec<Value> {
+    let mut captures = Vec::new();
+    for s in stored {
+        let path = root.join(&s.rel);
+        call.artifact(&path);
+        if let Some(id) = s.id {
+            call.row("captures", id);
+        }
+        let mut c = Map::from_iter([
+            ("path".to_string(), json!(path)),
+            ("encoding".into(), json!(s.encoding)),
+            ("id".into(), json!(s.id)),
+        ]);
+        c.extend(extra.clone());
+        captures.push(Value::Object(c));
+    }
+    captures
+}
+
+/// Present times (QPC, in 100 ns) as ms after the first, to the microsecond.
+fn present_ms(times: impl Iterator<Item = i64>) -> Vec<f64> {
+    let mut first = None;
+    times
+        .map(|t| {
+            let t0 = *first.get_or_insert(t);
+            ((t - t0) as f64 / 10.0).round() / 1000.0
+        })
+        .collect()
+}
+
+/// A burst's files once grabbed: each frame's as `<tag>-<nn>`, or with mean the frames' per-pixel mean's as `<tag>`;
+/// each frame's rows `row` with frame and present_ms (the mean's: frames and present_ms) added to its frame state.
+/// The result's captures, and why it stopped if it did (a cancel between frames, a store that failed). Err, nothing
+/// written: the first file couldn't be made.
+#[allow(clippy::too_many_arguments)]
+fn burst_files(
+    call: &mut Call,
+    shot: &Shot,
+    d3d: &D3d,
+    frames: Staged,
+    [w, h]: [u32; 2],
+    present: &[f64],
+    row: &Capture,
+    ledger: &mut Ledger,
+    root: &Path,
+    rel: &dyn Fn(&str, &str) -> String,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    let with = |more: [(&str, Value); 2]| Capture {
+        frame_state: Some(
+            row.frame_state
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(more.map(|(k, v)| (k.to_string(), v)))
+                .collect(),
+        ),
+        ..row.clone()
+    };
+    let n = frames.len();
+    if shot.mean {
+        let failed = |why: String| format!("the mean: {why}; nothing written");
+        let mut sum = vec![0f32; w as usize * h as usize * 4];
+        for (staging, _) in &frames {
+            let halves = d3d.map(staging, w, h).map_err(|e| failed(e.to_string()))?;
+            for (s, v) in sum.iter_mut().zip(halves) {
+                *s += v.to_f32();
+            }
+        }
+        drop(frames);
+        let mean = Image {
+            width: w,
+            height: h,
+            pixels: Px::ScrgbF16(sum.iter().map(|s| f16::from_f32(s / n as f32)).collect()),
+        };
+        let files = encode(mean, shot.npy).map_err(failed)?;
+        let row = with([("frames", json!(n)), ("present_ms", json!(present))]);
+        let name = |ext: &str| rel(&shot.tag, ext);
+        let (stored, failed) = store(root, &name, files, &row, ledger);
+        return Ok((listed(call, root, &stored, &Map::new()), failed));
+    }
+    let mut captures = Vec::new();
+    for (i, (staging, _)) in frames.into_iter().enumerate() {
+        if call.stopped() {
+            let why = format!("{} after {i} of {n} frames were written", call.stop_cause());
+            return Ok((captures, Some(why)));
+        }
+        let files = match staged_files(d3d, &staging, [w, h], shot.npy) {
+            Ok(files) => files,
+            Err(why) if i == 0 => return Err(format!("frame 0: {why}; nothing written")),
+            Err(why) => return Ok((captures, Some(format!("frame {i}: {why}")))),
+        };
+        let row = with([("frame", json!(i)), ("present_ms", json!(present[i]))]);
+        let name = format!("{}-{i:02}", shot.tag);
+        let (stored, failed) = store(root, &|ext| rel(&name, ext), files, &row, ledger);
+        let extra = Map::from_iter([("frame".to_string(), json!(i))]);
+        captures.extend(listed(call, root, &stored, &extra));
+        if failed.is_some() {
+            return Ok((captures, failed));
+        }
+        call.progress(&format!("frame {} of {n} written", i + 1));
+    }
+    Ok((captures, None))
+}
+
+/// A staging texture's FP16 frame, encoded as method hdr writes it.
+fn staged_files(
+    d3d: &D3d,
+    staging: &ID3D11Texture2D,
+    [w, h]: [u32; 2],
+    npy: bool,
+) -> Result<Vec<Encoded>, String> {
+    let halves = d3d.map(staging, w, h).map_err(|e| e.to_string())?;
+    let image = Image {
+        width: w,
+        height: h,
+        pixels: Px::ScrgbF16(halves),
+    };
+    encode(image, npy)
+}
+
+/// What the game says of the frame just grabbed, through its channel, each read waited for up to [`POSE_WAIT`], only
+/// with a loaded game in quen's state: the camera (cam.get, as game_camera reads it) and the player (world.get, as
+/// world_get reads it) as a poses row named `name`, and for frame_state `photo` (the camera is photo mode's) and `time`
+/// (the game time). What doesn't answer is left out; no pose without the camera.
+fn frame_pose(cx: &Ctx, name: &str) -> (Option<PoseRow>, Map<String, Value>) {
+    let mut state = Map::new();
+    if cx.last_flags().is_none_or(|f| f & VALID == 0) {
+        return (None, state);
+    }
+    let read = |verb| cx.channel().ok()?.call(verb, POSE_WAIT).ok();
+    let Some((camera, cam)) = read(Verb::CamGet {}).and_then(|r| crate::camera::read_back(&r).ok())
+    else {
+        return (None, state);
+    };
+    state.insert("photo".into(), json!(camera == "photomode"));
+    let world = read(Verb::WorldGet {})
+        .and_then(|r| r.data)
+        .unwrap_or_default();
+    if world["time"].is_object() {
+        state.insert("time".into(), world["time"].clone());
+    }
+    let player = Body::player(&world).ok().map(|p| PlayerPose {
+        position: p.pos,
+        yaw: Some(p.heading),
+    });
+    let pose = PoseRow {
+        name: name.into(),
+        camera: cam.pos,
+        rotation: cam.rot,
+        fov: cam.fov,
+        player,
+        save_id: None,
+        ref_capture_id: None,
+    };
+    (Some(pose), state)
+}
+
+/// [`frame_pose`] of the capture whose first file is `<session>\<name>.<ext>`: its pose, named `<session>/<name>`
+/// (unique, as the file is), added to the ledger (on the call's rows; None when not read or not added), and the frame
+/// state.
+fn posed(
+    cx: &Ctx,
+    call: &mut Call,
+    ledger: &mut Ledger,
+    name: &str,
+) -> (Option<i64>, Map<String, Value>) {
+    let (pose, state) = frame_pose(cx, &format!("{}/{name}", cx.live.id));
+    let id = pose.and_then(|p| ledger.add_pose(&p).ok());
+    if let Some(id) = id {
+        call.row("poses", id);
+    }
+    call.lap("pose");
+    (id, state)
+}
+
+/// measure_boxes' `tools/list` entry.
+pub fn boxes_tool() -> Value {
+    let unit = json!({"type": "number", "minimum": 0, "maximum": 1, "description": "a fraction"});
+    json!({
+        "name": "measure_boxes",
+        "description": "Record named boxes' means on every frame the game presents: one Windows.Graphics.Capture \
+            session of the game's own window (found from the session's job; no other window shows) in FP16, for secs or frames. Writes \
+            <capture root>\\<session>\\<tag>-boxes.csv: frame, present_ms (after the first frame's) and per box \
+            <name>_r, _g, _b, the mean of linear scRGB as captured (values: scrgb, 1.0 = 80 nits, BT.709; pixels \
+            with a NaN or infinity left out, non_finite counts them; empty: none left); a captures row (method \
+            wgc_boxes, frame_state boxes, frames, values) with the pose as game_screenshot's, read after the last \
+            frame; with images also <tag>-first.png and <tag>-last.png as game_screenshot method hdr writes. Refused, \
+            nothing written: wrong token, the tag taken in this session, a bad box, no visible game window, WGC \
+            unavailable (no fallback), no first frame within 2 s. Failed, the frames so far written: a cancel \
+            (job_cancel), no frame within 2 s, the window resized.",
+        "inputSchema": game::schema(json!({
+            "tag": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "names the files, unique in the session"},
+            "boxes": {"type": "array", "minItems": 1, "maxItems": BOXES_MAX, "description": "the boxes, names unique", "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,39}$", "description": "its columns' prefix"},
+                    "box": {"type": "array", "minItems": 4, "maxItems": 4, "items": unit, "description": "[x, y, width, height] in fractions of the window from its top-left, each edge rounded to a pixel, as measure_image's crop_unit fraction"},
+                },
+                "required": ["name", "box"],
+                "additionalProperties": false,
+            }},
+            "secs": {"type": "number", "minimum": 0, "maximum": RECORD_SECS_MAX, "description": "how long after the first frame's present time, above 0: the first frame at or past it is the last; or frames"},
+            "frames": {"type": "integer", "minimum": 1, "maximum": RECORD_FRAMES_MAX, "description": "how many frames; or secs"},
+            "images": {"type": "boolean", "description": "also the first and the last frame as images (the last only when the recording reached its end); default false"},
+        }), &["tag", "boxes"]),
+    })
+}
+
+/// How long a recording runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Until {
+    /// Seconds from the first frame's present time.
+    Secs(f64),
+    Frames(u64),
+}
+
+/// A checked measure_boxes request.
+#[derive(Debug)]
+struct Record {
+    tag: String,
+    /// Each box's name and [x, y, width, height] in fractions of the window.
+    boxes: Vec<(String, [f64; 4])>,
+    until: Until,
+    images: bool,
+}
+
+impl Record {
+    /// The arguments besides the token, which `game::ctx` checks.
+    fn parse(args: &Value) -> Result<Record, String> {
+        let tag = tag_of(args)?.to_string();
+        let given = args["boxes"]
+            .as_array()
+            .filter(|b| (1..=BOXES_MAX).contains(&b.len()))
+            .ok_or(format!("boxes: 1 to {BOXES_MAX} of {{name, box}}"))?;
+        let mut boxes: Vec<(String, [f64; 4])> = Vec::new();
+        for b in given {
+            let map = b.as_object().ok_or("a box is {name, box}")?;
+            if let Some(key) = map.keys().find(|k| *k != "name" && *k != "box") {
+                return Err(format!("a box: unknown field {key:?}"));
+            }
+            let name = b["name"]
+                .as_str()
+                .filter(|n| crate::image::name_ok(n))
+                .ok_or("a box's name: 1-40 of a-z, 0-9 and _, from a letter")?;
+            if boxes.iter().any(|(n, _)| n == name) {
+                return Err(format!("box name {name:?} twice"));
+            }
+            let fractions = b["box"]
+                .as_array()
+                .filter(|a| a.len() == 4)
+                .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .ok_or(format!("box {name}: [x, y, width, height] in fractions"))?;
+            // Inside the window at any size; whether it holds a pixel is checked at the window's.
+            crop_region(1 << 16, 1 << 16, Some(fractions), true)
+                .map_err(|e| format!("box {name}: {e}"))?;
+            boxes.push((name.into(), fractions));
+        }
+        let until = match (args.get("secs"), args.get("frames")) {
+            (Some(s), None) => Until::Secs(
+                s.as_f64()
+                    .filter(|s| *s > 0.0 && *s <= RECORD_SECS_MAX)
+                    .ok_or(format!(
+                        "secs must be a number above 0, at most {RECORD_SECS_MAX}"
+                    ))?,
+            ),
+            (None, Some(f)) => Until::Frames(
+                f.as_u64()
+                    .filter(|f| (1..=RECORD_FRAMES_MAX).contains(f))
+                    .ok_or(format!(
+                        "frames must be a whole number from 1 to {RECORD_FRAMES_MAX}"
+                    ))?,
+            ),
+            _ => return Err("give secs or frames, one of them".into()),
+        };
+        Ok(Record {
+            tag,
+            boxes,
+            until,
+            images: game::flag(args, "images")?,
+        })
+    }
+}
+
+/// What a recording read: each frame's present time (QPC, in 100 ns) and box means, the pixels left out, why it
+/// ended early, and the last frame's index when its image was copied (the recording reached its end).
+#[derive(Default)]
+struct Recorded {
+    times: Vec<i64>,
+    means: Vec<Vec<Option<[f64; 3]>>>,
+    non_finite: usize,
+    stopped: Option<String>,
+    last: Option<usize>,
+}
+
+/// measure_boxes' frames on a started session: each frame's boxes copied into a ring slot and read [`RING`] - 1
+/// frames later; with `full`, the first and the last frame copied whole. Until `until`'s end, a cancel, a frame not
+/// within [`FRAME_WAIT`] or a resized window (`stopped`, the frames so far kept). Err: no first frame.
+fn record(
+    d3d: &D3d,
+    wgc: &Wgc,
+    call: &Call,
+    until: Until,
+    regions: &[quen_core::hdr::Region],
+    ring: &[Vec<ID3D11Texture2D>],
+    full: Option<&[ID3D11Texture2D; 2]>,
+) -> Result<Recorded, String> {
+    let [w, h] = wgc.size;
+    let mut out = Recorded::default();
+    // The box means of the frame whose copies are in ring slot `slot`.
+    let read = |slot: usize, out: &mut Recorded| -> windows::core::Result<()> {
+        let mut means = Vec::new();
+        for (staging, r) in ring[slot].iter().zip(regions) {
+            let (mean, odd) = mean_rgb(&d3d.map(staging, r.width, r.height)?);
+            out.non_finite += odd;
+            means.push(mean);
+        }
+        out.means.push(means);
+        Ok(())
+    };
+    loop {
+        let i = out.times.len();
+        if call.stopped() {
+            out.stopped = Some(format!("{} after {i} frames", call.stop_cause()));
+            break;
+        }
+        pump();
+        let frame = match wgc.next() {
+            Ok(frame) => frame,
+            Err(e) if i == 0 => return Err(format!("no frame within 2 s: {e}")),
+            Err(e) => {
+                out.stopped = Some(format!("no frame within 2 s after {i} frames: {e}"));
+                break;
+            }
+        };
+        if frame.size != wgc.size {
+            out.stopped = Some(format!(
+                "{} after {i} frames",
+                resized(frame.size, wgc.size).message()
+            ));
+            break;
+        }
+        for (staging, r) in ring[i % RING].iter().zip(regions) {
+            d3d.copy(&frame.texture, staging, r.x, r.y, r.width, r.height);
+        }
+        let end = match until {
+            Until::Frames(n) => i as u64 + 1 >= n,
+            Until::Secs(s) => out
+                .times
+                .first()
+                .is_some_and(|t0| (frame.t - t0) as f64 / 1e7 >= s),
+        };
+        if let Some(full) = full {
+            if i == 0 {
+                d3d.copy(&frame.texture, &full[0], 0, 0, w, h);
+            }
+            if end {
+                d3d.copy(&frame.texture, &full[1], 0, 0, w, h);
+                out.last = Some(i);
+            }
+        }
+        out.times.push(frame.t);
+        drop(frame);
+        if i + 1 >= RING
+            && let Err(e) = read((i + 1 - RING) % RING, &mut out)
+        {
+            out.stopped = Some(format!("reading frame {}'s boxes: {e}", i + 1 - RING));
+            break;
+        }
+        call.progress(&format!("{} frames", i + 1));
+        if end {
+            break;
+        }
+    }
+    // The frames still in the ring.
+    while out.means.len() < out.times.len() {
+        let j = out.means.len();
+        if let Err(e) = read(j % RING, &mut out) {
+            out.stopped
+                .get_or_insert(format!("reading frame {j}'s boxes: {e}"));
+            break;
+        }
+    }
+    out.times.truncate(out.means.len());
+    out.last = out.last.filter(|i| *i < out.means.len());
+    Ok(out)
+}
+
+/// Dispatches this thread's window messages: the pin's, so a long recording doesn't leave it unresponsive.
+fn pump() {
+    let mut msg = MSG::default();
+    // SAFETY: this thread's own queue; each message goes to its own window's procedure.
+    unsafe {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// measure_boxes: one WGC session of the game's window for a duration or a frame count, the boxes' means per frame
+/// into a CSV with its captures row; with images, the first and the last frame too.
+pub(crate) fn boxes(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let cx = game::ctx(session, args, &["tag", "boxes", "secs", "frames", "images"])?;
+    let rec = Record::parse(args)?;
+    let root = cx.config.capture_root();
+    let rel = |name: &str, ext: &str| format!("{}\\{name}.{ext}", cx.live.id);
+    let names = [
+        format!("{}-boxes", rec.tag),
+        format!("{}-first", rec.tag),
+        format!("{}-last", rec.tag),
+    ];
+    taken(&root, &rel, &names[..1], &["csv"], &rec.tag)?;
+    if rec.images {
+        taken(&root, &rel, &names[1..], &["png"], &rec.tag)?;
+    }
+    let pids = cx.live.job.pids().unwrap_or_default();
+    let _dpi = Dpi::per_monitor();
+    let (window, rect) = game_window(&pids)?;
+    let mut ledger =
+        Ledger::open(cx.config.state_dir().join("quen.db")).map_err(|e| format!("ledger: {e}"))?;
+    let d3d = D3d::for_window(window).map_err(|e| format!("D3D11: {e}"))?;
+    let wgc = d3d
+        .capture(window, POOL)
+        .map_err(|e| format!("Windows.Graphics.Capture (measure_boxes has no fallback): {e}"))?;
+    let [w, h] = wgc.size;
+    let regions = rec
+        .boxes
+        .iter()
+        .map(|(name, b)| {
+            crop_region(w, h, Some(*b), true)
+                .map_err(|e| format!("box {name} on the {w}x{h} window: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let staged = (|| {
+        let ring = (0..RING)
+            .map(|_| {
+                regions
+                    .iter()
+                    .map(|r| d3d.staging(r.width, r.height))
+                    .collect::<windows::core::Result<Vec<_>>>()
+            })
+            .collect::<windows::core::Result<Vec<_>>>()?;
+        let full = match rec.images {
+            true => Some([d3d.staging(w, h)?, d3d.staging(w, h)?]),
+            false => None,
+        };
+        Ok::<_, windows::core::Error>((ring, full))
+    })();
+    let (ring, full) = staged.map_err(|e| format!("D3D11: {e}"))?;
+    if call.stopped() {
+        return Err(Done::Refused(
+            "cancelled before anything was changed".into(),
+        ));
+    }
+    call.lap("check");
+    let secs = match rec.until {
+        Until::Secs(s) => s.ceil() as u64,
+        Until::Frames(n) => n.div_ceil(60),
+    };
+    let line = crate::status::measuring(&cx, call, secs, None, &mut None);
+    crate::status::hide(&cx, call, true).map_err(Done::Refused)?;
+    let display = display_state(window);
+    let pin = Pin::show(&rect).map_err(|e| format!("pin window: {e}"))?;
+    sleep(PIN_SETTLE);
+    call.lap("pin");
+    let at = session::now() as i64;
+    let got = wgc
+        .session
+        .StartCapture()
+        .map_err(|e| format!("Windows.Graphics.Capture: {e}"))
+        .and_then(|()| record(&d3d, &wgc, call, rec.until, &regions, &ring, full.as_ref()));
+    drop(wgc);
+    drop(pin);
+    crate::status::cue(&cx, call);
+    call.lap("record");
+    let got = got.map_err(|why| format!("{why}; nothing written"))?;
+    let (pose_id, state) = posed(&cx, call, &mut ledger, &names[0]);
+    let t = ledger
+        .utc(at)
+        .map_err(|e| format!("ledger: {e}; nothing written"))?;
+    let present = present_ms(got.times.iter().copied());
+    let frames: Vec<BoxFrame> = got
+        .means
+        .into_iter()
+        .zip(&present)
+        .map(|(means, &present_ms)| BoxFrame { present_ms, means })
+        .collect();
+    let box_names: Vec<String> = rec.boxes.iter().map(|(n, _)| n.clone()).collect();
+    let boxes: Vec<Value> = rec
+        .boxes
+        .iter()
+        .zip(&regions)
+        .map(|((name, b), r)| json!({"name": name, "box": b, "px": [r.x, r.y, r.width, r.height]}))
+        .collect();
+    let with = |method: &str, more: Vec<(&str, Value)>| Capture {
+        boot_id: Some(cx.live.boot),
+        method: Some(method.into()),
+        includes_overlay: Some(true),
+        includes_desktop: Some(false),
+        display_state: Some(display.clone()),
+        frame_state: Some(
+            state
+                .clone()
+                .into_iter()
+                .chain(more.into_iter().map(|(k, v)| (k.to_string(), v)))
+                .collect(),
+        ),
+        pose_id,
+        t: t.clone(),
+        ..Capture::default()
+    };
+    let row = with(
+        WGC_BOXES,
+        vec![
+            ("boxes", json!(boxes)),
+            ("frames", json!(frames.len())),
+            ("values", json!("scrgb")),
+        ],
+    );
+    let csv = boxes_csv(&box_names, &frames).into_bytes();
+    let name = |ext: &str| rel(&names[0], ext);
+    let (stored, mut failed) = store(&root, &name, vec![("csv", None, csv)], &row, &mut ledger);
+    let mut captures = listed(call, &root, &stored, &Map::new());
+    let images = full
+        .iter()
+        .flat_map(|[first, last]| [(first, &names[1], Some(0)), (last, &names[2], got.last)]);
+    for (staging, image, i) in images {
+        let Some(i) = i.filter(|_| failed.is_none()) else {
+            continue;
+        };
+        let files = match staged_files(&d3d, staging, [w, h], false) {
+            Ok(files) => files,
+            Err(why) => {
+                failed = Some(format!("{image}: {why}"));
+                continue;
+            }
+        };
+        let row = with(
+            WGC_FP16,
+            vec![("frame", json!(i)), ("present_ms", json!(present[i]))],
+        );
+        let (stored, f) = store(&root, &|ext| rel(image, ext), files, &row, &mut ledger);
+        captures.extend(listed(call, &root, &stored, &Map::new()));
+        failed = failed.or(f);
+    }
+    call.lap("store");
+    let mut fields = Map::new();
+    fields.insert("captures".into(), json!(captures));
+    fields.insert("frames".into(), json!(frames.len()));
+    fields.insert("span_ms".into(), json!(present.last()));
+    fields.insert("values".into(), json!("scrgb"));
+    fields.insert("boxes".into(), json!(boxes));
+    if got.non_finite > 0 {
+        fields.insert("non_finite".into(), json!(got.non_finite));
+    }
+    fields.insert("window".into(), json!([w, h]));
+    fields.insert("display_state".into(), json!(display));
+    if let Some(line) = line {
+        fields.insert("status".into(), json!(line));
+    }
+    match failed.or(got.stopped) {
         None => Ok(fields),
         Some(why) => Err(Done::Failed(why, fields)),
     }
@@ -299,8 +1008,8 @@ enum Px {
     ScrgbF16(Vec<f16>),
 }
 
-/// One encoded file: its extension, encoding and bytes.
-type Encoded = (&'static str, Encoding, Vec<u8>);
+/// One encoded file: its extension, encoding (none: not an image) and bytes.
+type Encoded = (&'static str, Option<Encoding>, Vec<u8>);
 
 /// SDR: an RGB PNG. HDR: the 16-bit PQ BT.2020 PNG, after the `.npy` of the half floats as captured with `npy`.
 fn encode(image: Image, npy: bool) -> Result<Vec<Encoded>, String> {
@@ -327,7 +1036,7 @@ fn encode(image: Image, npy: bool) -> Result<Vec<Encoded>, String> {
                 .write_header()
                 .and_then(|mut w| w.write_image_data(&rgb))
                 .map_err(|e| format!("PNG: {e}"))?;
-            Ok(vec![("png", Encoding::Srgb8, png)])
+            Ok(vec![("png", Some(Encoding::Srgb8), png)])
         }
         Px::ScrgbF16(halves) => {
             let frame =
@@ -336,13 +1045,13 @@ fn encode(image: Image, npy: bool) -> Result<Vec<Encoded>, String> {
             if npy {
                 let mut npy = Vec::new();
                 frame.write_npy(&mut npy).map_err(|e| e.to_string())?;
-                files.push(("npy", Encoding::ScrgbF16, npy));
+                files.push(("npy", Some(Encoding::ScrgbF16), npy));
             }
             let mut png = Vec::new();
             frame
                 .write_png_pq(Cursor::new(&mut png))
                 .map_err(|e| e.to_string())?;
-            files.push(("png", Encoding::PqBt2020U16, png));
+            files.push(("png", Some(Encoding::PqBt2020U16), png));
             Ok(files)
         }
     }
@@ -351,7 +1060,7 @@ fn encode(image: Image, npy: bool) -> Result<Vec<Encoded>, String> {
 /// One file written, and its ledger id if its row went in.
 struct Stored {
     rel: String,
-    encoding: Encoding,
+    encoding: Option<Encoding>,
     id: Option<i64>,
 }
 
@@ -363,7 +1072,7 @@ fn store(
     rel: &dyn Fn(&str) -> String,
     files: Vec<Encoded>,
     row: &Capture,
-    mut ledger: Ledger,
+    ledger: &mut Ledger,
 ) -> (Vec<Stored>, Option<String>) {
     let (mut stored, mut rows) = (Vec::new(), Vec::new());
     for (ext, encoding, bytes) in files {
@@ -384,7 +1093,7 @@ fn store(
             path: rel.clone(),
             sha256: sha256_hex(&bytes),
             bytes: bytes.len() as i64,
-            encoding: Some(encoding),
+            encoding,
             ..row.clone()
         });
         stored.push(Stored {
@@ -592,9 +1301,14 @@ impl Drop for Pin {
 /// The ledger's `method` for the HDR fallback; its rows say `includes_desktop`.
 const DESKTOP_DUPLICATION: &str = "desktop_duplication";
 /// The methods of the image files this tool writes: what `measure_image` reads.
-pub(crate) const IMAGE_METHODS: [&str; 3] = [PRINTWINDOW, WGC_FP16, DESKTOP_DUPLICATION];
+pub(crate) const IMAGE_METHODS: [&str; 4] =
+    [PRINTWINDOW, WGC_FP16, DESKTOP_DUPLICATION, WGC_FP16_MEAN];
 const PRINTWINDOW: &str = "printwindow";
 const WGC_FP16: &str = "wgc_fp16";
+/// A burst's per-pixel mean (game_screenshot count with mean).
+const WGC_FP16_MEAN: &str = "wgc_fp16_mean";
+/// measure_boxes' CSV.
+const WGC_BOXES: &str = "wgc_boxes";
 
 /// A grabbed frame, the method that took it, and why WGC didn't, if it didn't.
 struct Grab {
@@ -824,6 +1538,15 @@ impl D3d {
 
     /// Windows.Graphics.Capture of `window` in FP16: the first frame, then the session is closed.
     fn wgc(&self, window: HWND) -> windows::core::Result<Image> {
+        // Two buffers: the smallest pool moonbridge's capture runs with.
+        let wgc = self.capture(window, 2)?;
+        wgc.session.StartCapture()?;
+        let frame = wgc.next()?;
+        self.read(&frame.texture, 0, 0, frame.size[0], frame.size[1])
+    }
+
+    /// A Windows.Graphics.Capture session of `window` in FP16 on this device, a pool of `buffers`, not started yet.
+    fn capture(&self, window: HWND, buffers: i32) -> windows::core::Result<Wgc> {
         if !GraphicsCaptureSession::IsSupported()? {
             return Err(windows::core::Error::new(
                 windows::core::HRESULT(0x8000_4001u32 as i32), // E_NOTIMPL
@@ -839,41 +1562,108 @@ impl D3d {
             let device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
             (item, device)
         };
-        // Two buffers: the smallest pool moonbridge's capture runs with.
+        let size = item.Size()?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &device,
             DirectXPixelFormat::R16G16B16A16Float,
-            2,
-            item.Size()?,
+            buffers,
+            size,
         )?;
-        // ponytail: no pool.Close(). Closing the free-threaded pool of another process's window crashed a WGC worker
-        // thread moments later (an access violation, every time in testing); releasing it does not. The session's
-        // Close ends the capture.
-        pool.CreateCaptureSession(&item).and_then(|session| {
-            let image = (|| {
-                // Windows 11 draws no yellow border when asked not to; older builds refuse, harmlessly.
-                let _ = session.SetIsBorderRequired(false);
-                session.SetIsCursorCaptureEnabled(false)?;
-                session.StartCapture()?;
-                let start = Instant::now();
-                let frame = loop {
-                    match pool.TryGetNextFrame() {
-                        Ok(frame) => break frame,
-                        Err(e) if start.elapsed() > FRAME_WAIT => return Err(e),
-                        Err(_) => sleep(Duration::from_millis(1)),
-                    }
-                };
-                let size = frame.ContentSize()?;
-                let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-                // SAFETY: the frame's surface is a D3D11 texture on this device.
-                let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
-                let image = self.read(&texture, 0, 0, size.Width as u32, size.Height as u32);
-                let _ = frame.Close();
-                image
-            })();
-            let _ = session.Close();
-            image
-        })
+        let wgc = Wgc {
+            session: pool.CreateCaptureSession(&item)?,
+            pool,
+            size: [size.Width as u32, size.Height as u32],
+        };
+        // Windows 11 draws no yellow border when asked not to; older builds refuse, harmlessly.
+        let _ = wgc.session.SetIsBorderRequired(false);
+        wgc.session.SetIsCursorCaptureEnabled(false)?;
+        Ok(wgc)
+    }
+
+    /// `count` consecutive frames of one WGC session of `window`, each copied as it comes into a staging texture made
+    /// before the session started, so the copies only queue; read them with [`D3d::map`]. With each its system-relative
+    /// time (QPC, in 100 ns), and their size.
+    fn burst(&self, window: HWND, count: usize) -> windows::core::Result<(Staged, [u32; 2])> {
+        let wgc = self.capture(window, POOL)?;
+        let [w, h] = wgc.size;
+        let staged = (0..count)
+            .map(|_| self.staging(w, h))
+            .collect::<windows::core::Result<Vec<_>>>()?;
+        wgc.session.StartCapture()?;
+        let mut frames = Vec::with_capacity(count);
+        for staging in staged {
+            let frame = wgc.next()?;
+            if frame.size != wgc.size {
+                return Err(resized(frame.size, wgc.size));
+            }
+            self.copy(&frame.texture, &staging, 0, 0, w, h);
+            frames.push((staging, frame.t));
+        }
+        Ok((frames, wgc.size))
+    }
+
+    /// A CPU-readable FP16 texture of `w` x `h`.
+    fn staging(&self, w: u32, h: u32) -> windows::core::Result<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging = None;
+        // SAFETY: a texture made on this device from a description of its own.
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))?
+        };
+        staging.ok_or_else(windows::core::Error::empty)
+    }
+
+    /// Queues a copy of `w` x `h` pixels at (`x`, `y`) of `from` to the top-left of `to`.
+    fn copy(&self, from: &ID3D11Texture2D, to: &ID3D11Texture2D, x: u32, y: u32, w: u32, h: u32) {
+        let region = D3D11_BOX {
+            left: x,
+            top: y,
+            front: 0,
+            right: x + w,
+            bottom: y + h,
+            back: 1,
+        };
+        // SAFETY: two textures of this device, the region inside `from` and its size inside `to` (the callers').
+        unsafe {
+            self.context
+                .CopySubresourceRegion(to, 0, 0, 0, 0, from, 0, Some(&region))
+        };
+    }
+
+    /// The `w` x `h` RGBA half floats of an FP16 staging texture, once its copies are done.
+    fn map(&self, staging: &ID3D11Texture2D, w: u32, h: u32) -> windows::core::Result<Vec<f16>> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: the mapped rows are read within the map, by its row pitch, `w` pixels of 4 halves each.
+        unsafe {
+            self.context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let mut halves = Vec::with_capacity(w as usize * h as usize * 4);
+            for row in 0..h as usize {
+                let line = mapped
+                    .pData
+                    .cast::<u8>()
+                    .add(row * mapped.RowPitch as usize);
+                let line = std::slice::from_raw_parts(line.cast::<u16>(), w as usize * 4);
+                halves.extend(line.iter().map(|&bits| f16::from_bits(bits)));
+            }
+            self.context.Unmap(staging, 0);
+            Ok(halves)
+        }
     }
 
     /// Desktop Duplication of the window's monitor in FP16, cropped to `rect`; the duplication ends on return.
@@ -928,70 +1718,99 @@ impl D3d {
         h: u32,
     ) -> windows::core::Result<Image> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
-        // SAFETY: COM calls on objects created here; the mapped rows are read within the map, by its row pitch.
-        unsafe {
-            texture.GetDesc(&mut desc);
-            let (w, h) = (
-                w.min(desc.Width.saturating_sub(x)),
-                h.min(desc.Height.saturating_sub(y)),
-            );
-            if desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || w == 0 || h == 0 {
-                return Err(windows::core::Error::new(
-                    windows::core::HRESULT(0x8007_000Du32 as i32), // E_INVALIDDATA
-                    format!(
-                        "a {}x{} texture of format {}, not FP16",
-                        desc.Width, desc.Height, desc.Format.0
-                    ),
-                ));
-            }
-            let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: desc.Format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut staging = None;
-            self.device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
-            let staging = staging.ok_or_else(windows::core::Error::empty)?;
-            let region = D3D11_BOX {
-                left: x,
-                top: y,
-                front: 0,
-                right: x + w,
-                bottom: y + h,
-                back: 1,
-            };
-            self.context
-                .CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&region));
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            let mut halves = Vec::with_capacity(w as usize * h as usize * 4);
-            for row in 0..h as usize {
-                let line = mapped
-                    .pData
-                    .cast::<u8>()
-                    .add(row * mapped.RowPitch as usize);
-                let line = std::slice::from_raw_parts(line.cast::<u16>(), w as usize * 4);
-                halves.extend(line.iter().map(|&bits| f16::from_bits(bits)));
-            }
-            self.context.Unmap(&staging, 0);
-            Ok(Image {
-                width: w,
-                height: h,
-                pixels: Px::ScrgbF16(halves),
-            })
+        // SAFETY: a query into a local.
+        unsafe { texture.GetDesc(&mut desc) };
+        let (w, h) = (
+            w.min(desc.Width.saturating_sub(x)),
+            h.min(desc.Height.saturating_sub(y)),
+        );
+        if desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || w == 0 || h == 0 {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(0x8007_000Du32 as i32), // E_INVALIDDATA
+                format!(
+                    "a {}x{} texture of format {}, not FP16",
+                    desc.Width, desc.Height, desc.Format.0
+                ),
+            ));
         }
+        let staging = self.staging(w, h)?;
+        self.copy(texture, &staging, x, y, w, h);
+        Ok(Image {
+            width: w,
+            height: h,
+            pixels: Px::ScrgbF16(self.map(&staging, w, h)?),
+        })
+    }
+}
+
+/// Why a WGC session stops: the window's size changed from its size when the session began.
+fn resized(now: [u32; 2], was: [u32; 2]) -> windows::core::Error {
+    windows::core::Error::new(
+        windows::core::HRESULT(0x8007_000Du32 as i32), // E_INVALIDDATA
+        format!(
+            "the window changed size, {}x{} to {}x{}",
+            was[0], was[1], now[0], now[1]
+        ),
+    )
+}
+
+/// A burst's frames, each in a staging texture of its own, with its system-relative time (QPC, in 100 ns).
+type Staged = Vec<(ID3D11Texture2D, i64)>;
+
+/// A Windows.Graphics.Capture session of one window in FP16 ([`D3d::capture`]); closed on drop.
+struct Wgc {
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    /// The window's size when the session was made: the pool's.
+    size: [u32; 2],
+}
+
+// ponytail: no pool.Close(). Closing the free-threaded pool of another process's window crashed a WGC worker thread
+// moments later (an access violation, every time in testing); releasing it does not. The session's Close ends the
+// capture.
+impl Drop for Wgc {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+    }
+}
+
+/// A frame of a [`Wgc`] session: its texture on the session's device, content size and system-relative time (QPC, in
+/// 100 ns); back to the pool on drop.
+struct WgcFrame {
+    frame: Direct3D11CaptureFrame,
+    texture: ID3D11Texture2D,
+    size: [u32; 2],
+    t: i64,
+}
+
+impl Drop for WgcFrame {
+    fn drop(&mut self) {
+        let _ = self.frame.Close();
+    }
+}
+
+impl Wgc {
+    /// The next frame, waited for up to [`FRAME_WAIT`]: the game's next present.
+    fn next(&self) -> windows::core::Result<WgcFrame> {
+        let start = Instant::now();
+        let frame = loop {
+            match self.pool.TryGetNextFrame() {
+                Ok(frame) => break frame,
+                Err(e) if start.elapsed() > FRAME_WAIT => return Err(e),
+                Err(_) => sleep(Duration::from_millis(1)),
+            }
+        };
+        let size = frame.ContentSize()?;
+        let t = frame.SystemRelativeTime()?.Duration;
+        let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+        // SAFETY: the frame's surface is a D3D11 texture on this device.
+        let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+        Ok(WgcFrame {
+            frame,
+            texture,
+            size: [size.Width as u32, size.Height as u32],
+            t,
+        })
     }
 }
 
@@ -1172,11 +1991,11 @@ unsafe fn query_display(monitor: HMONITOR) -> Result<Map<String, Value>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::tests::{fake_game, reply, served, token};
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
-        UnregisterClassW, WNDCLASSW, WS_VISIBLE,
+        DefWindowProcW, IsWindow, RegisterClassW, UnregisterClassW, WNDCLASSW, WS_VISIBLE,
     };
 
     #[test]
@@ -1214,9 +2033,183 @@ mod tests {
             json!({"tag": "x".repeat(65)}),
             json!({"tag": "A", "method": "jxr"}),
             json!({"tag": "A", "method": 1}),
+            json!({"tag": "A", "count": 4}),
+            json!({"tag": "A", "method": "hdr", "count": 1}),
+            json!({"tag": "A", "method": "hdr", "count": 33}),
+            json!({"tag": "A", "method": "hdr", "mean": true}),
+            json!({"tag": "A", "method": "hdr", "count": 4, "mean": 1}),
         ] {
             assert!(Shot::parse(&bad).is_err(), "{bad}");
         }
+        // A burst: its frames' names, or with mean the tag alone.
+        let burst = Shot::parse(&json!({"tag": "D", "method": "hdr", "count": 3})).unwrap();
+        assert_eq!(burst.names(), ["D-00", "D-01", "D-02"]);
+        let mean = json!({"tag": "D", "method": "hdr", "count": 3, "mean": true, "npy": true});
+        let mean = Shot::parse(&mean).unwrap();
+        assert_eq!(
+            (mean.names(), mean.extensions()),
+            (vec!["D".to_string()], &["npy", "png"][..])
+        );
+        assert_eq!(Shot::parse(&json!({"tag": "D"})).unwrap().names(), ["D"]);
+        // At most 2 GiB of frames: 32 at 4K, fewer above.
+        let rect = |w, h| RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        assert!(burst_fits(32, &rect(3840, 2160)).is_ok());
+        let why = burst_fits(32, &rect(7680, 4320)).unwrap_err();
+        assert!(why.contains("at most 8 here"), "{why}");
+        // Present times in 100 ns, as ms after the first.
+        assert_eq!(
+            present_ms([1_000_000, 1_166_667, 1_333_333].into_iter()),
+            [0.0, 16.667, 33.333]
+        );
+    }
+
+    /// measure_boxes' arguments: named boxes in fractions inside the window, secs or frames.
+    #[test]
+    fn checks_the_recorders_arguments() {
+        let box_ = |name: &str, b: [f64; 4]| json!({"name": name, "box": b});
+        let rec = Record::parse(
+            &json!({"tag": "R1", "boxes": [box_("sky", [0.0, 0.0, 1.0, 0.25]),
+            box_("geralt", [0.4, 0.3, 0.2, 0.5])], "frames": 120, "images": true}),
+        )
+        .unwrap();
+        assert_eq!(rec.boxes[1], ("geralt".to_string(), [0.4, 0.3, 0.2, 0.5]));
+        assert_eq!((rec.until, rec.images), (Until::Frames(120), true));
+        let secs = Record::parse(
+            &json!({"tag": "R1", "boxes": [box_("a", [0.0, 0.0, 0.5, 0.5])], "secs": 2.5}),
+        );
+        assert_eq!(secs.unwrap().until, Until::Secs(2.5));
+        let one = || json!([box_("a", [0.0, 0.0, 0.5, 0.5])]);
+        for bad in [
+            json!({"tag": "R", "boxes": one()}),
+            json!({"tag": "R", "boxes": one(), "secs": 1, "frames": 1}),
+            json!({"tag": "R", "boxes": one(), "secs": 0}),
+            json!({"tag": "R", "boxes": one(), "secs": 601}),
+            json!({"tag": "R", "boxes": one(), "frames": 0}),
+            json!({"tag": "R", "boxes": [], "frames": 1}),
+            json!({"tag": "R", "boxes": [box_("a", [0.6, 0.0, 0.5, 0.5])], "frames": 1}),
+            json!({"tag": "R", "boxes": [box_("A", [0.0, 0.0, 0.5, 0.5])], "frames": 1}),
+            json!({"tag": "R", "boxes": [{"name": "a", "box": [0, 0, 0.5]}], "frames": 1}),
+            json!({"tag": "R", "boxes": [box_("a", [0.0; 4]), box_("a", [0.0; 4])], "frames": 1}),
+            json!({"tag": "R", "boxes": [{"name": "a", "box": [0, 0, 1, 1], "x": 1}], "frames": 1}),
+            json!({"tag": "R", "boxes": one(), "frames": 1, "images": "yes"}),
+            json!({"tag": "../R", "boxes": one(), "frames": 1}),
+        ] {
+            assert!(Record::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// measure_boxes refuses before anything is written: its arguments, a tag taken, the game's window not found (the
+    /// Fake's game has none).
+    #[test]
+    fn the_recorder_refuses_and_writes_nothing() {
+        let fx = crate::game::tests::Fake::new("capture-boxes");
+        let one = json!([{"name": "a", "box": [0, 0, 0.5, 0.5]}]);
+        let taken = fx.dir.join("data/captures/s1/T-boxes.csv");
+        fs::create_dir_all(taken.parent().unwrap()).unwrap();
+        fs::write(&taken, "synthetic").unwrap();
+        for (args, why) in [
+            (
+                json!({"token": "nope", "tag": "R", "boxes": one, "frames": 1}),
+                "wrong or missing token",
+            ),
+            (
+                json!({"token": "tok", "tag": "R", "boxes": one}),
+                "secs or frames",
+            ),
+            (
+                json!({"token": "tok", "tag": "R", "boxes": one, "frames": 1, "x": 1}),
+                "unknown argument",
+            ),
+            (
+                json!({"token": "tok", "tag": "T", "boxes": one, "frames": 1}),
+                "is taken in this session",
+            ),
+            (
+                json!({"token": "tok", "tag": "R", "boxes": one, "frames": 1}),
+                "no visible window",
+            ),
+        ] {
+            let out = fx.run("measure_boxes", args.clone());
+            let reason = out["reason"].as_str().unwrap_or_default();
+            assert!(
+                out["refused"] == true && reason.contains(why),
+                "{args}: {out}"
+            );
+        }
+        let l = Ledger::open_readonly(fx.dir.join("data/state/quen.db")).unwrap();
+        let rows = l
+            .query("SELECT count(*) FROM captures", &[], Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(rows.rows, [[json!(0)]]);
+    }
+
+    /// After a grab: the camera and the player through the channel as a poses row named for the capture, the game time
+    /// and photo mode for frame_state; nothing when the game doesn't answer (each read bounded) or no game is loaded.
+    #[test]
+    fn reads_the_frames_pose_after_the_grab() {
+        let fx = served("capture-pose");
+        let server = fake_game(
+            &token(&fx),
+            2,
+            Box::new(|r| match r.verb {
+                Verb::CamGet {} => {
+                    let cam = json!({"camera": "photomode", "pos": [1, 2, 3], "rot": [-5, 90, 0], "fov": 60});
+                    vec![reply(r.id, true, "camera", Some(cam))]
+                }
+                Verb::WorldGet {} => {
+                    let world = json!({"player": {"pos": [4, 5, 6], "heading": 45}, "time": {"day": 3, "hour": 22},
+                                       "weather": "WT_Clear"});
+                    vec![reply(r.id, true, "world", Some(world))]
+                }
+                _ => vec![],
+            }),
+        );
+        let session = fx.session();
+        let cx = game::ctx(&session, &json!({"token": "tok"}), &[]).unwrap();
+        let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+        let mut ledger = Ledger::open(fx.dir.join("data/state/quen.db")).unwrap();
+        let (id, state) = posed(&cx, &mut call, &mut ledger, "A1");
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(
+            Value::Object(state),
+            json!({"photo": true, "time": {"day": 3, "hour": 22}})
+        );
+        let sql = "SELECT name, cam_x, cam_y, cam_z, cam_pitch, cam_yaw, cam_roll, fov, player_x, player_y, player_z, \
+                   player_yaw FROM poses WHERE id = ?1";
+        let row = ledger
+            .query(sql, &[json!(id.unwrap())], Duration::from_secs(5))
+            .unwrap()
+            .rows;
+        assert_eq!(
+            row,
+            [json!([
+                "s1/A1", 1.0, 2.0, 3.0, -5.0, 90.0, 0.0, 60.0, 4.0, 5.0, 6.0, 45.0
+            ])
+            .as_array()
+            .unwrap()
+            .clone()]
+        );
+
+        // A game that doesn't answer: no pose, no state, after one bounded read.
+        let silent = fake_game(&token(&fx), 1, Box::new(|_| vec![]));
+        let start = Instant::now();
+        let (pose, state) = frame_pose(&cx, "s1/A2");
+        assert!(pose.is_none() && state.is_empty(), "{state:?}");
+        assert!(start.elapsed() < POSE_WAIT * 2, "{:?}", start.elapsed());
+        assert_eq!(silent.join().unwrap().len(), 1);
+        // No loaded game in quen's state: nothing sent.
+        fs::write(
+            fx.dir.join("game/bin/x64_dx12/W3QuenState.log"),
+            "push flags=0\n",
+        )
+        .unwrap();
+        let (pose, state) = frame_pose(&cx, "s1/A3");
+        assert!(pose.is_none() && state.is_empty());
     }
 
     /// HDR's choice with fake grabbers: WGC when it works; else Desktop Duplication, only with the game in front before
@@ -1285,7 +2278,13 @@ mod tests {
             pixels: Px::Bgra8(vec![30, 20, 10, 255, 3, 2, 1, 255]),
         };
         let a1 = |ext: &str| format!("boot1/A1.{ext}");
-        let (stored, failed) = store(&root, &a1, encode(sdr(), false).unwrap(), &row, ledger());
+        let (stored, failed) = store(
+            &root,
+            &a1,
+            encode(sdr(), false).unwrap(),
+            &row,
+            &mut ledger(),
+        );
         assert_eq!(failed, None);
         assert_eq!(stored[0].rel, "boot1/A1.png");
         let png = fs::read(root.join("boot1/A1.png")).unwrap();
@@ -1301,13 +2300,28 @@ mod tests {
             pixels: Px::ScrgbF16([1.0, 0.5, 0.25, 1.0].map(f16::from_f32).to_vec()),
         };
         let b2 = |ext: &str| format!("boot1/B2.{ext}");
-        let (stored, failed) = store(&root, &b2, encode(hdr(), true).unwrap(), &row, ledger());
+        let (stored, failed) = store(
+            &root,
+            &b2,
+            encode(hdr(), true).unwrap(),
+            &row,
+            &mut ledger(),
+        );
         assert_eq!(failed, None);
-        let encodings: Vec<Encoding> = stored.iter().map(|s| s.encoding).collect();
-        assert_eq!(encodings, [Encoding::ScrgbF16, Encoding::PqBt2020U16]);
+        let encodings: Vec<Option<Encoding>> = stored.iter().map(|s| s.encoding).collect();
+        assert_eq!(
+            encodings,
+            [Some(Encoding::ScrgbF16), Some(Encoding::PqBt2020U16)]
+        );
         // Without npy, an HDR shot is its PNG alone.
         let b3 = |ext: &str| format!("boot1/B3.{ext}");
-        let (stored, failed) = store(&root, &b3, encode(hdr(), false).unwrap(), &row, ledger());
+        let (stored, failed) = store(
+            &root,
+            &b3,
+            encode(hdr(), false).unwrap(),
+            &row,
+            &mut ledger(),
+        );
         assert_eq!(failed, None);
         assert_eq!(stored[0].rel, "boot1/B3.png");
         assert_eq!(stored.len(), 1);
@@ -1316,7 +2330,13 @@ mod tests {
         let odd = ledger().query(sql, &[], Duration::from_secs(5)).unwrap();
         assert!(odd.rows.is_empty(), "{:?}", odd.rows);
 
-        let (again, failed) = store(&root, &a1, encode(sdr(), false).unwrap(), &row, ledger());
+        let (again, failed) = store(
+            &root,
+            &a1,
+            encode(sdr(), false).unwrap(),
+            &row,
+            &mut ledger(),
+        );
         assert!(again.is_empty() && failed.unwrap().contains("A1.png"));
 
         // A shot's rows go in together or not at all: the second row's path is taken, so the first isn't added.
@@ -1333,7 +2353,7 @@ mod tests {
             height: 1,
             pixels: Px::ScrgbF16(vec![f16::ONE; 4]),
         };
-        let (stored, failed) = store(&root, &c3, encode(one, true).unwrap(), &row, ledger());
+        let (stored, failed) = store(&root, &c3, encode(one, true).unwrap(), &row, &mut ledger());
         assert!(failed.unwrap().contains("no ledger rows"));
         assert_eq!(stored.len(), 2);
         assert!(stored.iter().all(|s| s.id.is_none()));
