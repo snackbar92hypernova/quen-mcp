@@ -579,6 +579,11 @@ fn frame_pose(cx: &Ctx, name: &str) -> (Option<PoseRow>, Map<String, Value>) {
         rotation: cam.rot,
         fov: cam.fov,
         player,
+        time: serde_json::from_value(world["time"].clone()).ok(),
+        weather: world["weather"]
+            .as_str()
+            .filter(|w| !w.is_empty())
+            .map(Into::into),
         save_id: None,
         ref_capture_id: None,
     };
