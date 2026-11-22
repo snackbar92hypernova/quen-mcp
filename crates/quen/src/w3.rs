@@ -84,12 +84,15 @@ fn parking(game_dir: &Path) -> [(PathBuf, PathBuf); 4] {
     homes.map(|(home, dir)| (parked.join(home.folder()), dir))
 }
 
-/// Makes the folders the boot's moves park into.
+/// Makes the folders the boot's moves park into, and the one its staged files' outputs go to at the end.
 pub fn make_parking(changes: &[Change]) -> io::Result<()> {
     for change in changes {
-        if let Change::Move { to, .. } = change
-            && let Some(dir) = to.parent()
-        {
+        let dir = match change {
+            Change::Move { to, .. } => to.parent(),
+            Change::Outputs { to, .. } => Some(to.as_path()),
+            _ => None,
+        };
+        if let Some(dir) = dir {
             fs::create_dir_all(dir)?;
         }
     }

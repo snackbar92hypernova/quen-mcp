@@ -10,7 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::journal::{Action, Fs, Journal, sha256_hex};
+use crate::journal::{Action, Fs, Journal, output_of, sha256_hex};
 use crate::park::{self, Entry, Listing};
 use crate::reshade::{self, Missing, Value};
 use crate::settings;
@@ -113,6 +113,14 @@ pub enum Change {
         backup: PathBuf,
         keep: bool,
     },
+    /// At the end, move what staged files' programs wrote beside them in `dir` into `to` ([`outputs`],
+    /// [`Action::Outputs`]). `to` must exist.
+    Outputs {
+        dir: PathBuf,
+        stems: Vec<String>,
+        skip: Vec<String>,
+        to: PathBuf,
+    },
 }
 
 impl Change {
@@ -143,6 +151,12 @@ impl Change {
                     backup.display()
                 )
             }
+            Change::Outputs { dir, stems, to, .. } => format!(
+                "move each new file in {} named {} then . _ - or a space and more into {} at the end",
+                dir.display(),
+                stems.join(" or "),
+                to.display()
+            ),
         }
     }
 }
@@ -463,12 +477,56 @@ fn stage_touches(c: &Change, path: &Path) -> bool {
         | Change::Place { dest: path, .. }
         | Change::CopyDir { dest: path, .. } => same(path),
         Change::Move { from, .. } => same(from),
+        Change::Outputs { .. } => false,
     }
+}
+
+/// The change that, at the end, moves into `to` (the boot's game-logs folder) what the files `staged` ([`stage`]'s
+/// changes) put into bin wrote beside them: for each stem S, the files at bin's top level named S then `.`, `_`, `-`
+/// or a space and more, in any case ([`output_of`]), but those in bin at the launch (`bin` lists them), the staged files
+/// and each `<S>.log` (its own [`Change::NewLog`]). None without a file staged into bin.
+pub fn outputs(game_dir: &Path, staged: &[Change], bin: &[Entry], to: &Path) -> Option<Change> {
+    let dir = bin_dir(game_dir);
+    let placed: Vec<String> = staged
+        .iter()
+        .filter_map(|c| match c {
+            Change::Place { dest, .. } if dest.parent() == Some(dir.as_path()) => {
+                Some(dest.file_name()?.to_string_lossy().into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut stems: Vec<String> = placed
+        .iter()
+        .map(|name| {
+            Path::new(name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    stems.sort();
+    stems.dedup();
+    let logs: Vec<String> = stems.iter().map(|s| format!("{s}.log")).collect();
+    let skip = bin
+        .iter()
+        .map(|e| e.name.clone())
+        .chain(placed)
+        .chain(logs)
+        .filter(|name| output_of(name, &stems))
+        .collect();
+    (!stems.is_empty()).then(|| Change::Outputs {
+        dir,
+        stems,
+        skip,
+        to: to.to_owned(),
+    })
 }
 
 /// Makes `changes` in order, each step journaled before it acts: a [`Change::Rewrite`] is a Backup step (the copy read
 /// back and compared), then a Patch step (the same); a [`Change::Rebuilt`] the same Backup, then a Rebuilt step with
-/// the file's write time; a move, a place or a new log is one step. `stopped` is asked before each
+/// the file's write time; a move, a place, a new log or outputs is one step. `stopped` is asked before each
 /// change: once it says yes, this stops with `Interrupted`. On any error the caller unwinds through the journal.
 pub fn apply(
     fs: &dyn Fs,
@@ -583,6 +641,20 @@ pub fn apply(
                 }
                 let id = journal.step(Action::NewDir { path: dest.clone() })?;
                 fs.copy_tree(from, dest)?;
+                journal.done(id)?;
+            }
+            Change::Outputs {
+                dir,
+                stems,
+                skip,
+                to,
+            } => {
+                let id = journal.step(Action::Outputs {
+                    dir: dir.clone(),
+                    stems: stems.clone(),
+                    skip: skip.clone(),
+                    to: to.clone(),
+                })?;
                 journal.done(id)?;
             }
         }
@@ -1354,6 +1426,7 @@ mod tests {
                 | Change::NewLog { path } => path.as_path(),
                 Change::Move { from, .. } => from.as_path(),
                 Change::Place { dest, .. } | Change::CopyDir { dest, .. } => dest.as_path(),
+                Change::Outputs { dir, .. } => dir.as_path(),
             })
             .collect();
         let want = [
@@ -1400,6 +1473,7 @@ mod tests {
         let menu_dir = menu_dir(game_dir);
         fs.put("GAME/bin/x64_dx12/w3fake.INI", "the user's ini");
         fs.put("GAME/bin/x64_dx12/Tweaks.asi", "the user's tweaks");
+        fs.put("GAME/bin/x64_dx12/W3Test_old.log", "an older boot's log");
         fs.put(menu_dir.join("modMenu.xml"), "the user's menu");
         for (name, bytes) in [
             ("W3Test.asi", "test asi"),
@@ -1411,7 +1485,11 @@ mod tests {
             fs.put(Path::new("PC").join(name), bytes);
         }
         let before = fs.files();
-        let bin = [file("w3fake.INI", false), file("Tweaks.asi", false)];
+        let bin = [
+            file("w3fake.INI", false),
+            file("Tweaks.asi", false),
+            file("W3Test_old.log", false),
+        ];
         let menu = [file("modMenu.xml", false), file("audio.xml", false)];
         let mut inp = inputs(&[], &bin);
         inp.park = "Tweaks.asi";
@@ -1460,7 +1538,19 @@ mod tests {
                 ),
             ],
         );
+        let logs = Path::new("LOGS/game-logs");
+        let out = outputs(game_dir, &staged, &bin, logs).unwrap();
+        assert_eq!(
+            out.summary(),
+            format!(
+                "move each new file in {} named Tweaks or W3Test or w3fake then . _ - or a space and more into {} at \
+                 the end",
+                bin_dir.display(),
+                logs.display()
+            )
+        );
         changes.extend(staged);
+        changes.push(out);
         let path = Path::new("QUEN/journal.jsonl");
         let mut journal = Journal::create(&fs, path).unwrap();
         apply(&fs, &mut journal, &changes, &|| false).unwrap();
@@ -1473,10 +1563,60 @@ mod tests {
         assert_eq!(fs.read(&parked_menu).unwrap(), b"the user's menu");
         // The staged mod logs; the replay recycles its log and the copies, and puts the user's files back.
         fs.put(bin_dir.join("W3Test.log"), "a staged mod's log");
+        // Its other outputs go into the game-logs folder (one the end's game_logs copied already, the same bytes;
+        // one whose name holds other bytes there stays); a name that only starts with a stem, and an older boot's
+        // log, stay.
+        for name in [
+            "W3Test_probe.log",
+            "w3test.DMP",
+            "Tweaks-cache.bin",
+            "W3Test extra.txt",
+            "W3Test_copy.log",
+            "W3Test_other.log",
+            "W3TestX.log",
+        ] {
+            fs.put(bin_dir.join(name), format!("{name} output"));
+        }
+        fs.put(logs.join("W3Test_copy.log"), "W3Test_copy.log output");
+        fs.put(logs.join("W3Test_other.log"), "other bytes");
         let report = replay(&fs.read(path).unwrap(), &fs);
         assert!(report.clean() && report.kept.is_empty(), "{report:#?}");
+        let mut moved: Vec<(String, u64)> = report
+            .moved
+            .iter()
+            .map(|m| {
+                assert_eq!(m.to, logs.join(m.from.file_name().unwrap()), "{m:?}");
+                let name = m.from.file_name().unwrap().to_string_lossy();
+                (name.into_owned(), m.bytes)
+            })
+            .collect();
+        moved.sort();
+        let size = |name: &str| (name.to_owned(), format!("{name} output").len() as u64);
+        let want = [
+            "Tweaks-cache.bin",
+            "W3Test extra.txt",
+            "W3Test_copy.log",
+            "W3Test_probe.log",
+            "w3test.DMP",
+        ];
+        assert_eq!(moved, want.map(size), "{report:#?}");
+        for name in want {
+            assert_eq!(
+                fs.read(&logs.join(name)).unwrap(),
+                format!("{name} output").as_bytes()
+            );
+        }
+        let kept = format!(
+            "kept {}: {} holds other bytes",
+            show("W3Test_other.log"),
+            logs.join("W3Test_other.log").display()
+        );
+        assert!(report.notes.contains(&kept), "{report:#?}");
         let mut after = fs.files();
-        after.retain(|p, _| !p.starts_with("QUEN"));
+        after.retain(|p, _| !p.starts_with("QUEN") && !p.starts_with("LOGS"));
+        for name in ["W3Test_other.log", "W3TestX.log"] {
+            assert!(after.remove(&bin_dir.join(name)).is_some(), "{name}");
+        }
         assert_eq!(after, before);
         for name in ["W3Test.log", "W3Test.asi", "w3fake.INI", "Tweaks.asi"] {
             assert!(

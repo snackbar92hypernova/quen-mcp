@@ -369,6 +369,8 @@ pub(crate) struct Live {
     /// The user's saves, and how they were at launch.
     pub(crate) saves: PathBuf,
     pub(crate) saves_before: Snapshot,
+    /// The save file the launch loads (none: a play session without one).
+    pub(crate) loaded: Option<String>,
     /// The files game_save accepted (save.rs), as it found them: the guard passes each while it is still so.
     pub(crate) quen_saves: RefCell<Snapshot>,
     /// Memory patches, cvar writes and teleports, each with its time: the game.* and measure.* tools push
@@ -1520,6 +1522,11 @@ impl<'a> Session<'a> {
             game,
             saves: saves.clone(),
             saves_before: saves_before.clone(),
+            loaded: spec
+                .save
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned()),
             quen_saves: RefCell::default(),
             patches: RefCell::default(),
             launched: SystemTime::now(),
@@ -1607,10 +1614,10 @@ impl<'a> Session<'a> {
                 out.unwrap_or_default().display()
             )),
             Some(Err(why)) => Err(why),
-            Some(Ok(_child)) => {
+            Some(Ok(child)) => {
                 call.lap("launch");
                 fields.insert("command".into(), json!({"argv": argv, "cwd": cwd}));
-                boot::play(self, call, &spec, &mut fields)
+                boot::play(self, call, &spec, &child, &mut fields)
             }
         };
         self.shared.booting.store(0, Ordering::SeqCst);
@@ -2043,8 +2050,15 @@ impl<'a> Session<'a> {
             })
             .collect();
         let quen: Vec<String> = live.quen_saves.borrow().keys().cloned().collect();
-        let saves = json!({"tainted": tainted, "changed": changed, "deleted": deleted, "unexpected": unexpected,
-            "quen": quen, "user": user});
+        // The save the launch loaded, against quen's pre-launch snapshot.
+        let now = saves::snapshot(&live.saves);
+        let loaded = live.loaded.as_ref().map(|file| {
+            let before = live.saves_before.get(file);
+            json!({"file": file, "present": now.contains_key(file),
+                "unchanged": before.is_some() && now.get(file) == before})
+        });
+        let saves = json!({"loaded": loaded, "tainted": tainted, "changed": changed, "deleted": deleted,
+            "unexpected": unexpected, "quen": quen, "user": user});
         fields.insert("saves".into(), saves);
         // What the session left in the capture root, against the budget.
         if let Ok(config) = self.config() {

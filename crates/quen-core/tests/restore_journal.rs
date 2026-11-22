@@ -357,7 +357,7 @@ fn assert_reported(original: &BTreeMap<PathBuf, Vec<u8>>, fs: &MemFs, report: &R
             | Action::NewDir { path } => {
                 vec![path.as_path()]
             }
-            Action::GameMemory { .. } => vec![],
+            Action::GameMemory { .. } | Action::Outputs { .. } => vec![],
         }))
         .collect();
     for path in original.keys().chain(now.keys()) {

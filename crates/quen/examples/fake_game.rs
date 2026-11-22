@@ -4,6 +4,8 @@
 //! - `on_screen`: the window sits at (96, 96), topmost (for the screenshot test); otherwise it is far off screen, so
 //!   the tests don't show it, and it never takes the focus;
 //! - `dialog`: a titled dialog instead (off screen too), as the game shows a script compile error;
+//! - `exit_code`: it writes a line to its output and a ReShade.log with an ERROR line, then exits with the code the
+//!   file holds, before any window, as a game that crashes at launch;
 //! - `dxgi.dll` (ReShade): it writes `ReShade.log` with the RenoDX add-on's DevAutoReload line, and loads the DLL
 //!   its `ReShade.ini`'s `LoadFromDllMain` names (relative to it), as ReShade loads the devkit;
 //! - `WitcherNativeBridge.asi`: it writes `WitcherNativeBridge.log` as the Native Bridge does, with quen's script
@@ -40,6 +42,12 @@ fn main() {
     let here = exe.parent().unwrap();
     let flag = |name: &str| here.join(name).exists();
     fs::write(here.join("pid"), std::process::id().to_string()).unwrap();
+    if let Ok(code) = fs::read_to_string(here.join("exit_code")) {
+        let log = "00:00:00:000 [ 1] | INFO  | Initializing.\r\n00:00:00:001 [ 1] | ERROR | Failed to load add-on.\r\n";
+        fs::write(here.join("ReShade.log"), log).unwrap();
+        println!("fake game: crashing");
+        std::process::exit(code.trim().parse::<u32>().unwrap() as i32);
+    }
     if flag("dxgi.dll") {
         fs::write(
             here.join("ReShade.log"),

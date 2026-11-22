@@ -8,15 +8,17 @@
 //! capture path, and nothing here binds, presses or reads SKIV's or ReShade's screenshot keys), the harness's test mod
 //! and W3_SIGNALS pack, and the 4.04 / vcmp switching. ReShade is only the RenoDX add-on's host.
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use quen_core::boot::{self, Change, Inputs, RenoDx};
 use quen_core::bridge_log;
 use quen_core::journal::sha256_hex;
 use quen_core::park::{self, Entry, Learned, Listing};
+use quen_core::protocol::Verb;
 use quen_core::saves;
 use quen_core::vortex::Inventory;
 use serde_json::{Map, Value, json};
@@ -53,6 +55,24 @@ const CONTINUE_MAX: Duration = Duration::from_secs(300);
 /// again if no state shows. ponytail: guesses until a live boot times a menu load.
 const MENU_LOAD_TRIES: usize = 3;
 const MENU_LOAD_GRACE: Duration = Duration::from_secs(45);
+/// [unproven live] The first try waits, a Space at each turn, until the game lists a save (listsaves), at most
+/// `SAVE_LIST_MAX` from its first look: in a tester's boots the game refused first tries while its save list held 0
+/// saves, and a later try loaded. ponytail: a guess until a live boot times the list.
+const SAVE_LIST_MAX: Duration = Duration::from_secs(30);
+/// The NTSTATUS codes a failed launch names (ntstatus.h); any other code is given in decimal and hex only.
+const NTSTATUS: &[(u32, &str)] = &[
+    (0xC000_0005, "access violation"),
+    (0xC000_001D, "illegal instruction"),
+    (0xC000_007B, "invalid image format"),
+    (0xC000_00FD, "stack overflow"),
+    (0xC000_0135, "DLL not found"),
+    (0xC000_0139, "entry point not found"),
+    (0xC000_0142, "DLL init failed"),
+    (0xC000_0374, "heap corruption"),
+    (0xC000_0409, "stack buffer overrun / fail-fast"),
+];
+/// How much of the launch's logs a failed launch quotes in `game_text`: at most two lines, this many characters.
+const LOG_TEXT_MAX: usize = 300;
 /// How late quen's state log may show a change: modQuen checks at most every 0.25 s while the game ticks.
 const PUSH_LATENCY_MS: i64 = 250;
 /// How long photo mode may take to show on quen's state log after U.
@@ -564,7 +584,11 @@ impl Spec {
             &menu,
             &changes,
         )?;
+        // What a staged file's program writes beside it goes into the boot's game-logs folder, beside its backups.
+        let game_logs = backups.with_file_name("game-logs");
+        let outputs = boot::outputs(&game_dir, &staged, &bin_entries, &game_logs);
         changes.extend(staged);
+        changes.extend(outputs);
         let staged = boot::stage_mods(
             &JournalFs,
             &game_dir,
@@ -832,13 +856,37 @@ pub(crate) fn listing(dir: &Path) -> Result<Vec<Entry>, String> {
 /// line (with RenoDX), Continue (E and Space by turns until quen's state log's first push, then no key) until plain
 /// gameplay, the save asked for through game_load if Continue loaded another, the saves guard, then photo mode. Its
 /// results go into `fields`, the launch's, so a failed launch keeps them too (live boot 2: the Continue keys). Err says
-/// why the session must end.
+/// why the session must end; `game_text` then quotes the launch's logs, when it failed on what they hold. `game`: the
+/// process the launch started.
 pub(crate) fn play(
     session: &mut Session,
     call: &mut Call,
     spec: &Spec,
+    game: &win::Child,
     fields: &mut Map<String, Value>,
 ) -> Result<(), String> {
+    let said = RefCell::new(None);
+    let played = play_steps(session, call, spec, game, fields, &said);
+    if let Some(text) = said.take() {
+        fields.insert("game_text".into(), json!(text));
+    }
+    played
+}
+
+/// [`play`]'s steps; `said` takes what the logs say for `game_text`: data, never quen's reason.
+fn play_steps(
+    session: &mut Session,
+    call: &mut Call,
+    spec: &Spec,
+    game: &win::Child,
+    fields: &mut Map<String, Value>,
+    said: &RefCell<Option<String>>,
+) -> Result<(), String> {
+    const QUOTED: &str = "; game_text quotes the logs";
+    let quoted = || match said.borrow().is_some() {
+        true => QUOTED,
+        false => "",
+    };
     let started = Instant::now();
     let config = session.config()?.clone();
     let live = session.live.as_ref().ok_or("no live session")?;
@@ -853,14 +901,19 @@ pub(crate) fn play(
         }
         let pids = job.pids().map_err(|e| format!("the job: {e}"))?;
         if pids.is_empty() {
-            // Under a profiler the job's first process is its launcher, which can exit before the game starts.
-            return Err(match spec.profiler {
-                Some(_) => match fs::read(&game_log).ok().and_then(|log| exit_code(&String::from_utf8_lossy(&log))) {
-                    Some(code) => format!("the game exited during the launch with code {code} ({code:#X}), as the profiler's launcher logged (its output is in the session's game.log)"),
-                    None => "the game or the profiler's launcher exited during the launch (the launcher's output is in the session's game.log)".into(),
-                },
-                None => "the game exited during the launch (a script compile error can close it)".into(),
-            });
+            let log = fs::read(&game_log).unwrap_or_default();
+            let log = String::from_utf8_lossy(&log);
+            *said.borrow_mut() = log_text(Some(&*log), reshade_log(&bin, launched).as_deref());
+            // Under a profiler the job's first process is its launcher, which can exit before the game starts; without
+            // one it is the game.
+            let why = match (&spec.profiler, exit_code(&log), game.wait(Duration::ZERO)) {
+                (Some(_), Some(code), _) => format!("the game exited during the launch with code {}, as the profiler's launcher logged (its output is in the session's game.log)", code_text(code)),
+                (Some(_), None, _) => "the game or the profiler's launcher exited during the launch (the launcher's output is in the session's game.log)".into(),
+                (None, _, Ok(Some(code))) if NTSTATUS.iter().any(|(c, _)| *c == code) => format!("the game exited during the launch with code {}", code_text(code)),
+                (None, _, Ok(Some(code))) => format!("the game exited during the launch with code {} (a script compile error can close it)", code_text(code)),
+                (None, ..) => "the game exited during the launch (a script compile error can close it)".into(),
+            };
+            return Err(format!("{why}{}", quoted()));
         }
         if let Some(title) = capture::dialog(&pids) {
             // The game's text, cut short: its title, never more.
@@ -976,20 +1029,19 @@ pub(crate) fn play(
         && addon.exists()
         && bin.join("dxgi.dll").exists()
     {
-        let log = bin.join("ReShade.log");
         let t = Instant::now();
         loop {
             ready(call)?;
-            let fresh = fs::metadata(&log)
-                .and_then(|m| m.modified())
-                .is_ok_and(|m| m > launched);
-            if fresh && fs::read(&log).is_ok_and(|b| String::from_utf8_lossy(&b).contains(mark)) {
+            let log = reshade_log(&bin, launched);
+            if log.as_deref().is_some_and(|text| text.contains(mark)) {
                 break;
             }
             if t.elapsed() > RESHADE_MAX {
+                *said.borrow_mut() = log_text(None, log.as_deref());
                 return Err(format!(
-                    "{} lacks {mark:?}: the add-on didn't load",
-                    log.display()
+                    "{} lacks {mark:?}: the add-on didn't load{}",
+                    bin.join("ReShade.log").display(),
+                    quoted()
                 ));
             }
             sleep(POLL);
@@ -1050,6 +1102,8 @@ pub(crate) fn play(
     let stem = save.file_stem().unwrap_or_default().to_string_lossy();
     let (mut tries, mut menu_open) = (Vec::new(), newest.as_deref() != Some(save));
     let (mut taken, mut e_after): (Option<Instant>, bool) = (None, false);
+    // When the first try first looked at the game's save list (SAVE_LIST_MAX).
+    let mut listing: Option<Instant> = None;
     // Ok at plain gameplay, else why; the keys sent so far go into `fields` either way.
     let continued = loop {
         if in_game() {
@@ -1072,7 +1126,11 @@ pub(crate) fn play(
                 Err(why) => break Err(why),
             };
             next = Instant::now() + MENU_EVERY;
-            if menu_open {
+            let waiting = menu_open
+                && tries.is_empty()
+                && listing.get_or_insert_with(Instant::now).elapsed() < SAVE_LIST_MAX
+                && listed(&cx) == Some(0);
+            if menu_open && !waiting {
                 let tried = match cx.channel() {
                     Ok(channel) => channel::load(&cx, channel, &stem).map_err(|e| {
                         let why = json!({"ok": false, "why": e.why(), "game_text": e.game_text()});
@@ -1115,6 +1173,9 @@ pub(crate) fn play(
     let menu_loaded = taken.is_some() && !e_after;
     if !tries.is_empty() {
         fields.insert("menu_load".into(), json!(tries));
+    }
+    if tries.len() > 1 {
+        fields.insert("menu_load_tries".into(), json!(tries.len()));
     }
     let first_load = match menu_loaded {
         true => "the load verb at the main menu",
@@ -1219,6 +1280,59 @@ fn exit_code(log: &str) -> Option<u32> {
         .ok()
 }
 
+/// An exit code in decimal and hex, with its name when it is one of [`NTSTATUS`].
+fn code_text(code: u32) -> String {
+    match NTSTATUS.iter().find(|(c, _)| *c == code) {
+        Some((_, name)) => format!("{code} ({code:#X}, {name})"),
+        None => format!("{code} ({code:#X})"),
+    }
+}
+
+/// ReShade.log in `bin` if this launch wrote it: ReShade rewrites it at launch.
+fn reshade_log(bin: &Path, launched: SystemTime) -> Option<String> {
+    let log = bin.join("ReShade.log");
+    let fresh = fs::metadata(&log)
+        .and_then(|m| m.modified())
+        .is_ok_and(|m| m >= launched);
+    let bytes = fs::read(&log).ok().filter(|_| fresh)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A failed launch's `game_text`: the last line of the session's game.log (the launched process's output) and the
+/// ERROR lines of this launch's ReShade.log, the last two of them, paths under the user's folder as %USERPROFILE%, cut
+/// to [`LOG_TEXT_MAX`] characters. None when neither has one.
+fn log_text(game_log: Option<&str>, reshade: Option<&str>) -> Option<String> {
+    let trim = |l: &str| {
+        l.trim_matches(|c: char| c.is_whitespace() || c.is_control())
+            .to_owned()
+    };
+    let last = game_log.and_then(|log| log.lines().map(trim).rfind(|l| !l.is_empty()));
+    let errors = reshade
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|l| Some(trim(l.split_once("| ERROR |")?.1)));
+    let lines: Vec<String> = last
+        .map(|l| format!("game.log: {l}"))
+        .into_iter()
+        .chain(errors.map(|l| format!("ReShade.log: {l}")))
+        .collect();
+    let text = lines[lines.len().saturating_sub(2)..].join("\n");
+    // Masked before the cut, so the cut never leaves part of the user's folder.
+    let text = crate::mcp::for_user(&json!(text));
+    let text = text.as_str().filter(|t| !t.is_empty())?;
+    Some(match text.char_indices().nth(LOG_TEXT_MAX) {
+        Some((at, _)) => format!("{}...", &text[..at]),
+        None => text.to_owned(),
+    })
+}
+
+/// How many saves the game lists (listsaves); None when its channel doesn't say.
+fn listed(cx: &game::Ctx) -> Option<usize> {
+    let pipe = cx.channel().ok()?;
+    let reply = pipe.call(Verb::ListSaves {}, channel::REPLY_MAX).ok()?;
+    Some(reply.data?.as_array()?.len())
+}
+
 /// session_plan's fields: the save, every file change, what dx12user.settings gets (asked, and each line written: the
 /// forced keys and the overrides) and the command.
 pub(crate) fn plan_fields(config: &Config, spec: &Spec) -> Map<String, Value> {
@@ -1280,6 +1394,80 @@ mod tests {
         let log = "Launching witcher3.exe ...\r\n\0Launched process exited with code 3221225477; expected terminate-after-capture code 119.\r\n";
         assert_eq!(exit_code(log), Some(0xC000_0005));
         assert_eq!(exit_code("Launching witcher3.exe ...\r\n"), None);
+    }
+
+    /// A failed launch names an NTSTATUS of its fixed set, and gives any code in decimal and hex.
+    #[test]
+    fn exit_codes_are_named_from_a_fixed_set() {
+        assert_eq!(
+            code_text(0xC000_0409),
+            "3221226505 (0xC0000409, stack buffer overrun / fail-fast)"
+        );
+        assert_eq!(code_text(1), "1 (0x1)");
+        assert_eq!(code_text(0xC000_0001), "3221225473 (0xC0000001)");
+    }
+
+    /// game_text: game.log's last line and this launch's ReShade ERROR lines, the last two, paths under the user's
+    /// folder masked before the cut.
+    #[test]
+    fn a_failed_launch_quotes_its_logs_key_lines() {
+        let home = std::env::var("USERPROFILE").unwrap();
+        let reshade = format!(
+            "11:22:33:444 [ 1234] | INFO  | Initializing ...\r\n\
+             11:22:33:500 [ 1234] | ERROR | Failed to load add-on from \"{home}\\Mods\\x.addon64\" with error code 126.\r\n\
+             11:22:34:000 [ 1234] | WARN  | Skipped.\r\n"
+        );
+        let game =
+            "Launching witcher3.exe ...\r\n\0Launched process exited with code 3221225477.\r\n\r\n";
+        assert_eq!(
+            log_text(Some(game), Some(&reshade)).unwrap(),
+            "game.log: Launched process exited with code 3221225477.\nReShade.log: Failed to load add-on from \
+             \"%USERPROFILE%\\Mods\\x.addon64\" with error code 126."
+        );
+        let two = format!("{reshade}00:00:00:000 [ 1] | ERROR | Second.\r\n");
+        assert_eq!(
+            log_text(Some(game), Some(&two)).unwrap().lines().last(),
+            Some("ReShade.log: Second.")
+        );
+        assert!(
+            !log_text(Some(game), Some(&two))
+                .unwrap()
+                .contains("game.log")
+        );
+        let long = format!("{home}\\{}", "x".repeat(400));
+        let cut = log_text(Some(&long), None).unwrap();
+        assert!(
+            cut.starts_with("game.log: %USERPROFILE%\\x") && cut.ends_with("..."),
+            "{cut}"
+        );
+        assert_eq!(cut.chars().count(), LOG_TEXT_MAX + 3);
+        assert_eq!(log_text(Some("\r\n"), Some("| INFO | x")), None);
+        assert_eq!(log_text(None, None), None);
+    }
+
+    /// The first menu load's look at the game's save list: its count, None when the channel can't say.
+    #[test]
+    fn the_save_list_is_counted_through_the_channel() {
+        use crate::channel::tests::{fake_game, reply, served, token};
+        let fx = served("boot-listed");
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let server = fake_game(
+            &token(&fx),
+            2,
+            Box::new(move |r| {
+                let saves = match first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    true => json!([]),
+                    false => json!(["quicksave", "manualsave_1"]),
+                };
+                vec![reply(r.id, true, "saves", Some(saves))]
+            }),
+        );
+        let session = fx.session();
+        let cx = game::ctx(&session, &json!({"token": "tok"}), &[]).unwrap();
+        assert_eq!(listed(&cx), Some(0));
+        assert_eq!(listed(&cx), Some(2));
+        server.join().unwrap();
+        assert_eq!(listed(&cx), None, "the channel is down");
     }
 
     #[test]

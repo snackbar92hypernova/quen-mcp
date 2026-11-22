@@ -693,17 +693,53 @@ fn staged_files_load_with_the_boot_and_go_at_its_end() {
     // The staged mod writes its log and its menu a value; the end keeps a copy of each, then the folders go back as
     // they were.
     fs::write(bin.join("W3Test.log"), "the staged mod's log").unwrap();
+    // Its other outputs (a probe log, which game_logs copies too, and a dump) move into game-logs.
+    fs::write(bin.join("W3Test_probe.log"), "a probe log").unwrap();
+    fs::write(bin.join("W3Test.dmp"), "a dump").unwrap();
     let menu_set = "[ModMenu]\r\nOn=false\r\n";
     fs::write(fx.path("docs/user.settings"), menu_set).unwrap();
     let ended = quen.tool("session_end", json!({"token": launched["token"]}));
     assert_eq!(ended["ok"], true, "{ended}");
+    // The save the launch loaded is still there, as it was.
+    assert_eq!(
+        ended["saves"]["loaded"],
+        json!({"file": "QuickSave.sav", "present": true, "unchanged": true}),
+        "{ended}"
+    );
     let session = launched["session"].as_str().unwrap();
     let logs = fs::read_dir(fx.path("data/logs")).unwrap();
     let logs = logs
         .map(|e| e.unwrap().path())
-        .find(|p| p.to_string_lossy().ends_with(session));
-    let copy = logs.unwrap().join(r"game-logs\W3Test.log");
-    assert_eq!(fs::read_to_string(copy).unwrap(), "the staged mod's log");
+        .find(|p| p.to_string_lossy().ends_with(session))
+        .unwrap()
+        .join("game-logs");
+    assert_eq!(
+        fs::read_to_string(logs.join("W3Test.log")).unwrap(),
+        "the staged mod's log"
+    );
+    let mut moved: Vec<(String, u64)> = ended["replay"]["moved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let to = m["to"].as_str().unwrap();
+            let name = to.rsplit('\\').next().unwrap().to_owned();
+            (name, m["bytes"].as_u64().unwrap())
+        })
+        .collect();
+    moved.sort();
+    assert_eq!(
+        moved,
+        [("W3Test.dmp".into(), 6), ("W3Test_probe.log".into(), 11)],
+        "{ended}"
+    );
+    for (name, text) in [
+        ("W3Test_probe.log", "a probe log"),
+        ("W3Test.dmp", "a dump"),
+    ] {
+        assert_eq!(fs::read_to_string(logs.join(name)).unwrap(), text);
+        assert!(!bin.join(name).exists(), "{name}");
+    }
     let undone = ended["replay"]["undone"].to_string();
     assert!(
         undone.contains("W3Test.log, new since the journal began"),
@@ -1561,6 +1597,29 @@ fn a_launch_whose_natives_failed_ends_before_any_key() {
     fx.assert_restored();
     let rows = fx.ledger("SELECT outcome, failure FROM boots");
     assert_eq!(rows[0][0], "failed");
+}
+
+/// A game that exits during the launch: the reason gives its exit code, an NTSTATUS by name, and game_text quotes the
+/// last line of its output and this launch's ReShade ERROR line; everything is given back.
+#[test]
+fn a_game_that_exits_during_the_launch_names_its_code() {
+    let fx = Fixture::new();
+    fs::write(fx.path("game/bin/x64_dx12/exit_code"), "3221225477").unwrap();
+    let mut quen = Quen::start(&fx);
+    let launch = quen.tool("session_launch", json!({"user_ok": true}));
+    let why = launch["reason"].as_str().unwrap();
+    assert!(
+        launch["refused"] == false
+            && why.contains(
+                "with code 3221225477 (0xC0000005, access violation); game_text quotes the logs"
+            ),
+        "{launch}"
+    );
+    assert_eq!(
+        launch["game_text"], "game.log: fake game: crashing\nReShade.log: Failed to load add-on.",
+        "{launch}"
+    );
+    fx.assert_restored();
 }
 
 /// quen works the same with the W3 Game State Bridge installed and without it: it reads nothing the bridge writes (here

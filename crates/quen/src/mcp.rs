@@ -851,7 +851,7 @@ pub(crate) fn tools() -> Value {
                     "preset": {"type": "string", "description": "RenoDX preset-1 values written before the launch (needs renodx_addon in the config): Key=number[,Key=number...]; +Key adds a key preset 1 lacks"},
                     "park": {"type": "string", "description": "comma names or ALL: a Mods folder, bin file, Vortex mod (nexus:<id> or name) or its file; never the Native Bridge, quen's package; a script folder and its imports' binary only together, both taken by ALL"},
                     "keep": {"type": "string", "description": "names as in park, kept"},
-                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths: an ASI, its ini, a DLL) copied into bin\\x64_dx12 for the session, a mod menu's .xml into bin\\config\\r4game\\user_config_matrix\\pc; one there of that name is parked first. The end recycles them and each bin copy's new <stem>.log"},
+                    "stage": {"type": "array", "items": {"type": "string"}, "description": "files on this PC (absolute paths) copied to bin\\x64_dx12, a menu .xml to bin\\config\\r4game\\user_config_matrix\\pc; one there of that name is parked. The end recycles them and each bin copy's new <stem>.log; other new <stem>[._- ]* files in bin go to game_logs"},
                     "stage_mods": {"type": "array", "items": {"type": "string"}, "description": "mod folders (absolute paths) copied into Mods, as stage into bin"},
                     "devkit": {"type": "boolean", "description": "load the RenoDX devkit through ReShade.ini (needs devkit in the config and ReShade in bin; default: on when both are there and ReShade isn't parked; false for timing runs)"},
                     "fg": {"type": "boolean", "description": "keep frame generation as the user set it (default false: off)"},
@@ -880,14 +880,15 @@ pub(crate) fn tools() -> Value {
         },
         {
             "name": "session_end",
-            "description": "End the session: turn off a free camera quen read on (freecam), wait until the gamesaves \
-                folder stops changing, kill the game through \
-                its job, replay the journal (restore every file it changed, unpark the mods, recycle the staged \
-                files and their new logs once game_logs copied them: only what still is as \
-                quen left it; a file the game rewrote is kept beside as .quen-current), release the lock. saves lists what the game wrote in gamesaves since the launch: tainted ones (written after a \
-                memory patch, cvar write or teleport) first, every changed one, the ones the game deleted (deleted: \
-                each with quen's pre-launch copy, or null; quen never writes them back), and the unexpected ones (not \
-                AutoSave / CheckPoint): tell the user. The boot's ledger row gets its outcome. If the replay leaves a \
+            "description": "End the session: turn off a free camera quen read on (freecam), wait until gamesaves stops \
+                changing, kill the game's job, replay the journal (restore every file it changed, unpark the mods, \
+                recycle the staged files and their new logs once game_logs copied them, move their other outputs \
+                there (replay.moved): only what still is as \
+                quen left it; a file the game rewrote is kept beside as .quen-current), release the lock. saves: \
+                loaded (the launch's save: present, unchanged), what the game wrote in gamesaves since the launch: \
+                tainted ones (written after a memory patch, cvar write or teleport) first, every changed one, deleted \
+                (with quen's pre-launch copy or null; quen never writes them back), unexpected (not \
+                AutoSave/CheckPoint): tell the user. The boot row gets its outcome. If the replay leaves a \
                 step (replay.left says why) the journal stays; session_recover retries. Never while the game runs outside \
                 quen's job. A play session: refused while the game runs, unless close_game; saves.user lists the \
                 user's saves.",
