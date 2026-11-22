@@ -162,7 +162,7 @@ pub fn tools() -> Vec<Value> {
             "name": "game_asi",
             "description": "Call an ASI's *_SetMode export once in the running game, as measure_ab's {asi, set_mode} \
                 action does, without its windows: on a thread quen starts in the game, waited for up to 10 s. call: what \
-                ran (asi!export(mode)); returned: the export's value. Journaled and on the boot's patches; taints no \
+                ran (asi!export(mode)); returned: the export's value; at: when quen started the call (UTC, ms). Journaled and on the boot's patches; taints no \
                 save. quen can't read an ASI's mode, so it can't put one back: a play session's hands_give refuses \
                 after a set in its hand-over, unless keep_writes. Refused, nothing run: wrong token, the user has the \
                 controls, a name that isn't an .asi file, an export that isn't *_SetMode, the ASI not loaded in the \
@@ -212,6 +212,7 @@ pub(crate) fn call(session: &mut Session, call: &mut Call, name: &str, args: &Va
         "game_keys" => keys(session, call, args),
         "game_screenshot" => capture::screenshot(session, call, args),
         "game_camera" => crate::camera::camera(session, call, args),
+        "game_pose" => crate::camera::pose(session, call, args),
         "game_photo" => crate::photo::call(session, call, args),
         "game_freecam" => crate::freecam::call(session, call, args),
         _ => channel::call(session, call, name, args),
@@ -780,6 +781,7 @@ impl Ctx<'_> {
     ) -> Result<Fields, Done> {
         let export = self.mode_export(asi, export)?;
         let pid = self.game_pid()?;
+        let at = session::utc_ms(SystemTime::now());
         let called = call_export(pid, asi, &|name| name == export, mode);
         // A refusal ran nothing, and a call our ASI rejected (returned 0) changed nothing (feature tests 2: those were on
         // the boot row). Any other call is journaled and on the boot row. It ran already, so a journal that can't be
@@ -806,6 +808,7 @@ impl Ctx<'_> {
         fields.extend(note.map(|n| ("journal_note".to_string(), json!(n))));
         fields.insert("call".into(), json!(format!("{asi}!{export}({mode})")));
         fields.insert("returned".into(), json!(ret));
+        fields.insert("at".into(), json!(at));
         if ret != 1 {
             let why = format!(
                 "{asi}!{export}({mode}) returned {ret}: the ASI didn't accept the mode (started with Mode=off, not \

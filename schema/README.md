@@ -171,7 +171,8 @@ A named camera position for repeatable captures. `id`; `name` (unique, e.g. `P1`
 rotation `cam_pitch`, `cam_yaw`, `cam_roll` (degrees), `fov`; the player's `player_x`, `player_y`, `player_z` (all set
 or all NULL) and `player_yaw` (degrees; never set without the position; since schema 0012 it may be NULL with one,
 before it was set exactly when they were); `save_id` → saves: the save the pose is in; `ref_capture_id` → captures: its
-reference image.
+reference image; since schema 0017 the world it was seen in, NULL when not recorded: `game_day`, `game_hour` (0-23; both
+set or both NULL: game_settime's arguments) and `weather` (its name).
 
 ### captures (table)
 

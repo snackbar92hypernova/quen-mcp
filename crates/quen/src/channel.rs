@@ -30,7 +30,7 @@ const NO_REPLY: &str = "modQuen gave no reply";
 /// game_settime's and game_weather's read-back (world.get): the first read at once, then one every `CONFIRM_EVERY`, at
 /// most `CONFIRM_READS`, so about 3 s. modQuen blends the weather over 1 s (RequestWeatherChangeTo), and a read is
 /// answered on the game's next tick. ponytail: 2 s over the blend for slow ticks, until a live boot times it.
-/// game_weather's `settle_s` at most: past the 45 s seen for a path-tracing constant (finding 41).
+/// game_weather's and game_teleport's `settle_s` at most: past the 45 s seen for a path-tracing constant (finding 41).
 const SETTLE_MAX_S: f64 = 120.0;
 /// world_actors' radius (metres) and count when not given.
 const ACTORS_RADIUS: f32 = 30.0;
@@ -317,10 +317,13 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "game_teleport",
             "description": format!("Place the player at pos facing rot (the units the game's scripts use, as a \
-                camera pose reads; z snaps to the ground). {taints}. {needs}, or {game}, or no player."),
+                camera pose reads; z snaps to the ground). Seen after one (boot 368): the game's light list lagged \
+                about 4 frames, the camera eased for about 0.5 s; settle_s waits after it. {taints}. {needs}, or \
+                {game}, or no player."),
             "inputSchema": schema(json!({
                 "pos": vec3("[x, y, z] in world units"),
                 "rot": vec3("[pitch, yaw, roll] in degrees; default [0, 0, 0]"),
+                "settle_s": {"type": "number", "minimum": 0, "maximum": 120, "description": "seconds to wait after the game's reply before answering; default none"},
             }), &["pos"]),
         }),
     ]
@@ -338,7 +341,7 @@ pub(crate) fn call(
         "game_pause" => &["on"],
         "game_settime" => &["day", "hour"],
         "game_weather" => &["name", "settle_s"],
-        "game_teleport" => &["pos", "rot"],
+        "game_teleport" => &["pos", "rot", "settle_s"],
         "game_items" => &["name", "count", "equip"],
         "world_actors" => &["radius", "max", "tag", "class"],
         _ => &[],
@@ -463,6 +466,15 @@ pub(crate) fn call(
                 note_pause(cx.live, &reply);
             }
             fields.insert("reply".into(), json!(reply.text));
+            if let (Verb::Teleport { .. }, Some(d)) = (&request.verb, settle) {
+                if !crate::measure::settle(call, d, "game_teleport") {
+                    let why = format!("{} during settle_s, after the teleport", call.stop_cause());
+                    return Err(Done::Failed(why, fields));
+                }
+                fields.insert("settled_s".into(), json!(d.as_secs_f64()));
+                call.lap("settle");
+                return Ok(fields);
+            }
             if matches!(request.verb, Verb::SetTime { .. } | Verb::Weather { .. }) {
                 let mut confirmed = confirm(&cx, &request.verb, &mut fields);
                 call.lap("confirm");
@@ -960,8 +972,8 @@ pub(crate) mod tests {
         assert_eq!(pause["reply"], "done", "{pause}");
         let time = json!({"token": "tok", "day": 3, "hour": 22});
         assert_eq!(run(&mut session, "game_settime", time)["ok"], true);
-        let tp = json!({"token": "tok", "pos": [1.5, -2, 30]});
-        assert_eq!(run(&mut session, "game_teleport", tp)["ok"], true);
+        let tp = json!({"token": "tok", "pos": [1.5, -2, 30], "settle_s": 0.1});
+        assert_eq!(run(&mut session, "game_teleport", tp)["settled_s"], 0.1);
         let nope = json!({"token": "tok", "name": "WT_Nope"});
         let nope = run(&mut session, "game_weather", nope);
         assert_eq!(nope["refused"], true, "{nope}");
@@ -1439,6 +1451,10 @@ pub(crate) mod tests {
             (
                 "game_teleport",
                 json!({"token": "tok", "pos": [0, 0, 0], "rot": "north"}),
+            ),
+            (
+                "game_teleport",
+                json!({"token": "tok", "pos": [0, 0, 0], "settle_s": 121}),
             ),
         ] {
             let out = fx.run(tool, args.clone());

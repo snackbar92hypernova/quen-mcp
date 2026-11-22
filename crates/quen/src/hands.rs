@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
+use quen_core::bridge_log::VALID;
 use quen_core::mem::Write;
 use quen_core::protocol::Verb;
 use quen_core::saves::{self, Snapshot};
@@ -70,17 +71,17 @@ pub(crate) fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "hands_take",
-            "description": "Take the controls of the game from the user, once the user asked for it here: in a play \
-                session (session_launch mode play), where the user has them from the launch, or in a test session \
-                after hands_give. The client asks the user on every call (user_ok is only your word): never route \
-                around a denial. While the user has the controls, quen refuses what sends input, writes to the game or \
-                moves the focus (game_keys, game_console, game_exec, game_asi, game_load, game_pause, game_settime, \
-                game_weather, game_teleport, game_place, game_items, game_save, game_camera with a pose, game_frame, \
+            "description": "Take the game's controls from the user, once they asked here: in a play session \
+                (session_launch mode play; theirs from the launch) or in a test session after hands_give. The client \
+                asks the user on every call (user_ok is only your word): never route around a denial. While the user \
+                has them, quen refuses what sends input, writes to the game or moves the focus (game_keys, \
+                game_console, game_exec, game_asi, game_load, game_pause, game_settime, game_weather, game_teleport, \
+                game_place, game_items, game_save, game_camera with a pose, game_pose restore, game_frame, \
                 game_freecam but status, game_cvar set or restore, mem_patch, mem_unpatch and their _instances, \
                 measure_ab, sweep_play, focus) and runs reads. Answers hand_over (n: in a play session quen's run ids \
-                are <session>-h<n>-<tag>) and user_saves (the saves the user made since the last hand-over, theirs). \
-                Refused, nothing changed: no user_ok, the agent has them already, the game not running, a wrong token, \
-                another connection's session.",
+                are <session>-h<n>-<tag>), user_saves (theirs, made since the last hand-over) and player (world_get's, \
+                when the game answers). Refused, nothing changed: no user_ok, the agent has them already, the game not \
+                running, a wrong token, another connection's session.",
             // Claude Code prompts for this tool on every call, in every permission mode, as for session_launch.
             "_meta": {"anthropic/requiresUserInteraction": true},
             "inputSchema": schema(json!({
@@ -115,6 +116,7 @@ pub(crate) fn user_may(tool: &str, args: &Value) -> bool {
     match tool {
         "game_cvar" => !has("set") && args.get("restore").is_none_or(|r| r == false),
         "game_camera" => !has("pos") && !has("rot") && !has("fov"),
+        "game_pose" => args["action"] == "save",
         "game_photo" => matches!(args["action"].as_str(), Some("get" | "list")),
         "game_freecam" => args["action"] == "status",
         "game_screenshot" | "game_listsaves" | "world_get" | "world_actors" | "world_frame"
@@ -181,6 +183,20 @@ fn taken(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Don
         ("hand_over".into(), json!(h.takes.get())),
         ("user_saves".into(), json!(user_saves)),
     ]);
+    // Where the user left the player: world_get's read, when the game is loaded and answers; never the take's end.
+    if cx.last_flags().is_some_and(|f| f & VALID != 0)
+        && let Ok(reply) = cx.channel().and_then(|c| {
+            c.call(Verb::WorldGet {}, REPLY_MAX)
+                .map_err(|e| e.why().to_string())
+        })
+    {
+        fields.extend(
+            reply
+                .data
+                .map(|d| ("player".to_string(), d["player"].clone())),
+        );
+        call.lap("player");
+    }
     if let Some(shown) = status::set(&cx, Some(call), State::Working) {
         fields.insert("status".into(), json!(shown));
     }
@@ -507,10 +523,12 @@ mod tests {
             ("game_camera", json!({"fov": 40})),
             ("game_freecam", json!({"action": "on"})),
             ("game_freecam", json!({"action": "set", "relative": {}})),
+            ("game_pose", json!({"action": "restore", "name": "P"})),
         ] {
             assert!(!user_may(tool, &args), "{tool} {args}");
         }
         for (tool, args) in [
+            ("game_pose", json!({"action": "save", "name": "P"})),
             ("game_cvar", json!({"name": "X"})),
             ("game_cvar", json!({"name": "X", "restore": false})),
             ("game_camera", none.clone()),
@@ -902,6 +920,39 @@ mod tests {
             "{journal}"
         );
         assert_eq!(fx.shared.hands(), Some(Hands::User));
+    }
+
+    /// hands_take answers where the player is, as world_get reads it, when the game answers.
+    #[test]
+    fn hands_take_reads_where_the_player_is() {
+        use crate::channel::tests::{fake_game_until, reply, served, token};
+        let fx = served("take-player");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = fake_game_until(
+            &token(&fx),
+            Box::new(|r| {
+                let world =
+                    json!({"player": {"pos": [1, 2, 3], "heading": 90}, "weather": "WT_Clear"});
+                let data = matches!(r.verb, Verb::WorldGet {}).then_some(world);
+                vec![reply(r.id, true, "done", data)]
+            }),
+            stop.clone(),
+        );
+        let session = fx.session();
+        fx.shared.set_hands(Some(Hands::User));
+        let out = run(
+            &session,
+            "hands_take",
+            json!({"token": "tok", "user_ok": true}),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            out["player"],
+            json!({"pos": [1, 2, 3], "heading": 90}),
+            "{out}"
+        );
+        let sent = server.join().unwrap();
+        assert_eq!(sent[0].verb, Verb::WorldGet {}, "{sent:?}");
     }
 
     /// hands_take: refused without user_ok and while the agent has the controls; then it sorts the user's saves since

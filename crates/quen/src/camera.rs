@@ -86,18 +86,38 @@ pub fn tools() -> Vec<Value> {
             "name": "game_camera",
             "description": "Read or set the photo-mode camera by numbers. No pos: read the view (camera photomode: \
                 the photo-mode camera's own pose; game: the game camera's, outside photo mode). pos and rot (fov \
-                optional): set the photo-mode camera, photo mode only, and read it back; off is the largest \
-                difference from what was asked (pos_m, deg). rot is [pitch, yaw, roll] in degrees; the camera's \
-                forward is (-sin yaw, cos yaw, 0) in world xy, so +yaw turns left (observed once, 2026-10-19). A pose \
-                is what sweep_save takes as a keyframe. Photo mode's camera collides with geometry. Not journaled: no save holds the photo-mode camera. Through quen's \
-                command channel: needs quen's in-game package. Refused, nothing sent: wrong token, pos without rot, \
-                no loaded game, a set outside photo mode (quen's state). Failed: no reply within 5 s, or the read-back \
+                optional): set it, photo mode only, and read it back; off is the largest difference from what was \
+                asked (pos_m, deg). rot is [pitch, yaw, roll] in degrees; the camera's forward is (-sin yaw, cos yaw, \
+                0) in world xy, so +yaw turns left (observed once, 2026-10-19). A pose is what sweep_save takes as a \
+                keyframe. Photo mode's camera collides with geometry; noclip (with a set; quen-w3 0.1.13) turns its \
+                no-clip on first, until photo mode's menu closes. Not journaled: no save holds the photo-mode camera. \
+                Through quen's command channel: needs quen's in-game package. Refused, nothing sent: wrong token, pos \
+                without rot, no loaded game, a set outside photo mode (quen's state). Failed: no reply within 5 s, or the read-back \
                 off by more than 0.01 m or 0.1 degrees (the game kept the camera short of the pose).",
             "inputSchema": schema(json!({
                 "pos": vec3("[x, y, z] in metres: set the camera here"),
                 "rot": vec3("[pitch, yaw, roll] in degrees"),
                 "fov": {"type": "number", "description": "degrees, 1 to 179; left out: unchanged"},
+                "noclip": {"type": "boolean", "description": "with a set: photo mode's no-clip on first (cam.noclip, as game_frame sends it); default false"},
             }), &[]),
+        }),
+        json!({
+            "name": "game_pose",
+            "description": "A named pose, a poses row. save: the player's pos and heading, the game time and weather \
+                (world_get's: the world's, not photo mode's own) and the camera (game_camera's read) into a new row; \
+                runs while the user has the controls. restore: the row's values through their tools, in order: \
+                game_photo exit (in photo mode), game_teleport (rot [0, yaw, 0]), game_settime, game_weather (each \
+                skipped when not recorded), a wait of settle_s, game_photo enter, game_camera's set with noclip. Each \
+                step is that tool's call (journaled, tainting saves and noted for session_launch again as it is); \
+                the result holds its fields under the step's name. A pose holds no world or area: restore it where it \
+                was saved. quen-w3 0.1.13 or later. Refused, nothing changed: a taken name (save), no such pose, a \
+                pose without the player's position and yaw, no loaded game, the free camera on, the user's controls \
+                (restore), or a first step refused. Failed: a step that didn't succeed after one that did.",
+            "inputSchema": schema(json!({
+                "action": {"type": "string", "enum": ["save", "restore"], "description": "save the live game's pose, or restore a saved one"},
+                "name": {"type": "string", "description": "the pose's name, unique among poses"},
+                "settle_s": {"type": "number", "minimum": 0, "maximum": 120, "description": "restore: seconds to wait after the world steps, before photo mode opens (game_weather's blend: the sky about 2-3 s, rain wetness about 20 s); default none"},
+            }), &["action", "name"]),
         }),
         json!({
             "name": "sweep_save",
@@ -106,8 +126,8 @@ pub fn tools() -> Vec<Value> {
                 speed keys (default): each keyframe at its t, its segment shaped by its ease. constant: the whole \
                 path at one speed from 0 to the last t, shaped by the sweep's ease. Stored canonical (angles in \
                 (-180, 180], numbers on a 0.0001 grid) with a pose row per keyframe, '<name> k<i>', its \
-                ref_capture_id the keyframe's screenshot. A sweep never changes: the same name and sweep again \
-                returns its id (existed), another sweep under a taken name is refused. Needs no session. Refused, \
+                ref_capture_id the keyframe's screenshot, its player, time and weather from world. A sweep never \
+                changes: the same name and sweep again returns its id (existed), another sweep under a taken name is refused. Needs no session. Refused, \
                 nothing written: 2 to 24 keyframes, times increasing from 0 to at most 3600 s, pitch within +-89, \
                 fov 1 to 179, no segment turning 179 degrees or more (add a keyframe between), no ease where it \
                 isn't used, a known capture_id.",
@@ -157,7 +177,8 @@ pub(crate) fn call(session: &Session, call: &mut Call, name: &str, args: &Value)
 }
 
 pub(crate) fn camera(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
-    let cx = game::ctx(session, args, &["pos", "rot", "fov"])?;
+    let cx = game::ctx(session, args, &["pos", "rot", "fov", "noclip"])?;
+    let noclip = game::flag(args, "noclip")?;
     let fov = match args.get("fov") {
         None => None,
         Some(v) => Some(
@@ -189,11 +210,38 @@ pub(crate) fn camera(session: &Session, call: &mut Call, args: &Value) -> Result
             fov: fov.map(|f| f as f32),
         },
     };
+    if noclip {
+        if asked.is_none() {
+            return Err("noclip goes with a set (pos and rot)".to_string().into());
+        }
+        doctor::package_at_least(
+            cx.config,
+            doctor::BEFORE_SCENE,
+            "game_camera noclip",
+            "0.1.13",
+        )?;
+    }
     let channel = ready(&cx, "game_camera", asked.is_some())?;
     call.lap("check");
-    let reply = send_on(channel, verb, &Map::new())?;
-    call.lap("reply");
     let mut fields = Map::new();
+    let channel = match noclip {
+        true => {
+            let reply = send_on(channel, Verb::CamNoclip { on: true }, &fields)?;
+            fields.insert("noclip".into(), json!(reply.text));
+            cx.channel()
+                .map_err(|why| Done::Failed(why, fields.clone()))?
+        }
+        false => channel,
+    };
+    // After no-clip went on, a refused set has changed something.
+    let reply = send_on(channel, verb, &fields).map_err(|done| match (noclip, done) {
+        (true, Done::Refused(why)) => Done::Failed(why, fields.clone()),
+        (true, Done::RefusedWith(why, more)) => {
+            Done::Failed(why, fields.clone().into_iter().chain(more).collect())
+        }
+        (_, done) => done,
+    })?;
+    call.lap("reply");
     fields.insert("reply".into(), json!(reply.text));
     let (camera, got) = read_back(&reply).map_err(|why| Done::Failed(why, fields.clone()))?;
     fields.insert("camera".into(), json!(camera));
@@ -217,7 +265,8 @@ pub(crate) fn short(got: &Pose, want: &Pose) -> Option<String> {
     (pos > OFF_MAX.0 || deg > OFF_MAX.1).then(|| {
         format!(
             "the game kept the camera short of the pose (off {pos:.3} m, {deg:.2} deg): photo mode's collision \
-             (Noclip Off in its Camera tab) stops it at geometry. Set it along a free path, a step at a time"
+             (Noclip Off in its Camera tab) stops it at geometry. Set it along a free path, a step at a time, or with \
+             game_camera's noclip"
         )
     })
 }
@@ -449,6 +498,8 @@ fn save(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
                     player: player.clone(),
                     save_id: None,
                     ref_capture_id: *capture,
+                    time: sweep.world.time,
+                    weather: sweep.world.weather.clone(),
                 })?));
             }
             Ok((l.add_sweep(&row(poses.clone()))?, Some(poses)))
@@ -481,6 +532,186 @@ fn save(session: &Session, call: &mut Call, args: &Value) -> Result<Fields, Done
 
 fn open_ledger(config: &crate::config::Config) -> Result<Ledger, String> {
     Ledger::open(config.state_dir().join("quen.db")).map_err(|e| e.to_string())
+}
+
+/// game_pose: a poses row saved from the live game, or restored through its own tools' calls in order.
+pub(crate) fn pose(session: &mut Session, call: &mut Call, args: &Value) -> Result<Fields, Done> {
+    let (steps, mut fields) = {
+        let cx = game::ctx(session, args, &["action", "name", "settle_s"])?;
+        let name = text(args, "name")?.trim();
+        let action = text(args, "action")?;
+        if !matches!(action, "save" | "restore") || name.is_empty() {
+            let why = "action is save or restore, name a non-empty pose name";
+            return Err(why.to_string().into());
+        }
+        let settle = match args.get("settle_s") {
+            None => None,
+            Some(_) if action == "save" => return Err("settle_s is restore's".to_string().into()),
+            Some(v) => Some(
+                v.as_f64()
+                    .filter(|s| (0.0..=120.0).contains(s))
+                    .ok_or("settle_s must be seconds, 0 to 120".to_string())?,
+            ),
+        };
+        doctor::installed(&[&doctor::PACKAGE], cx.config, "game_pose")?;
+        doctor::package_at_least(cx.config, doctor::BEFORE_SCENE, "game_pose", "0.1.13")?;
+        let mut ledger = open_ledger(cx.config)?;
+        let sql = "SELECT id, cam_x, cam_y, cam_z, cam_pitch, cam_yaw, cam_roll, fov, player_x, player_y, player_z, \
+                   player_yaw, game_day, game_hour, weather FROM poses WHERE name = ?1";
+        let row = ledger
+            .query(sql, &[json!(name)], Duration::from_secs(5))
+            .map_err(|e| e.to_string())?
+            .rows
+            .pop();
+        if action == "save" {
+            if row.is_some() {
+                let why = format!(
+                    "a pose named {name:?} exists (a pose never changes): pick another name"
+                );
+                return Err(why.into());
+            }
+            return save_pose(&cx, call, &mut ledger, name);
+        }
+        let Some(r) = row else {
+            return Err(format!("no pose named {name:?} in the ledger").into());
+        };
+        let n = |i: usize| r[i].as_f64().unwrap_or_default();
+        if r[8..12].iter().any(Value::is_null) {
+            let why = format!(
+                "pose {name:?} has no player position and yaw: photo mode keeps its camera near the player, so it \
+                 can't be restored. Nothing changed"
+            );
+            return Err(why.into());
+        }
+        let last = cx.last_flags();
+        if last.is_none_or(|f| f & VALID == 0) {
+            let why = format!(
+                "quen's state shows {}: game_pose restore needs a loaded game. Nothing changed",
+                game::shown(last)
+            );
+            return Err(why.into());
+        }
+        if cx.live.freecam.get() {
+            let why = "the game's free camera is on, as game_freecam last read it: game_freecam off first. \
+                       Nothing changed";
+            return Err(why.to_string().into());
+        }
+        let cam = Pose {
+            pos: [n(1), n(2), n(3)],
+            rot: [n(4), n(5), n(6)],
+            fov: n(7),
+        };
+        let (player, yaw) = ([n(8), n(9), n(10)], n(11));
+        let time = (!r[12].is_null()).then(|| json!({"day": r[12], "hour": r[13]}));
+        let mut steps = Vec::new();
+        if last.is_some_and(in_photo) {
+            steps.push(("photo_exit", "game_photo", json!({"action": "exit"})));
+        }
+        let teleport = json!({"pos": player, "rot": [0.0, yaw, 0.0]});
+        steps.push(("teleport", "game_teleport", teleport));
+        if let Some(time) = &time {
+            steps.push(("time", "game_settime", time.clone()));
+        }
+        if !r[14].is_null() {
+            steps.push(("weather", "game_weather", json!({"name": r[14]})));
+        }
+        if let Some(s) = settle {
+            steps.push(("settle", "wait", json!(s)));
+        }
+        steps.push(("photo_enter", "game_photo", json!({"action": "enter"})));
+        let set = json!({"pos": cam.pos, "rot": cam.rot, "fov": cam.fov, "noclip": true});
+        steps.push(("camera", "game_camera", set));
+        let pose = json!({"id": r[0], "name": name, "camera": pose_json(&cam),
+                          "player": {"pos": player, "yaw": yaw}, "time": time, "weather": r[14]});
+        call.lap("check");
+        (steps, Map::from_iter([("pose".to_string(), pose)]))
+    };
+    // Each step is its own tool's call, noted for session_launch again as that call would be.
+    let mut changed = false;
+    for (key, tool, mut step) in steps {
+        if tool == "wait" {
+            let d = Duration::from_secs_f64(step.as_f64().unwrap_or_default());
+            if !crate::measure::settle(call, d, "game_pose settle_s") {
+                let why = format!(
+                    "{} during settle_s, after the world was set",
+                    call.stop_cause()
+                );
+                return Err(Done::Failed(why, fields));
+            }
+            fields.insert("settled_s".into(), step);
+            continue;
+        }
+        step["token"] = args["token"].clone();
+        let (done, _) = session.nested(call, tool, &step, true, true);
+        call.lap(key);
+        let (why, failed) = match done {
+            Done::Ok(f) => {
+                fields.insert(key.into(), json!(f));
+                changed = true;
+                continue;
+            }
+            Done::Refused(why) | Done::Needs(why, _) => (why, changed),
+            Done::RefusedWith(why, f) => {
+                fields.insert(key.into(), json!(f));
+                (why, changed)
+            }
+            Done::Failed(why, f) => {
+                fields.insert(key.into(), json!(f));
+                (why, true)
+            }
+        };
+        let why = format!("{key} ({tool}): {why}");
+        return Err(match failed {
+            true => Done::Failed(why, fields),
+            false => Done::RefusedWith(why, fields),
+        });
+    }
+    Ok(fields)
+}
+
+/// game_pose save: the player, game time and weather (world.get) and the camera (cam.get) into a new poses row.
+fn save_pose(cx: &Ctx, call: &mut Call, ledger: &mut Ledger, name: &str) -> Result<Fields, Done> {
+    let world = send_on(
+        ready(cx, "game_pose", false)?,
+        Verb::WorldGet {},
+        &Map::new(),
+    )?
+    .data
+    .unwrap_or_default();
+    let (camera, got) = read_back(&send(cx, Verb::CamGet {}, &Map::new())?)?;
+    call.lap("read");
+    let player = &world["player"];
+    let (Some(pos), Some(yaw)) = (numbers(player, "pos")?, player["heading"].as_f64()) else {
+        return Err(format!("the game's world read has no player pose: {world}").into());
+    };
+    let row = PoseRow {
+        name: name.into(),
+        camera: got.pos,
+        rotation: got.rot,
+        fov: got.fov,
+        player: Some(PlayerPose {
+            position: pos,
+            yaw: Some(yaw),
+        }),
+        time: serde_json::from_value(world["time"].clone()).ok(),
+        weather: world["weather"]
+            .as_str()
+            .filter(|w| !w.is_empty())
+            .map(Into::into),
+        ..PoseRow::default()
+    };
+    let id = ledger
+        .add_pose(&row)
+        .map_err(|e| format!("{e}; nothing written"))?;
+    call.lap("ledger");
+    call.row("poses", id);
+    let pose = json!({"id": id, "name": name, "camera": pose_json(&got), "player": {"pos": pos, "yaw": yaw},
+                      "time": row.time, "weather": row.weather});
+    // camera: which one was read (photomode, or game outside photo mode).
+    Ok(Map::from_iter([
+        ("pose".to_string(), pose),
+        ("camera".into(), json!(camera)),
+    ]))
 }
 
 /// A checked sweep_play request.
@@ -1096,6 +1327,7 @@ pub(crate) mod tests {
                 rot: [0.0; 3],
                 fov: 60.0,
             },
+            false,
         ));
         let frame = Arc::new(AtomicU32::new(u32::MAX));
         let set = frame.clone();
@@ -1112,7 +1344,7 @@ pub(crate) mod tests {
                     Verb::CamSet { pos, rot, fov } => {
                         let fov = fov.map_or(held.2.fov, f64::from);
                         held.2 = Pose {
-                            pos: if pos[0] > WALL {
+                            pos: if pos[0] > WALL && !held.3 {
                                 held.2.pos
                             } else {
                                 pos.map(f64::from)
@@ -1150,6 +1382,10 @@ pub(crate) mod tests {
                         (true, format!("frame {n} set"), data(&held.2))
                     }
                     Verb::CamStop {} => (true, "stopped".into(), None),
+                    Verb::CamNoclip { on } => {
+                        held.3 = *on;
+                        (true, "no-clip on until photo mode closes".into(), None)
+                    }
                     Verb::Pause { on } => (
                         true,
                         format!("quen's pause is {}", if *on { "on" } else { "off" }),
@@ -1169,10 +1405,146 @@ pub(crate) mod tests {
         fs::write(log, format!("push flags={flags}\n")).unwrap();
     }
 
+    /// game_pose saves the live game's pose into a poses row and restores it through its tools in order, each noted
+    /// for again; a taken name, an unknown pose and one without the player are refused, nothing sent.
+    #[test]
+    fn game_pose_saves_and_restores_through_its_tools() {
+        let fx = served("pose");
+        let log = fx.dir.join("game/bin/x64_dx12/W3QuenState.log");
+        let world = std::sync::Mutex::new(json!({"player": {"pos": [10, 20, 3], "heading": 45},
+            "time": {"day": 3, "hour": 22}, "weather": "WT_Clear"}));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = crate::channel::tests::fake_game_until(
+            &token(&fx),
+            Box::new(move |r| {
+                let mut world = world.lock().unwrap();
+                let cam = |pos: [f32; 3], rot: [f32; 3], fov: f32| {
+                    Some(json!({"camera": "photomode", "pos": pos, "rot": rot, "fov": fov}))
+                };
+                let data = match &r.verb {
+                    Verb::WorldGet {} => Some(world.clone()),
+                    Verb::CamGet {} => cam([11.0, 21.0, 5.0], [-5.0, 90.0, 0.0], 50.0),
+                    Verb::CamSet { pos, rot, fov } => cam(*pos, *rot, fov.unwrap()),
+                    Verb::SetTime { day, hour } => {
+                        world["time"] = json!({"day": day, "hour": hour});
+                        None
+                    }
+                    Verb::Weather { name } => {
+                        world["weather"] = json!(name);
+                        None
+                    }
+                    Verb::PhotoMode { on: true } => {
+                        fs::write(&log, "push flags=129\n").unwrap();
+                        None
+                    }
+                    _ => None,
+                };
+                vec![reply(r.id, true, "done", data)]
+            }),
+            stop.clone(),
+        );
+        let mut session = fx.session();
+        session.noted().clear();
+        let mut run = |args: Value| {
+            let mut call = session.call(crate::mcp::Conn::nobody(), Value::Null, None);
+            let done = game::call(&mut session, &mut call, "game_pose", &args);
+            session.envelope("game_pose", call, done)
+        };
+        let saved = run(json!({"token": "tok", "action": "save", "name": "P1"}));
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(
+            saved["pose"]["time"],
+            json!({"day": 3, "hour": 22}),
+            "{saved}"
+        );
+        let taken = run(json!({"token": "tok", "action": "save", "name": "P1"}));
+        assert_eq!(taken["refused"], true, "{taken}");
+        let unknown = run(json!({"token": "tok", "action": "restore", "name": "P9"}));
+        assert_eq!(unknown["refused"], true, "{unknown}");
+        ledger(&fx)
+            .add_pose(&PoseRow {
+                name: "no player".into(),
+                fov: 60.0,
+                ..PoseRow::default()
+            })
+            .unwrap();
+        let alone = run(json!({"token": "tok", "action": "restore", "name": "no player"}));
+        assert!(
+            alone["reason"].as_str().unwrap().contains("player"),
+            "{alone}"
+        );
+        let restored =
+            run(json!({"token": "tok", "action": "restore", "name": "P1", "settle_s": 0.1}));
+        assert_eq!(restored["ok"], true, "{restored}");
+        assert_eq!(restored["camera"]["pose"]["fov"], 50.0, "{restored}");
+        assert_eq!(restored["settled_s"], 0.1, "{restored}");
+        stop.store(true, Ordering::Relaxed);
+        let row = rows(
+            &fx,
+            "SELECT player_x, player_yaw, cam_yaw, fov, game_day, game_hour, weather FROM poses WHERE name = 'P1'",
+        );
+        assert_eq!(
+            row,
+            vec![vec![
+                json!(10.0),
+                json!(45.0),
+                json!(90.0),
+                json!(50.0),
+                json!(3),
+                json!(22),
+                json!("WT_Clear")
+            ]]
+        );
+        let sent: Vec<Verb> = server
+            .join()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.verb)
+            .filter(|v| {
+                !matches!(
+                    v,
+                    Verb::Notice { .. } | Verb::NoticeHide {} | Verb::WorldGet {}
+                )
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                Verb::CamGet {},
+                Verb::Teleport {
+                    pos: [10.0, 20.0, 3.0],
+                    rot: [0.0, 45.0, 0.0]
+                },
+                Verb::SetTime { day: 3, hour: 22 },
+                Verb::Weather {
+                    name: "WT_Clear".into()
+                },
+                Verb::PhotoMode { on: true },
+                Verb::CamNoclip { on: true },
+                Verb::CamSet {
+                    pos: [11.0, 21.0, 5.0],
+                    rot: [-5.0, 90.0, 0.0],
+                    fov: Some(50.0)
+                },
+            ]
+        );
+        let noted: Vec<Value> = session.noted().iter().map(|s| s["tool"].clone()).collect();
+        assert_eq!(
+            noted,
+            [
+                "game_teleport",
+                "game_settime",
+                "game_weather",
+                "game_photo",
+                "game_camera"
+            ]
+        );
+    }
+
     #[test]
     fn game_camera_reads_and_sets_in_photo_mode_only() {
         let fx = served("camera");
-        let (server, _) = camera_game(&fx, 4, 0.0);
+        let (server, _) = camera_game(&fx, 6, 0.0);
         let session = fx.session();
         let get = run(&session, "game_camera", json!({"token": "tok"}));
         assert_eq!(get["camera"], "photomode", "{get}");
@@ -1222,8 +1594,23 @@ pub(crate) mod tests {
         let short = blocked["off"]["pos_m"].as_f64().unwrap();
         assert!((short - 332.0).abs() < 1e-3, "{blocked}");
         assert_eq!(blocked["pose"]["pos"][0], json!(671.2999877929688));
+        // noclip: cam.noclip first, then the set passes the wall; alone, it is refused.
+        let alone = run(
+            &session,
+            "game_camera",
+            json!({"token": "tok", "noclip": true}),
+        );
+        assert_eq!(alone["refused"], true, "{alone}");
+        let through = run(
+            &session,
+            "game_camera",
+            json!({"token": "tok", "pos": [1003.3, 1874.8, 11.9], "rot": [-5, 170, 0], "noclip": true}),
+        );
+        assert_eq!(through["ok"], true, "{through}");
+        assert!(through["noclip"].as_str().unwrap().contains("no-clip on"));
         let verbs: Vec<Verb> = server.join().unwrap().into_iter().map(|r| r.verb).collect();
-        assert_eq!(verbs.len(), 4, "the refusals sent nothing: {verbs:?}");
+        assert_eq!(verbs.len(), 6, "the refusals sent nothing: {verbs:?}");
+        assert_eq!(verbs[4], Verb::CamNoclip { on: true });
         assert_eq!(
             verbs[1],
             Verb::CamSet {

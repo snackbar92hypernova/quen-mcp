@@ -290,6 +290,11 @@ pub struct Pose {
     pub player: Option<PlayerPose>,
     pub save_id: Option<i64>,
     pub ref_capture_id: Option<i64>,
+    /// The game time and weather it was seen in (schema 0017); none: not recorded.
+    #[serde(default)]
+    pub time: Option<sweep::GameTime>,
+    #[serde(default)]
+    pub weather: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -833,8 +838,8 @@ impl Ledger {
         let player = p.player.as_ref();
         self.conn.execute(
             "INSERT INTO poses (name, cam_x, cam_y, cam_z, cam_pitch, cam_yaw, cam_roll, fov, player_x, player_y,
-               player_z, player_yaw, save_id, ref_capture_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+               player_z, player_yaw, save_id, ref_capture_id, game_day, game_hour, weather)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 p.name,
                 p.camera[0],
@@ -850,6 +855,9 @@ impl Ledger {
                 player.and_then(|q| q.yaw),
                 p.save_id,
                 p.ref_capture_id,
+                p.time.map(|t| t.day),
+                p.time.map(|t| t.hour),
+                p.weather,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())

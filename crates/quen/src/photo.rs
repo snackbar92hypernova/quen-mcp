@@ -11,7 +11,7 @@ use quen_core::bridge_log::{VALID, in_photo, names};
 use quen_core::protocol::{self, GRADING, PhotoPart, Request, Verb};
 use serde_json::{Map, Value, json};
 
-use crate::channel::REPLY_MAX;
+use crate::channel::{Error, REPLY_MAX};
 use crate::doctor;
 use crate::game::{self, Ctx, Fields, ctx, schema, text};
 use crate::session::{Call, Done, Session};
@@ -49,16 +49,17 @@ pub fn tool() -> Value {
         .collect();
     json!({
         "name": "game_photo",
-        "description": "Photo mode through its own script interface (CR4PhotomodeEffects, as its menu calls it), \
-            quen-w3 0.1.9 or later. action enter / exit: open or close photo mode by the game's own functions (exit: \
-            the menu's own, no dialog; the game restores the weather), then wait up to 10 s for quen's state to show \
-            it. get: photo mode's state as photo (weather, minute, env, grading, grading_at_open, rain, snow, \
+        "description": "Photo mode by its own script interface (CR4PhotomodeEffects), quen-w3 0.1.9+. action enter \
+            / exit: open or close it by the game's own functions (exit: the menu's own, no dialog; the game restores \
+            the weather), waiting up to 10 s for quen's state to show it (enter: first up to 10 s for no fade, scene \
+            or dialogue). get: its state as photo (weather, minute, env, grading, grading_at_open, rain, snow, \
             sky_clear, world_weather). weather (name), env (path), time (minute), grade (grading): set it, photo is \
-            the read-back, failed when it doesn't show the change. reset (part): the world's weather, no env, or \
-            the grading at open. tick (tick_s, cloth_s): one world tick and the cloth simulation; no read-back. list \
-            (what, filter): names. All but enter need photo mode. env is journaled and taints later saves. \
-            Refused, nothing sent: wrong token, a value out of range, no loaded game, not in photo mode (enter: in \
-            it, or game_freecam's free camera on); with needs: quen-w3 0.1.8 or older. Failed: no reply within 5 s.",
+            the read-back, failed if it doesn't show. reset (part): the world's weather, no env, or the grading at \
+            open. tick (tick_s, cloth_s): one world tick and cloth simulation; no read-back. list (what, filter): \
+            names. All but enter need photo mode. env is journaled and taints later saves. Refused, nothing sent: \
+            wrong token, a bad value, no loaded game, not in photo mode (enter: in it, the free camera on, a \
+            blackscreen or fade: retry in a few seconds); with needs: quen-w3 0.1.8 or older. Failed: no reply \
+            within 5 s.",
         "inputSchema": schema(json!({
             "action": one_of(&["enter", "exit", "get", "weather", "env", "time", "grade", "reset", "tick", "list"], "what to do"),
             "name": string("weather: a name of the area's list (list weathers), e.g. WT_Clear"),
@@ -105,6 +106,11 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
                    its own camera). Nothing sent";
         return Err(why.to_string().into());
     }
+    // A fade refuses photo mode (vanilla's check; a batch right after a teleport): waited out as run_plan waits before
+    // a step, then modQuen decides.
+    if enter {
+        let _ = cx.wait_for(call, game::READY_MAX, game::in_game);
+    }
     let channel = cx.channel()?;
     call.lap("check");
     let mut fields = Map::new();
@@ -123,11 +129,18 @@ pub(crate) fn call(session: &Session, call: &mut Call, args: &Value) -> Result<F
     let reply = channel.call(verb.clone(), REPLY_MAX);
     call.lap("reply");
     if let Some((mut journal, id)) = journal {
-        let ran = !matches!(reply, Err(crate::channel::Error::Refused(..)));
+        let ran = !matches!(reply, Err(Error::Refused(..)));
         let note = cx.settle(&mut journal, id, ran);
         fields.extend(note.map(|n| ("journal_note".to_string(), json!(n))));
     }
-    let reply = reply.map_err(|e| e.done(fields.clone()))?;
+    let reply = reply.map_err(|e| match e {
+        Error::Refused(_, Some(text)) if text.contains("blackscreen or fade") => {
+            let why = "the game refused photo mode during a blackscreen or fade (its words: game_text): retry in a \
+                       few seconds";
+            Done::RefusedWith(why.into(), Map::from_iter([("game_text".into(), json!(text))]))
+        }
+        e => e.done(fields.clone()),
+    })?;
     fields.insert("reply".into(), json!(reply.text));
     match verb {
         Verb::PhotoMode { on } => {
@@ -510,6 +523,42 @@ mod tests {
             "game_photo",
             &json!({"action": "exit"})
         ));
+    }
+
+    /// enter waits for a fade in quen's state to end before it sends; the game's refusal for a blackscreen or fade says
+    /// to retry.
+    #[test]
+    fn enter_waits_out_a_fade_and_a_fade_refusal_says_retry() {
+        let fx = served("photo-fade");
+        let log = state_log(&fx);
+        fs::write(&log, "push flags=257\n").unwrap();
+        let server = fake_game(
+            &token(&fx),
+            1,
+            Box::new(|r| {
+                let why =
+                    "photo mode doesn't open now (vanilla's own check): a blackscreen or fade";
+                vec![reply(r.id, false, why, None)]
+            }),
+        );
+        let faded = std::thread::spawn(move || {
+            sleep(Duration::from_millis(400));
+            fs::write(log, "push flags=1\n").unwrap();
+        });
+        let start = Instant::now();
+        let out = fx.run("game_photo", json!({"token": "tok", "action": "enter"}));
+        assert!(start.elapsed() >= Duration::from_millis(400), "{out}");
+        assert_eq!(out["refused"], true, "{out}");
+        assert!(
+            out["reason"]
+                .as_str()
+                .unwrap()
+                .contains("retry in a few seconds"),
+            "{out}"
+        );
+        assert!(out["game_text"].as_str().unwrap().contains("blackscreen"));
+        faded.join().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]
